@@ -756,6 +756,13 @@ namespace AutoExile.Modes
         /// </summary>
         private bool TryFollowLeaderExit(BotContext ctx, GameController gc, Vector2 nearGridPos)
         {
+            var bathysphere = FindNearestBathysphere(gc, nearGridPos);
+            if (bathysphere != null)
+            {
+                ctx.Log("Follower: prioritizing BATHYSPHERE transition");
+                return StartNavigationToEntity(ctx, gc, bathysphere);
+            }
+
             // First: look for town portals / portals (always followed)
             var portal = FindNearestEntity(gc, nearGridPos, includePortals: true, includeTransitions: false);
 
@@ -832,6 +839,13 @@ namespace AutoExile.Modes
             // Entity gone — try to find another transition near the cached position
             if (_transitionGridPos.HasValue)
             {
+                var bathysphere = FindNearestBathysphere(gc, _transitionGridPos.Value);
+                if (bathysphere != null)
+                {
+                    _transitionEntityId = bathysphere.Id;
+                    return bathysphere;
+                }
+
                 var fallback = FindNearestEntity(gc, _transitionGridPos.Value,
                     includePortals: true, includeTransitions: true);
                 if (fallback != null)
@@ -1060,6 +1074,35 @@ namespace AutoExile.Modes
             }
 
             return best;
+        }
+
+        private static Entity? FindNearestBathysphere(GameController gc, Vector2 nearGridPos)
+        {
+            Entity? best = null;
+            float bestDist = float.MaxValue;
+
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (!entity.IsTargetable || !IsBathysphere(entity))
+                    continue;
+
+                var entityGridPos = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);
+                var dist = Vector2.Distance(nearGridPos, entityGridPos);
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    best = entity;
+                }
+            }
+
+            return best;
+        }
+
+        private static bool IsBathysphere(Entity entity)
+        {
+            return entity.Path?.Contains("BATHYSPHERE", StringComparison.OrdinalIgnoreCase) == true
+                || entity.Metadata?.Contains("BATHYSPHERE", StringComparison.OrdinalIgnoreCase) == true
+                || entity.RenderName?.Contains("BATHYSPHERE", StringComparison.OrdinalIgnoreCase) == true;
         }
 
         /// <summary>

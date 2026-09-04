@@ -78,5 +78,16 @@ namespace AutoExile.Modes.Shared
         /// Reset pickup count only (e.g. between map runs while preserving pending state).
         /// </summary>
         public void ResetCount() => _pickupCount = 0;
+
+        /// <summary>
+        /// Clear only the pending pickup (e.g. when a caller cancels the in-flight
+        /// interaction), preserving the session pickup count.
+        /// </summary>
+        public void ClearPending()
+        {
+            _pendingEntityId = 0;
+            _pendingItemName = "";
+            _pendingValue = 0;
+        }
     }
 }

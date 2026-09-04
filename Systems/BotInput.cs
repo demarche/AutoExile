@@ -59,6 +59,27 @@ namespace AutoExile.Systems
             return true;
         }
 
+        // Keep world-directed cursor input away from UI-heavy screen edges. These
+        // ratios mirror AutoPOE's world safe zone; UI clicks still use the full
+        // window so stash and map-device controls remain reachable.
+        private const float WorldSafeMinXRatio = 0.0977f;
+        private const float WorldSafeMaxXRatio = 0.9023f;
+        private const float WorldSafeMinYRatio = 0.12f;
+        private const float WorldSafeMaxYRatio = 0.84f;
+
+        private static bool ClampToWorldSafeZone(ref Vector2 pos)
+        {
+            if (!ClampToWindow(ref pos)) return false;
+
+            pos.X = Math.Clamp(pos.X,
+                WindowRect.X + WindowRect.Width * WorldSafeMinXRatio,
+                WindowRect.X + WindowRect.Width * WorldSafeMaxXRatio);
+            pos.Y = Math.Clamp(pos.Y,
+                WindowRect.Y + WindowRect.Height * WorldSafeMinYRatio,
+                WindowRect.Y + WindowRect.Height * WorldSafeMaxYRatio);
+            return true;
+        }
+
         // ── Action Log ──
         private static readonly ActionRecord[] _actionLog = new ActionRecord[500];
         private static int _actionLogIndex;
@@ -464,6 +485,13 @@ namespace AutoExile.Systems
         /// <summary>Global gate — no actions before this time.</summary>
         public static DateTime NextActionAt = DateTime.MinValue;
 
+        /// <summary>Timestamp of the last unmatched LeftDown/RightDown, or null if the button is up.
+        /// Used to detect a stuck virtual mouse button (e.g. an exception between down and up)
+        /// that would otherwise leave the game showing a busy cursor and ignore further clicks.</summary>
+        private static DateTime? _leftMouseDownAt;
+        private static DateTime? _rightMouseDownAt;
+        private const double StuckMouseButtonTimeoutMs = 2000;
+
         /// <summary>
         /// Last time any input event (KeyDown/KeyUp/MouseDown/MouseUp) was sent.
         /// Enforces a minimum gap between ALL input events across ALL paths
@@ -514,12 +542,34 @@ namespace AutoExile.Systems
                 LogRawInput("KeyDown-DROPPED", $"{key} {context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
                 return;
             }
+            if (key == Keys.RButton)
+            {
+                SendRightDown(context);
+                return;
+            }
+            if (key == Keys.MButton)
+            {
+                SendMiddleDown(context);
+                return;
+            }
+
             MarkInputEvent("KeyDown", $"{key} {context}".Trim());
             Input.KeyDown(key);
         }
 
         private static void SendKeyUp(Keys key, string context = "")
         {
+            if (key == Keys.RButton)
+            {
+                SendRightUp(context);
+                return;
+            }
+            if (key == Keys.MButton)
+            {
+                SendMiddleUp(context);
+                return;
+            }
+
             MarkInputEvent("KeyUp", $"{key} {context}".Trim());
             Input.KeyUp(key);
         }
@@ -533,12 +583,14 @@ namespace AutoExile.Systems
             }
             MarkInputEvent("LeftDown", context);
             Input.LeftDown();
+            _leftMouseDownAt = DateTime.Now;
         }
 
         private static void SendLeftUp(string context = "")
         {
             MarkInputEvent("LeftUp", context);
             Input.LeftUp();
+            _leftMouseDownAt = null;
         }
 
         private static void SendRightDown(string context = "")
@@ -550,12 +602,57 @@ namespace AutoExile.Systems
             }
             MarkInputEvent("RightDown", context);
             Input.RightDown();
+            _rightMouseDownAt = DateTime.Now;
         }
 
         private static void SendRightUp(string context = "")
         {
             MarkInputEvent("RightUp", context);
             Input.RightUp();
+            _rightMouseDownAt = null;
+        }
+
+        /// <summary>Internal batch helper: sends a tracked mouse button down event.</summary>
+        public static void SendMouseDownPublic(bool rightClick, string context)
+        {
+            if (rightClick) SendRightDown(context);
+            else SendLeftDown(context);
+        }
+
+        /// <summary>Internal batch helper: sends a tracked mouse button up event.</summary>
+        public static void SendMouseUpPublic(bool rightClick, string context)
+        {
+            if (rightClick) SendRightUp(context);
+            else SendLeftUp(context);
+        }
+
+        /// <summary>Forcibly clears any virtual mouse button state after an aborted UI operation.</summary>
+        public static void ReleaseMouseButtons()
+        {
+            if (_leftMouseDownAt.HasValue)
+                SendLeftUp("forced-release");
+            if (_rightMouseDownAt.HasValue)
+                SendRightUp("forced-release");
+        }
+
+        private const uint MouseEventMiddleDown = 0x0020;
+        private const uint MouseEventMiddleUp = 0x0040;
+
+        private static void SendMiddleDown(string context = "")
+        {
+            if (!CanSendInputEvent)
+            {
+                LogRawInput("MiddleDown-DROPPED", $"{context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
+                return;
+            }
+            MarkInputEvent("MiddleDown", context);
+            MouseEvent(MouseEventMiddleDown, 0, 0, 0, UIntPtr.Zero);
+        }
+
+        private static void SendMiddleUp(string context = "")
+        {
+            MarkInputEvent("MiddleUp", context);
+            MouseEvent(MouseEventMiddleUp, 0, 0, 0, UIntPtr.Zero);
         }
 
         /// <summary>
@@ -596,6 +693,9 @@ namespace AutoExile.Systems
 
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll", EntryPoint = "mouse_event")]
+        private static extern void MouseEvent(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
 
         /// <summary>True if the OS reports a modifier key as physically held
         /// (outside our own tracking — e.g. a user-pressed key or a leaked
@@ -700,7 +800,7 @@ namespace AutoExile.Systems
         public static bool StartMovement(Vector2 absScreenPos, Keys moveKey)
         {
             if (TryCaptureReplay("StartMovement", absScreenPos, moveKey)) return true;
-            if (!ClampToWindow(ref absScreenPos)) return false;
+            if (!ClampToWorldSafeZone(ref absScreenPos)) return false;
 
             // Move-only walks TO the cursor. If the target is on the player the
             // character stands still. Safety-nudge every call, including the
@@ -772,7 +872,7 @@ namespace AutoExile.Systems
         {
             if (!IsMovementActive || IsMovementSuspended) return false;
             if (TryCaptureReplay("UpdateMovementCursor", absScreenPos)) return true;
-            if (!ClampToWindow(ref absScreenPos)) return false;
+            if (!ClampToWorldSafeZone(ref absScreenPos)) return false;
             absScreenPos = NudgeOffPlayer(absScreenPos);
 
             // Throttle: only update if position changed significantly or enough time passed
@@ -926,6 +1026,7 @@ namespace AutoExile.Systems
 
         /// <summary>Currently held keys and when they were pressed.</summary>
         private static readonly Dictionary<Keys, DateTime> _heldKeys = new();
+        private static long _holdGeneration;
 
         /// <summary>Auto-release held keys after this many seconds (safety watchdog).</summary>
         public static float HeldKeyTimeoutSeconds = 5f;
@@ -950,6 +1051,13 @@ namespace AutoExile.Systems
         /// </summary>
         public static void TrackHeldKey(Keys key) => _heldKeys[key] = DateTime.Now;
 
+        /// <summary>Refresh the watchdog timestamp for a key that must remain held.</summary>
+        public static void RefreshHeldKey(Keys key)
+        {
+            if (_heldKeys.ContainsKey(key))
+                _heldKeys[key] = DateTime.Now;
+        }
+
         /// <summary>
         /// Hold a key down (KeyDown without KeyUp). The key stays held until
         /// ReleaseKey, ReleaseAllKeys, or the timeout watchdog releases it.
@@ -960,6 +1068,8 @@ namespace AutoExile.Systems
             if (TryCaptureReplay("HoldKey", key: key)) return true;
             if (!CanAct) return false;
 
+            // Supersede any targeted hold whose cursor movement is still pending.
+            Interlocked.Increment(ref _holdGeneration);
             SuspendMovement();
 
             // Release if already held (prevents double-down)
@@ -982,7 +1092,7 @@ namespace AutoExile.Systems
         {
             if (TryCaptureReplay("HoldKeyAt", absPos, key)) return true;
             if (!CanAct) return false;
-            if (!ClampToWindow(ref absPos)) return false;
+            if (!ClampToWorldSafeZone(ref absPos)) return false;
 
             SuspendMovement();
 
@@ -992,22 +1102,37 @@ namespace AutoExile.Systems
 
             var moveMs = EstimateMoveMs(absPos);
             NextActionAt = DateTime.Now.AddMilliseconds(moveMs + ActionCooldownMs);
-            _ = DoHoldKeyAt(absPos, key);
+            var generation = Interlocked.Increment(ref _holdGeneration);
+            _ = DoHoldKeyAt(absPos, key, generation);
             return true;
         }
 
-        private static async Task DoHoldKeyAt(Vector2 absPos, Keys key)
+        private static async Task DoHoldKeyAt(Vector2 absPos, Keys key, long generation)
         {
             await MoveCursorTo(absPos);
+            if (generation != Volatile.Read(ref _holdGeneration)) return;
             await Task.Delay(RandSettle());
+            if (generation != Volatile.Read(ref _holdGeneration)) return;
             await SendDelay();
+            if (generation != Volatile.Read(ref _holdGeneration)) return;
             SendKeyDown(key);
             _heldKeys[key] = DateTime.Now;
+        }
+
+        /// <summary>Update a channelled skill cursor inside the world-safe region.</summary>
+        public static bool UpdateWorldSkillCursor(Vector2 absPos)
+        {
+            if (!ClampToWorldSafeZone(ref absPos)) return false;
+            Input.SetCursorPos(absPos);
+            return true;
         }
 
         /// <summary>Release a specific held key.</summary>
         public static void ReleaseKey(Keys key)
         {
+            // Cancel a matching hold even when its async cursor move has not yet
+            // reached the key-down/tracking step.
+            Interlocked.Increment(ref _holdGeneration);
             if (_heldKeys.Remove(key))
                 SendKeyUp(key);
         }
@@ -1018,6 +1143,8 @@ namespace AutoExile.Systems
         /// </summary>
         public static void ReleaseAllKeys()
         {
+            // Invalidate pending HoldKeyAt continuations before releasing keys.
+            Interlocked.Increment(ref _holdGeneration);
             if (_heldKeys.Count > 0)
             {
                 foreach (var key in _heldKeys.Keys)
@@ -1032,6 +1159,8 @@ namespace AutoExile.Systems
         /// </summary>
         public static void TickHeldKeys()
         {
+            TickStuckMouseButtons();
+
             if (_heldKeys.Count == 0) return;
 
             var now = DateTime.Now;
@@ -1046,6 +1175,31 @@ namespace AutoExile.Systems
             {
                 SendKeyUp(key);
                 _heldKeys.Remove(key);
+            }
+        }
+
+        /// <summary>
+        /// Force-releases a left/right mouse button that's been virtually held far
+        /// longer than any real click (an exception between Down and Up, or a game
+        /// window/focus glitch). Left unresolved this leaves the game showing a busy
+        /// cursor and ignoring all further bot clicks until a real human click occurs.
+        /// </summary>
+        private static void TickStuckMouseButtons()
+        {
+            var now = DateTime.Now;
+            if (_leftMouseDownAt.HasValue &&
+                (now - _leftMouseDownAt.Value).TotalMilliseconds >= StuckMouseButtonTimeoutMs)
+            {
+                LogRawInput("LeftUp-WATCHDOG", $"forced release after {(now - _leftMouseDownAt.Value).TotalMilliseconds:F0}ms held");
+                Input.LeftUp();
+                _leftMouseDownAt = null;
+            }
+            if (_rightMouseDownAt.HasValue &&
+                (now - _rightMouseDownAt.Value).TotalMilliseconds >= StuckMouseButtonTimeoutMs)
+            {
+                LogRawInput("RightUp-WATCHDOG", $"forced release after {(now - _rightMouseDownAt.Value).TotalMilliseconds:F0}ms held");
+                Input.RightUp();
+                _rightMouseDownAt = null;
             }
         }
 
@@ -1163,7 +1317,7 @@ namespace AutoExile.Systems
         {
             if (TryCaptureReplay("CursorPressKey", absPos, key)) return true;
             if (!CanAct) { LogAction("CursorPressKey", absPos, key, false); return false; }
-            if (!ClampToWindow(ref absPos)) { LogAction("CursorPressKey", absPos, key, false); return false; }
+            if (!ClampToWorldSafeZone(ref absPos)) { LogAction("CursorPressKey", absPos, key, false); return false; }
             SuspendMovement();
             ReleaseAllKeys();
             var moveMs = EstimateMoveMs(absPos);
@@ -1178,7 +1332,7 @@ namespace AutoExile.Systems
         /// <summary>Force cursor+key press, bypassing the input gate. For dodge — survival trumps input cadence.</summary>
         public static bool ForceCursorPressKey(Vector2 absPos, Keys key)
         {
-            if (!ClampToWindow(ref absPos)) { LogAction("ForceCursorPressKey", absPos, key, false); return false; }
+            if (!ClampToWorldSafeZone(ref absPos)) { LogAction("ForceCursorPressKey", absPos, key, false); return false; }
             SuspendMovement();
             ReleaseAllKeys();
             var moveMs = EstimateMoveMs(absPos);
@@ -1465,9 +1619,11 @@ namespace AutoExile.Systems
                     await SendDelay();
                     Input.LeftDown();
                     MarkInputEvent("LeftDown", $"batch-click {i + 1}/{positions.Count}");
+                    _leftMouseDownAt = DateTime.Now;
                     await Task.Delay(RandHold());
                     Input.LeftUp();
                     MarkInputEvent("LeftUp", $"batch-click {i + 1}/{positions.Count}");
+                    _leftMouseDownAt = null;
 
                     clicked++;
 
@@ -1489,6 +1645,11 @@ namespace AutoExile.Systems
             }
             finally
             {
+                if (_leftMouseDownAt.HasValue)
+                {
+                    try { Input.LeftUp(); } catch { }
+                    _leftMouseDownAt = null;
+                }
                 IsBatchRunning = false;
                 NextActionAt = DateTime.Now.AddMilliseconds(ActionCooldownMs);
                 onComplete?.Invoke(clicked);

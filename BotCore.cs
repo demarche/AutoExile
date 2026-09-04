@@ -10,6 +10,7 @@ using AutoExile.Modes;
 using AutoExile.Modes.BossEncounters;
 using AutoExile.Systems;
 using AutoExile.WebServer;
+using AutoExile.Statistics;
 using System.IO;
 using System.Linq;
 using System.Numerics;
@@ -57,10 +58,11 @@ namespace AutoExile
         private BossFightRecorder _mavenRecorder = new();
         private HumanGameplayRecorder _humanRecorder = new();
         private BotWebServer? _webServer;
-        private DataStore? _dataStore;
+        private StatsService _stats = null!;
         private ProfileManager? _profileManager;
         private MapDatabase _mapDatabase = null!;
         private readonly PerformanceTracker _perf = new();
+        private bool _loadedDllDiffersFromSource;
 
         // Public accessors for external tools (POEMCP /eval)
         public NavigationSystem Navigation => _navigation;
@@ -76,6 +78,7 @@ namespace AutoExile
         public IBotMode ActiveMode => _mode;
         public BotContext Context => _ctx;
         public HeistState? HeistState => _heistMode?.State;
+        public StatsService Stats => _stats;
 
         // Mode references for ImGui buttons
         private FollowerMode? _followerMode;
@@ -129,12 +132,15 @@ namespace AutoExile
         {
             Name = "AutoExile";
             Instance = this;
+            LogLoadedAssemblyDiagnostics();
             _recorder.SetOutputDir(Path.Combine(DirectoryFullName, "Recordings"));
             _mavenRecorder.Initialize(DirectoryFullName);
             _humanRecorder.Initialize(DirectoryFullName, msg => LogMessage($"[AutoExile] {msg}"));
             _ninjaPrice.Initialize(DirectoryFullName, msg => LogMessage($"[AutoExile] NinjaPrice: {msg}"));
+            _stats = new StatsService(msg => LogMessage($"[Stats] {msg}"));
+            _stats.Initialize(DirectoryFullName);
             _mapDatabase = new MapDatabase(msg => LogMessage($"[AutoExile] {msg}"));
-            _mapDatabase.Initialize(DirectoryFullName);
+            _mapDatabase.Initialize(_stats);
 
             _ctx = new BotContext
             {
@@ -160,6 +166,7 @@ namespace AutoExile
                 MapDatabase = _mapDatabase,
                 Settings = Settings,
                 Perf = _perf,
+                Stats = _stats,
                 Log = msg => LogMessage($"[AutoExile] {msg}")
             };
 
@@ -237,15 +244,13 @@ namespace AutoExile
             _profileManager.OnProfileSwitched += _ => _runtime.Reset();
             _profileManager.LoadActive(Settings);
 
-            // Initialize data store
-            _dataStore = new DataStore(msg => LogMessage($"[AutoExile] {msg}"));
-            _dataStore.Initialize(DirectoryFullName);
-
-            // Wire loot recording callback → data store + optional Discord webhook
-            _lootTracker.OnItemRecorded = (name, value, slots) =>
+            // SQLite is the canonical stats store. The legacy JSONL files are imported
+            // once by StatsService but are never dual-written after migration.
+            _lootTracker.OnItemRecordedDetailed = (name, value, slots, entityId) =>
             {
                 var area = GameController?.Area?.CurrentArea?.Name ?? "";
-                _dataStore.RecordLoot(name, value, slots, area, _mode.Name);
+                var areaHash = GameController?.IngameState?.Data?.CurrentAreaHash ?? 0;
+                _stats.RecordLoot(name, value, slots, entityId, areaHash, area);
 
                 // Discord notification — opt-in, value threshold + optional keyword filter
                 var notif = Settings.Notifications;
@@ -268,7 +273,7 @@ namespace AutoExile
             {
                 var area = GameController?.Area?.CurrentArea?.Name ?? "";
                 var valueStr = chaosValue > 0 ? $" ({chaosValue:F0}c)" : "";
-                _dataStore.RecordEvent("loot_skip", $"{itemName}{valueStr}: {reason}", area);
+                _stats.RecordEvent("loot_skip", $"{itemName}{valueStr}: {reason} @ {area}");
                 _perf.RecordFailure("lootSkip", reason ?? "(unknown)");
             };
 
@@ -281,7 +286,7 @@ namespace AutoExile
             {
                 _webServer = new BotWebServer(Settings.WebUiPort.Value, Settings.WebUiNetworkAccess.Value, msg => LogMessage($"[AutoExile] {msg}"));
                 _webServer.Settings = Settings;
-                _webServer.DataStore = _dataStore;
+                _webServer.Stats = _stats;
                 _webServer.ProfileManager = _profileManager;
                 _webServer.Runtime = _runtime;
                 _webServer.MapDatabase = _mapDatabase;
@@ -294,6 +299,52 @@ namespace AutoExile
             }
 
             return base.Initialise();
+        }
+
+        private void LogLoadedAssemblyDiagnostics()
+        {
+            try
+            {
+                var loadedPath = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                if (string.IsNullOrWhiteSpace(loadedPath) || !File.Exists(loadedPath))
+                {
+                    LogMessage("[AutoExile] DLL diagnostic: loaded assembly path unavailable");
+                    return;
+                }
+
+                var loadedFile = new FileInfo(loadedPath);
+                var loadedHash = Convert.ToHexString(
+                    System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(loadedPath)));
+                LogMessage($"[AutoExile] DLL loaded: path={loadedPath} writeUtc={loadedFile.LastWriteTimeUtc:O} size={loadedFile.Length} sha256={loadedHash}");
+
+                var pluginRoot = Directory.GetParent(DirectoryFullName)?.Parent?.FullName;
+                if (string.IsNullOrEmpty(pluginRoot)) return;
+
+                var sourceCandidates = Directory.GetFiles(
+                    Path.Combine(pluginRoot, "Source", "AutoExile", "bin"),
+                    "AutoExile.dll", SearchOption.AllDirectories);
+                foreach (var sourcePath in sourceCandidates)
+                {
+                    var sourceFile = new FileInfo(sourcePath);
+                    var sourceHash = Convert.ToHexString(
+                        System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(sourcePath)));
+                    if (string.Equals(sourceHash, loadedHash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        LogMessage($"[AutoExile] DLL diagnostic: loaded DLL matches source build {sourcePath}");
+                        return;
+                    }
+
+                    LogMessage($"[AutoExile] WARNING: loaded DLL differs from source build: loaded={loadedPath} ({loadedFile.LastWriteTimeUtc:O}, {loadedFile.Length} bytes, {loadedHash}) source={sourcePath} ({sourceFile.LastWriteTimeUtc:O}, {sourceFile.Length} bytes, {sourceHash})");
+                    _loadedDllDiffersFromSource = true;
+                }
+
+                if (sourceCandidates.Length == 0)
+                    LogMessage("[AutoExile] DLL diagnostic: no Source\\AutoExile\\bin build was found to compare");
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[AutoExile] DLL diagnostic failed: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -360,6 +411,9 @@ namespace AutoExile
             var currentArea = area?.Name ?? "";
             var currentHash = GameController.IngameState?.Data?.CurrentAreaHash ?? 0;
             if (currentHash == 0) return; // Not loaded yet
+
+            BotInput.StopMovement();
+            BotInput.ReleaseAllKeys();
 
             // Skip if same hash (ExileCore may fire AreaChange on reload without actual transition)
             if (currentHash == _lastAreaHash) return;
@@ -466,6 +520,20 @@ namespace AutoExile
 
         public override Job Tick()
         {
+            _stats.SetRunning(Settings.Enable && GameController.InGame && Settings.Running.Value);
+            _stats.SetBestFindsMinimumChaos(Settings.Loot.BestFindsMinChaosValue.Value);
+            _stats.Pulse();
+            if (_loadedDllDiffersFromSource)
+            {
+                if (Settings.Running.Value)
+                {
+                    Settings.Running.Value = false;
+                    BotInput.StopMovement();
+                    BotInput.ReleaseAllKeys();
+                    LogMessage("[AutoExile] Bot paused: the loaded DLL differs from the latest Source build. Rebuild after stopping Loader, then restart ExileAPI.");
+                }
+                return base.Tick();
+            }
             if (!Settings.Enable || !GameController.InGame)
                 return base.Tick();
 
@@ -498,7 +566,11 @@ namespace AutoExile
 
             // Don't do anything when POE isn't the active window
             if (!GameController.IsForeGroundCache)
+            {
+                BotInput.StopMovement();
+                BotInput.ReleaseAllKeys();
                 return base.Tick();
+            }
 
             _ctx.DeltaTime = (float)GameController.DeltaTime;
             _ctx.MinimapIcons = _knownMinimapIcons;
@@ -556,13 +628,14 @@ namespace AutoExile
             BotInput.TickHeldKeys(); // Safety watchdog — auto-release stale held keys
             BotInput.TickMovementLayer(); // Auto-resume movement after discrete actions
 
-            // Sync primary movement key from skill config → NavigationSystem + CombatSystem
-            var primaryMove = Settings.Build.GetPrimaryMovement();
-            _navigation.MoveKey = primaryMove?.Key.Value ?? Keys.T;
-
             // Ensure skill bar is always up to date — NavigationSystem needs MovementSkills
-            // for dash-for-speed even when combat is disabled by the active mode
+            // and the live Move binding even when combat is disabled by the active mode.
             _combat.RefreshSkillBar(GameController, Settings.Build);
+
+            // Prefer the live built-in Move binding. Profiles can outlive skill-bar
+            // changes, so a configured key may now contain an active skill instead.
+            var primaryMove = Settings.Build.GetPrimaryMovement();
+            _navigation.MoveKey = _combat.PrimaryMoveKey ?? primaryMove?.Key.Value ?? Keys.T;
 
             // Sync movement skills (dash/blink) from CombatSystem → NavigationSystem
             _navigation.MovementSkills = _combat.MovementSkills;
@@ -713,12 +786,17 @@ namespace AutoExile
             if (!Settings.Running)
             {
                 BotInput.StopMovement();
+                BotInput.ReleaseAllKeys();
                 return base.Tick();
             }
 
             // Global interrupts — handle before mode gets control
             if (!HandleInterrupts())
+            {
+                BotInput.StopMovement();
+                BotInput.ReleaseAllKeys();
                 return base.Tick();
+            }
 
             // Area change settle — entity list and game state aren't reliable for
             // a few seconds after zone transition. Skip mode logic to prevent
@@ -792,11 +870,17 @@ namespace AutoExile
 
             UpdateDebugRangeCircle();
 
+            // Keep the overlay below PoE's top skill/buff strip at every resolution.
+            // The mode HUD starts below the two global status lines (and recorder line).
+            var windowRect = GameController.Window.GetWindowRectangle();
+            var hudTop = Math.Clamp(windowRect.Height * 0.12f, 120f, 180f);
+            _ctx.ModeHudTop = hudTop + (_humanRecorder.IsRecording ? 60f : 44f);
+
             // Status overlay
             var running = Settings.Running.Value;
             var color = running ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow;
             var status = running ? $"BOT: {_mode.Name}" : $"BOT: PAUSED ({_mode.Name})";
-            Graphics.DrawText(status, new Vector2(100, 80), color);
+            Graphics.DrawText(status, new Vector2(100, hudTop), color);
 
             // Runtime line — shows elapsed (always) + remaining (when limit set).
             // Pause time is excluded automatically by RuntimeTracker.
@@ -821,18 +905,21 @@ namespace AutoExile
                             :  pctLeft < 0.10              ? SharpDX.Color.Orange
                             :                                SharpDX.Color.LightGray;
             }
-            Graphics.DrawText(runtimeText, new Vector2(100, 96), runtimeColor);
+            Graphics.DrawText(runtimeText, new Vector2(100, hudTop + 16f), runtimeColor);
 
             // Human recorder indicator
             if (_humanRecorder.IsRecording)
             {
                 var recText = $"REC  {_humanRecorder.TicksRecorded} ticks";
-                Graphics.DrawText(recText, new Vector2(100, 116), SharpDX.Color.Red);
+                Graphics.DrawText(recText, new Vector2(100, hudTop + 36f), SharpDX.Color.Red);
             }
 
             // Loot tracker overlay (top-right area)
-            var winWidth = GameController.Window.GetWindowRectangle().Width;
-            _lootTracker.Render(Graphics, new Vector2(winWidth - 250, 80));
+            var winWidth = windowRect.Width;
+            // Simulacrum renders the same session metrics in its compact mode HUD,
+            // so avoid a second panel with differently-scoped loot counters.
+            if (_mode != _simulacrumMode)
+                _lootTracker.Render(Graphics, new Vector2(winWidth - 250, hudTop));
 
             // Pass graphics to context for mode rendering
             _ctx.Graphics = Graphics;
@@ -1051,8 +1138,7 @@ namespace AutoExile
                         for (int i = 0; i < limit; i++)
                         {
                             var key = _combat.KeyForSlot(i);
-                            // Skip mouse-only slots — we don't support click-based skill usage
-                            if (key == Keys.None || key == Keys.RButton || key == Keys.MButton)
+                            if (key == Keys.None)
                                 continue;
 
                             var skillId = barIds[i];
@@ -1095,6 +1181,12 @@ namespace AutoExile
                 try { entities = MapRenderer.CollectEntities(GameController, playerGrid); } catch { }
                 List<float[]>? navPath = null;
                 try { navPath = MapRenderer.CollectNavPath(_navigation); } catch { }
+                var statsSnapshot = _stats.Snapshot;
+                var statsSession = statsSnapshot.Session;
+                var simStats = statsSnapshot.SessionFor("Simulacrum");
+                var bossStats = statsSnapshot.SessionFor("Boss");
+                var farmStats = statsSnapshot.SessionFor("Wave Farming");
+                var labStats = statsSnapshot.SessionFor("Labyrinth");
 
                 _webServer.UpdateStatus(new BotStatusSnapshot
                 {
@@ -1119,13 +1211,12 @@ namespace AutoExile
                     ExplorationRegions = _exploration.IsInitialized && _exploration.ActiveBlob != null
                         ? _exploration.ActiveBlob.Regions.Count : 0,
                     LootCandidates = _loot.Candidates.Count,
-                    SessionChaos = Sanitize((float)_lootTracker.TotalChaosValue),
-                    ChaosPerHour = Sanitize((float)_lootTracker.ChaosPerHour),
+                    SessionChaos = Sanitize((float)statsSession.ChaosValue),
+                    ChaosPerHour = Sanitize((float)statsSession.ChaosPerHour),
                     ChaosPerDivine = Sanitize((float)(_ninjaPrice.ChaosPerDivine)),
-                    ItemsLooted = _lootTracker.TotalItemsLooted,
-                    MapsCompleted = _lootTracker.MapsCompleted,
-                    SessionDuration = _lootTracker.SessionDuration.TotalSeconds > 0
-                        ? _lootTracker.SessionDuration.ToString(@"hh\:mm\:ss") : "",
+                    ItemsLooted = statsSession.ItemsLooted,
+                    MapsCompleted = statsSession.FullClears,
+                    SessionDuration = TimeSpan.FromMilliseconds(statsSession.ActiveDurationMs).ToString(@"hh\:mm\:ss"),
                     RuntimeActiveSeconds    = (int)_runtime.ActiveDuration.TotalSeconds,
                     RuntimeRemainingSeconds = Settings.Run.MaxRuntimeMinutes.Value > 0
                         ? (int)_runtime.Remaining(Settings.Run.MaxRuntimeMinutes.Value).TotalSeconds
@@ -1134,20 +1225,20 @@ namespace AutoExile
                     // Simulacrum stats
                     SimWave = _simulacrumMode?.State.CurrentWave ?? 0,
                     SimWaveActive = _simulacrumMode?.State.IsWaveActive ?? false,
-                    SimDeaths = _simulacrumMode?.State.DeathCount ?? 0,
-                    SimRuns = _simulacrumMode?.State.RunsCompleted ?? 0,
-                    SimAvgWaves = Sanitize((float)(_simulacrumMode?.State.AverageWavesPerRun ?? 0)),
-                    SimAvgRunTime = _simulacrumMode?.State.RunsCompleted > 0
-                        ? _simulacrumMode.State.AverageRunDuration.ToString(@"m\:ss") : "",
-                    SimRunTime = _simulacrumMode != null && _mode == _simulacrumMode
-                        && _simulacrumMode.Phase >= SimPhase.FindMonolith && _simulacrumMode.Phase <= SimPhase.ExitMap
-                        ? (DateTime.Now - _simulacrumMode.State.RunStartedAt).ToString(@"m\:ss") : "",
+                    SimDeaths = simStats.Deaths,
+                    SimRuns = simStats.FullClears,
+                    SimAvgWaves = Sanitize((float)simStats.AverageWavesPerEnteredRun),
+                    SimAvgRunTime = simStats.Entered > 0
+                        ? TimeSpan.FromMilliseconds(simStats.AverageRunDurationMs).ToString(@"m\:ss") : "",
+                    SimRunTime = statsSnapshot.CurrentRun?.Mode == "Simulacrum"
+                        ? (DateTime.UtcNow - statsSnapshot.CurrentRun.ActivatedAtUtc).ToString(@"m\:ss") : "",
+                    Stats = statsSnapshot,
 
                     // Boss stats
-                    BossRuns = _bossMode?.RunsCompleted ?? 0,
-                    BossDeaths = _bossMode?.Deaths ?? 0,
+                    BossRuns = bossStats.FullClears + bossStats.PartialRuns + bossStats.NoProgressRuns,
+                    BossDeaths = bossStats.Deaths,
                     BossDrops = _bossMode?.TargetItemsLooted ?? 0,
-                    BossAvgRunTime = Sanitize((float)(_bossMode?.AvgRunTimeSeconds ?? 0)),
+                    BossAvgRunTime = Sanitize((float)(bossStats.AverageRunDurationMs / 1000d)),
                     BossRunsPerDrop = Sanitize((float)(_bossMode?.RunsPerDrop ?? 0)),
                     BossChaosPerHour = Sanitize((float)(_bossMode?.ChaosPerHour(Settings.Boss.KeyDropChaosValue.Value) ?? 0)),
                     BossRunTime = _bossMode != null && _mode == _bossMode
@@ -1156,13 +1247,13 @@ namespace AutoExile
 
                     // Farming stats
                     FarmStrategy = _mode is Modes.WaveFarm.WaveFarmMode ? "Wave Farm" : "",
-                    FarmRuns = (_mode as Modes.WaveFarm.WaveFarmMode)?.RunsCompleted ?? 0,
+                    FarmRuns = farmStats.FullClears,
                     FarmPhase = (_mode as Modes.WaveFarm.WaveFarmMode)?.Status ?? "",
 
                     // Labyrinth stats
                     LabIzaroEncounters = _labyrinthMode?.State.IzaroEncounterCount ?? 0,
-                    LabDeaths = _labyrinthMode?.State.DeathCount ?? 0,
-                    LabRuns = _labyrinthMode?.State.RunsCompleted ?? 0,
+                    LabDeaths = labStats.Deaths,
+                    LabRuns = labStats.FullClears,
                     LabGemsTransformed = _labyrinthMode?.State.GemsTransformed ?? 0,
                     LabTotalProfit = Sanitize((float)(_labyrinthMode?.State.TotalProfit ?? 0)),
                     LabSelectedGem = _labyrinthMode?.State.SelectedGemName ?? "",
@@ -1191,8 +1282,11 @@ namespace AutoExile
         /// <summary>Called by ExileCore when plugin is being unloaded.</summary>
         public override void OnClose()
         {
+            BotInput.StopMovement();
+            BotInput.ReleaseAllKeys();
             _webServer?.Stop();
             _webServer = null;
+            _stats?.Dispose();
             Instance = null;
             base.OnClose();
         }
@@ -1668,23 +1762,33 @@ namespace AutoExile
             var gc = GameController;
 
             if (gc.IsLoading)
+            {
+                BotInput.StopMovement();
+                BotInput.ReleaseAllKeys();
                 return false;
+            }
 
             if (!gc.Player.IsAlive)
             {
                 // Track death for mode re-entry logic
-                if (!_wasDead && _blightMode != null)
+                if (!_wasDead && _mode == _blightMode && _blightMode != null)
                     _blightMode.State.DeathCount++;
-                if (!_wasDead && _simulacrumMode != null)
+                if (!_wasDead && _mode == _simulacrumMode && _simulacrumMode != null)
+                {
                     _simulacrumMode.State.DeathCount++;
-                if (!_wasDead && _heistMode != null)
+                    _simulacrumMode.OnPlayerDied(_ctx);
+                }
+                if (!_wasDead && _mode == _heistMode && _heistMode != null)
                     _heistMode.State.DeathCount++;
-                if (!_wasDead && _labyrinthMode != null)
+                if (!_wasDead && _mode == _labyrinthMode && _labyrinthMode != null)
                     _labyrinthMode.State.DeathCount++;
-                if (!_wasDead && _bossMode != null)
+                if (!_wasDead && _mode == _bossMode && _bossMode != null)
                     _bossMode.IncrementDeathCount();
                 if (!_wasDead)
+                {
+                    _stats.RecordDeath();
                     _deathTime = DateTime.Now;
+                }
                 _wasDead = true;
 
                 // Click resurrect button (brief delay after death to avoid instant clicks)
@@ -1813,6 +1917,9 @@ namespace AutoExile
                 return;
 
             _ctx.Log($"Switching mode: {_mode.Name} -> {newMode.Name}");
+            BotInput.StopMovement();
+            BotInput.ReleaseAllKeys();
+            _stats.EndRun(_mode.Name, "interrupted", "mode_switched");
             _mode.OnExit();
             _mode = newMode;
             _mode.OnEnter(_ctx);
@@ -2228,10 +2335,13 @@ namespace AutoExile
             var numCols = (int)terrain.NumCols;
             var numRows = (int)terrain.NumRows;
 
-            TileStructure[] tileData;
-            try { tileData = memory.ReadStdVector<TileStructure>(terrain.TgtArray); }
-            catch { LogMessage("[AutoExile] TileDump: failed to read tile data"); return; }
-            if (tileData == null || tileData.Length == 0) return;
+            var tileData = TileMap.TryReadTileData(gc);
+            if (tileData == null)
+            {
+                LogMessage("[AutoExile] TileDump: tile metadata is unavailable for this ExileAPI build");
+                return;
+            }
+            if (tileData.Length == 0) return;
 
             var playerGrid = new System.Numerics.Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
 
@@ -2241,9 +2351,9 @@ namespace AutoExile
             {
                 try
                 {
-                    var tgt = memory.Read<TgtTileStruct>(tileData[i].TgtFilePtr);
+                    var tgt = memory.Read<TileMap.TgtTileStructRaw>(tileData[i].TgtFilePtr);
                     tileEntries[i] = (
-                        memory.Read<TgtDetailStruct>(tgt.TgtDetailPtr).name.ToString(memory),
+                        memory.Read<TileMap.TgtDetailStructRaw>(tgt.TgtDetailPtr).Name.ToString(memory),
                         tgt.TgtPath.ToString(memory)
                     );
                 }

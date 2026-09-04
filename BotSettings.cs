@@ -48,7 +48,7 @@ namespace AutoExile
         [Menu("Web UI Port", "Port for the web dashboard (requires restart to change).")]
         public RangeNode<int> WebUiPort { get; set; } = new RangeNode<int>(9876, 1024, 65535);
 
-        [Menu("Web UI Network Access", "Allow access from other devices on the network (requires admin or URL reservation).")]
+        [Menu("Web UI Tailscale Access", "Allow access through this machine's Tailscale IPv4 address only.")]
         public ToggleNode WebUiNetworkAccess { get; set; } = new ToggleNode(false);
 
         [Menu("Auto Level Gems", "Automatically level up skill gems when the level-up panel appears.")]
@@ -171,7 +171,7 @@ namespace AutoExile
             public SkillSlotConfig Skill8 { get; set; } = new SkillSlotConfig(Keys.None);
 
             /// <summary>All configured skill slots.</summary>
-            public IEnumerable<SkillSlotConfig> AllSkillSlots => new[] { Skill1, Skill2, Skill3, Skill4, Skill5, Skill6, Skill7, Skill8 };
+            internal IEnumerable<SkillSlotConfig> AllSkillSlots => new[] { Skill1, Skill2, Skill3, Skill4, Skill5, Skill6, Skill7, Skill8 };
 
             /// <summary>Find the first skill slot with PrimaryMovement role, or null.</summary>
             public SkillSlotConfig? GetPrimaryMovement()
@@ -353,6 +353,9 @@ namespace AutoExile
             [Menu("Min Chaos Per Slot (0=off)", "Minimum chaos value per inventory slot. 0 to disable.")]
             public RangeNode<int> MinChaosPerSlot { get; set; } = new RangeNode<int>(0, 0, 10);
 
+            [Menu("Best Finds Minimum Chaos", "Minimum estimated chaos value shown in the Best Finds history. 0 shows all priced items.")]
+            public RangeNode<int> BestFindsMinChaosValue { get; set; } = new RangeNode<int>(100, 0, 10000);
+
             [Menu("Ignore Quest Items", "Skip quest items (heist contracts, etc.) during loot pickup.")]
             public ToggleNode IgnoreQuestItems { get; set; } = new ToggleNode(true);
 
@@ -503,6 +506,30 @@ namespace AutoExile
             [Menu("Wave Timeout (min)", "Max minutes per wave before abandoning the run.")]
             public RangeNode<float> WaveTimeoutMinutes { get; set; } = new RangeNode<float>(3f, 1f, 10f);
 
+            [Menu("Stationary Channel During Wave", "Keep an Enemy channel skill held during active waves, even when no target is currently visible. Disables wave movement and loot pickup while active.")]
+            public ToggleNode StationaryChannelDuringWave { get; set; } = new ToggleNode(true);
+
+            [Menu("Intensity Buff Name", "Substring match for the player buff that tracks Spark of the Nova's Intensity stacks.")]
+            public TextNode IntensityBuffName { get; set; } = new TextNode("intensity");
+
+            [Menu("Min Intensity Before Reposition", "Don't leave a Spark position until at least this many Intensity stacks are reached, even if the kill rate drops or the time limit below is hit.")]
+            public RangeNode<int> MinIntensityStacksBeforeReposition { get; set; } = new RangeNode<int>(4, 0, 10);
+
+            [Menu("Kill Rate Drop Ratio", "Reposition once the kill rate falls to this fraction of its peak at the current position (e.g. 0.3 = dropped to 30% of peak, like 10/s falling to 1/s or below).")]
+            public RangeNode<float> KillRateDropRatio { get; set; } = new RangeNode<float>(0.3f, 0.05f, 0.9f);
+
+            [Menu("Dangerous Stationary Enemy Count", "Leave the current Spark position early when at least this many enemies are nearby and no kills are confirmed. 0 disables this safety escape.")]
+            public RangeNode<int> DangerousStationaryEnemyCount { get; set; } = new RangeNode<int>(20, 0, 100);
+
+            [Menu("Dangerous No-Kill Escape (s)", "Seconds with zero kills in a dangerous nearby pack before immediately leaving the current Spark position.")]
+            public RangeNode<float> DangerousNoKillEscapeSeconds { get; set; } = new RangeNode<float>(2f, 0.5f, 10f);
+
+            [Menu("Max Channel Position Time (s)", "Move to the next Spark position after this many seconds, once the Intensity floor above is met.")]
+            public RangeNode<float> MaxChannelPositionSeconds { get; set; } = new RangeNode<float>(8f, 1f, 30f);
+
+            [Menu("Emergency Spark Below 30% ES", "Keep Spark channeling immediately when Energy Shield falls below 30%, even if stationary channel mode is disabled. Does not reposition while active.")]
+            public ToggleNode EmergencySparkBelowEs { get; set; } = new ToggleNode(true);
+
             [Menu("Simulacrum Stock", "Keep this many full Simulacrums in inventory. Withdraws from the central Fragment tab (Stash settings) to maintain stock between runs.")]
             public RangeNode<int> SimulacrumStock { get; set; } = new RangeNode<int>(5, 1, 20);
         }
@@ -511,7 +538,7 @@ namespace AutoExile
         public class HeistSettings
         {
             [Menu("Companion Interact Key", "Key to press near doors/chests for companion interaction (default V).")]
-            public System.Windows.Forms.Keys CompanionInteractKey { get; set; } = System.Windows.Forms.Keys.V;
+            public HotkeyNode CompanionInteractKey { get; set; } = new HotkeyNode(Keys.V);
 
             [Menu("Alert Threshold %", "Stop opening side chests above this alert level.")]
             public RangeNode<float> AlertThreshold { get; set; } = new RangeNode<float>(70f, 20f, 95f);
@@ -905,7 +932,7 @@ namespace AutoExile
             /// Positive = reward, negative = danger. Overrides the built-in defaults.
             /// Managed via web UI altar mod editor.
             /// </summary>
-            public Dictionary<string, int> ModWeights { get; set; } = new();
+            internal Dictionary<string, int> ModWeights { get; set; } = new();
         }
 
         [Submenu(CollapsedByDefault = false)]
