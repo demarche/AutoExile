@@ -49,4 +49,14 @@
     </Reference>
   </ItemGroup>
 
+  <Target Name="SyncToTempPlugin" AfterTargets="Build">
+    <PropertyGroup>
+      <TempPluginDir>$(MSBuildProjectDirectory)\..\..\Temp\AutoExile</TempPluginDir>
+    </PropertyGroup>
+    <ItemGroup>
+      <OutputArtifacts Include="$(TargetDir)AutoExile.dll;$(TargetDir)AutoExile.pdb;$(TargetDir)AutoExile.deps.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(OutputArtifacts)" DestinationFolder="$(TempPluginDir)" SkipUnchangedFiles="true" ContinueOnError="true" />
+  </Target>
+
 </Project>

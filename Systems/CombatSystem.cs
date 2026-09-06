@@ -316,6 +316,8 @@ namespace AutoExile.Systems
         {
             var gc = ctx.Game;
             var settings = ctx.Settings.Build;
+            var sustainEnemyChannel = Profile.SustainEnemyChannelWithoutTarget ||
+                (ctx.Navigation.IsPathfinding && !ctx.Interaction.IsBusy);
 
             WantsToMove = false;
 
@@ -347,7 +349,7 @@ namespace AutoExile.Systems
             UpdateAggressiveMovementIntent(gc.Player.GridPosNum);
 
             // Check if active channel should be released (target died, conditions changed, etc.)
-            ReleaseChannelIfNeeded(gc, settings);
+            ReleaseChannelIfNeeded(gc, settings, sustainEnemyChannel);
 
             // Refresh skill bar data periodically
             RefreshSkillBar(gc, settings);
@@ -363,7 +365,7 @@ namespace AutoExile.Systems
             bool usedSkill = TickSelfSkills(gc, settings);
             if (usedSkill) return true; // gate consumed, don't fire more this tick
 
-            if (!InCombat && !Profile.SustainEnemyChannelWithoutTarget)
+            if (!InCombat && !sustainEnemyChannel)
             {
                 // Monsters in range but behind terrain — reposition to get LOS
                 if (NearestBlockedPos.HasValue && !SuppressPositioning && BotInput.CanAct)
@@ -380,7 +382,7 @@ namespace AutoExile.Systems
 
             // Execute targeted skills (Enemy/Corpse roles need combat context)
             if (!BotInput.CanAct) return false;
-            usedSkill = TickSkills(gc, settings);
+            usedSkill = TickSkills(gc, settings, sustainEnemyChannel);
             if (usedSkill) return true;
 
             // Track attack connectivity — detect unreachable monsters
@@ -1240,7 +1242,8 @@ namespace AutoExile.Systems
             return false;
         }
 
-        internal bool TickSkills(GameController gc, BotSettings.BuildSettings settings)
+        internal bool TickSkills(GameController gc, BotSettings.BuildSettings settings,
+            bool sustainEnemyChannel = false)
         {
             // If channeling, update cursor toward target each tick.
             // Don't block the skill loop — higher-priority skills (curses, debuffs) can
@@ -1271,7 +1274,7 @@ namespace AutoExile.Systems
 
                 // Targeting prerequisite: Enemy needs a target, Corpse needs a corpse
                 if (entry.Role == SkillRole.Enemy && (BestTarget == null || !InCombat)
-                    && !(entry.IsChannel && Profile.SustainEnemyChannelWithoutTarget)) continue;
+                    && !(entry.IsChannel && sustainEnemyChannel)) continue;
                 if (entry.Role == SkillRole.Corpse && !NearestCorpse.HasValue) continue;
 
                 // All "when to fire" logic is in conditions
@@ -1461,7 +1464,8 @@ namespace AutoExile.Systems
         /// Release the active channeling skill if conditions are no longer met.
         /// Called at the start of each combat tick.
         /// </summary>
-        private void ReleaseChannelIfNeeded(GameController gc, BotSettings.BuildSettings settings)
+        private void ReleaseChannelIfNeeded(GameController gc, BotSettings.BuildSettings settings,
+            bool sustainEnemyChannel)
         {
             if (_activeChannel == null) return;
 
@@ -1480,7 +1484,7 @@ namespace AutoExile.Systems
             bool shouldRelease = false;
 
             // No more targets
-            if (!Profile.SustainEnemyChannelWithoutTarget &&
+            if (!sustainEnemyChannel &&
                 _activeChannel.Role == SkillRole.Enemy && (BestTarget == null || !InCombat))
                 shouldRelease = true;
 
@@ -1495,7 +1499,7 @@ namespace AutoExile.Systems
 
             if (shouldRelease)
             {
-                var releaseReason = !Profile.SustainEnemyChannelWithoutTarget &&
+                var releaseReason = !sustainEnemyChannel &&
                     _activeChannel.Role == SkillRole.Enemy && (BestTarget == null || !InCombat)
                     ? "no_target"
                     : SuppressTargetedSkills ? "targeted_suppressed" : "conditions_failed";

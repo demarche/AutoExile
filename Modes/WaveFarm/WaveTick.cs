@@ -27,6 +27,8 @@ namespace AutoExile.Modes.WaveFarm
         private DateTime _lastMechanicScan = DateTime.MinValue;
         private const int LootScanIntervalMs = 500;
         private const int MechanicScanIntervalMs = 1000;
+        private const int LootDangerNearbyMonsters = 25;
+        private const int LootDangerWeightedDensity = 40;
 
         // Interactable tracking
         private readonly HashSet<long> _failedInteractables = new();
@@ -274,6 +276,22 @@ namespace AutoExile.Modes.WaveFarm
 
             bool denseEnough = pauseDensity > 0 && ctx.Combat.InCombat &&
                 ctx.Combat.WeightedDensity >= pauseDensity;
+            var lootIsDangerous = ctx.Combat.InCombat &&
+                (ctx.Combat.NearbyMonsterCount >= LootDangerNearbyMonsters ||
+                 ctx.Combat.WeightedDensity >= LootDangerWeightedDensity);
+
+            // Loot clicks suppress targeted skills to protect cursor accuracy. In a
+            // dense pack that turns off Spark exactly when sustained DPS is required,
+            // so abandon the pickup and resume combat. The item remains eligible once
+            // the pack is safe.
+            if (lootIsDangerous && ctx.Interaction.IsBusy && _lootTracker.HasPending)
+            {
+                var itemName = _lootTracker.PendingItemName ?? "item";
+                ctx.Interaction.Cancel(gc);
+                _lootTracker.Reset();
+                _forceReEval = true;
+                ctx.Log($"[Wave] Loot preempted for combat: {itemName}; nearby={ctx.Combat.NearbyMonsterCount}, density={ctx.Combat.WeightedDensity}");
+            }
 
             // Once we commit to a pack, stay engaged until ALL nearby monsters are dead.
             // Without this, the bot disengages when density drops below threshold (e.g. 2
@@ -312,7 +330,7 @@ namespace AutoExile.Modes.WaveFarm
                     _lastLootScan = DateTime.Now;
                     _forceReEval = true;
                 }
-                if (!ctx.Interaction.IsBusy && ctx.Loot.HasLootNearby)
+                if (!lootIsDangerous && !ctx.Interaction.IsBusy && ctx.Loot.HasLootNearby)
                 {
                     var (_, candidate) = ctx.Loot.PickupNext(ctx.Interaction, ctx.Navigation);
                     if (candidate != null && ctx.Interaction.IsBusy)
@@ -335,8 +353,8 @@ namespace AutoExile.Modes.WaveFarm
                 }
                 else
                 {
-                    Status = $"In pack, looting ({ctx.Combat.NearbyMonsterCount} monsters)";
-                    Decision = "InPack+Loot";
+                    Status = $"In pack, finishing interaction ({ctx.Combat.NearbyMonsterCount} monsters)";
+                    Decision = "InPack+Interaction";
                 }
                 return false;
             }

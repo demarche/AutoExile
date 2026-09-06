@@ -1070,6 +1070,8 @@ namespace AutoExile.Modes
             public double PositionElapsed;
             public bool InteractionBusy;
             public bool IsNavigating;
+            public bool IsPathfinding;
+            public string PathfindingStatus;
             public bool CanAct;
             public float PlayerGridX;
             public float PlayerGridY;
@@ -1109,6 +1111,8 @@ namespace AutoExile.Modes
                 PositionElapsed = positionElapsed,
                 InteractionBusy = ctx.Interaction.IsBusy,
                 IsNavigating = ctx.Navigation.IsNavigating,
+                IsPathfinding = ctx.Navigation.IsPathfinding,
+                PathfindingStatus = ctx.Navigation.PathfindingStatus,
                 CanAct = BotInput.CanAct,
                 PlayerGridX = playerGrid.X,
                 PlayerGridY = playerGrid.Y,
@@ -1130,7 +1134,9 @@ namespace AutoExile.Modes
             {
                 ctx.Log($"[Simulacrum][Death] wave={_state.CurrentWave} phase={_phase} " +
                     $"hp={ctx.Combat.HpPercent:P0} es={ctx.Combat.EsPercent:P0} " +
-                    $"decision=\"{Decision}\" status=\"{StatusText}\" samples={_sparkDiagnosticCount}");
+                    $"decision=\"{Decision}\" status=\"{StatusText}\" samples={_sparkDiagnosticCount} " +
+                    $"navMs={ctx.Navigation.LastPathfindMs} navTimedOut={ctx.Navigation.LastPathfindTimedOut} " +
+                    $"navigating={ctx.Navigation.IsNavigating} recovery=\"{ctx.Navigation.LastRecoveryAction}\"");
 
                 var buffs = ctx.Game.Player?.Buffs;
                 if (buffs != null)
@@ -1154,7 +1160,8 @@ namespace AutoExile.Modes
                         $"enemyChannel={s.HasEnemyChannel} channeling={s.IsChanneling} intensity={s.Intensity} " +
                         $"rate={s.KillRate:F1}/s peak={s.PeakKillRate:F1}/s repositioning={s.Repositioning} " +
                         $"posElapsed={s.PositionElapsed:F1}s interactionBusy={s.InteractionBusy} " +
-                        $"navigating={s.IsNavigating} canAct={s.CanAct} decision=\"{s.Decision}\" status=\"{s.StatusText}\"");
+                        $"navigating={s.IsNavigating} pathfinding={s.IsPathfinding} path=\"{s.PathfindingStatus}\" " +
+                        $"canAct={s.CanAct} decision=\"{s.Decision}\" status=\"{s.StatusText}\"");
                 }
             }
             catch (Exception ex)

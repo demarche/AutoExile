@@ -74,9 +74,11 @@ namespace AutoExile.Systems
         /// Returns a list of grid positions from start to goal, or empty if no path.
         /// </summary>
         public static List<Vector2> FindPath(int[][] grid, Vector2 gridStart, Vector2 gridEnd,
-            int maxNodes = 200000, bool flatCost = false)
+            int maxNodes = 200000, bool flatCost = false, int maxSearchMs = 0,
+            CancellationToken cancellationToken = default)
         {
-            var result = FindPathInternal(grid, null, gridStart, gridEnd, 0, 0, maxNodes, flatCost);
+            var result = FindPathInternal(grid, null, gridStart, gridEnd, 0, 0, maxNodes, flatCost,
+                maxSearchMs, cancellationToken);
             return result.Select(w => w.Position).ToList();
         }
 
@@ -90,23 +92,27 @@ namespace AutoExile.Systems
             int[][] pfGrid, int[][] tgtGrid,
             Vector2 gridStart, Vector2 gridEnd,
             int blinkRange = 40, float blinkCostPenalty = 30f,
-            int maxNodes = 200000)
+            int maxNodes = 200000, int maxSearchMs = 0,
+            CancellationToken cancellationToken = default)
         {
             if (tgtGrid == null || tgtGrid.Length == 0)
             {
                 // Fall back to normal pathfinding
-                var fallback = FindPath(pfGrid, gridStart, gridEnd, maxNodes);
+                var fallback = FindPath(pfGrid, gridStart, gridEnd, maxNodes,
+                    maxSearchMs: maxSearchMs, cancellationToken: cancellationToken);
                 return fallback.Select(p => new NavWaypoint(p, WaypointAction.Walk)).ToList();
             }
 
-            return FindPathInternal(pfGrid, tgtGrid, gridStart, gridEnd, blinkRange, blinkCostPenalty, maxNodes);
+            return FindPathInternal(pfGrid, tgtGrid, gridStart, gridEnd, blinkRange, blinkCostPenalty,
+                maxNodes, maxSearchMs: maxSearchMs, cancellationToken: cancellationToken);
         }
 
         private static List<NavWaypoint> FindPathInternal(
             int[][] pfGrid, int[][]? tgtGrid,
             Vector2 gridStart, Vector2 gridEnd,
             int blinkRange, float blinkCostPenalty,
-            int maxNodes, bool flatCost = false)
+            int maxNodes, bool flatCost = false, int maxSearchMs = 0,
+            CancellationToken cancellationToken = default)
         {
             var sx = (int)gridStart.X;
             var sy = (int)gridStart.Y;
@@ -139,9 +145,21 @@ namespace AutoExile.Systems
             open.Enqueue((sx, sy), Heuristic(sx, sy, gx, gy));
 
             var explored = 0;
+            var searchStartedAt = maxSearchMs > 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+            var maxSearchTicks = maxSearchMs > 0
+                ? System.Diagnostics.Stopwatch.Frequency * maxSearchMs / 1000
+                : long.MaxValue;
 
             while (open.Count > 0 && explored < maxNodes)
             {
+                // Check periodically to keep clock reads negligible while guaranteeing
+                // the game thread never spends an unbounded time in one route search.
+                if ((explored & 63) == 0 && cancellationToken.IsCancellationRequested)
+                    return new List<NavWaypoint>();
+                if ((explored & 63) == 0 &&
+                    System.Diagnostics.Stopwatch.GetTimestamp() - searchStartedAt >= maxSearchTicks)
+                    break;
+
                 var (cx, cy) = open.Dequeue();
                 explored++;
 

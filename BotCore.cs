@@ -62,7 +62,6 @@ namespace AutoExile
         private ProfileManager? _profileManager;
         private MapDatabase _mapDatabase = null!;
         private readonly PerformanceTracker _perf = new();
-        private bool _loadedDllDiffersFromSource;
 
         // Public accessors for external tools (POEMCP /eval)
         public NavigationSystem Navigation => _navigation;
@@ -93,6 +92,10 @@ namespace AutoExile
         private long _lastAreaHash;
         private DateTime _areaChangedAt = DateTime.MinValue;
         private float AreaSettleSeconds => Settings.AreaSettleSeconds.Value;
+        private DateTime _idleDiagnosticSince = DateTime.MinValue;
+        private DateTime _lastIdleDiagnosticAt = DateTime.MinValue;
+        private const double IdleDiagnosticDelaySeconds = 2;
+        private const double IdleDiagnosticIntervalSeconds = 5;
 
         // Cross-zone state cache (e.g., Wishes portal round-trip)
         // Keyed by area name — when returning to same-named area, restore cached state
@@ -320,26 +323,31 @@ namespace AutoExile
                 var pluginRoot = Directory.GetParent(DirectoryFullName)?.Parent?.FullName;
                 if (string.IsNullOrEmpty(pluginRoot)) return;
 
-                var sourceCandidates = Directory.GetFiles(
-                    Path.Combine(pluginRoot, "Source", "AutoExile", "bin"),
-                    "AutoExile.dll", SearchOption.AllDirectories);
-                foreach (var sourcePath in sourceCandidates)
-                {
-                    var sourceFile = new FileInfo(sourcePath);
-                    var sourceHash = Convert.ToHexString(
-                        System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(sourcePath)));
-                    if (string.Equals(sourceHash, loadedHash, StringComparison.OrdinalIgnoreCase))
-                    {
-                        LogMessage($"[AutoExile] DLL diagnostic: loaded DLL matches source build {sourcePath}");
-                        return;
-                    }
+                var binDir = Path.Combine(pluginRoot, "Source", "AutoExile", "bin");
+                if (!Directory.Exists(binDir)) return;
 
-                    LogMessage($"[AutoExile] WARNING: loaded DLL differs from source build: loaded={loadedPath} ({loadedFile.LastWriteTimeUtc:O}, {loadedFile.Length} bytes, {loadedHash}) source={sourcePath} ({sourceFile.LastWriteTimeUtc:O}, {sourceFile.Length} bytes, {sourceHash})");
-                    _loadedDllDiffersFromSource = true;
+                var latestSourcePath = Directory.GetFiles(binDir, "AutoExile.dll", SearchOption.AllDirectories)
+                    .OrderByDescending(f => new FileInfo(f).LastWriteTimeUtc)
+                    .FirstOrDefault();
+
+                if (latestSourcePath == null)
+                {
+                    LogMessage("[AutoExile] DLL diagnostic: no Source\\AutoExile\\bin build was found to compare");
+                    return;
                 }
 
-                if (sourceCandidates.Length == 0)
-                    LogMessage("[AutoExile] DLL diagnostic: no Source\\AutoExile\\bin build was found to compare");
+                var sourceFile = new FileInfo(latestSourcePath);
+                var sourceHash = Convert.ToHexString(
+                    System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(latestSourcePath)));
+
+                if (string.Equals(sourceHash, loadedHash, StringComparison.OrdinalIgnoreCase))
+                {
+                    LogMessage($"[AutoExile] DLL diagnostic: loaded DLL matches latest source build {latestSourcePath}");
+                }
+                else
+                {
+                    LogMessage($"[AutoExile] Info: loaded DLL differs from latest source build: loaded={loadedPath} ({loadedFile.LastWriteTimeUtc:O}) source={latestSourcePath} ({sourceFile.LastWriteTimeUtc:O})");
+                }
             }
             catch (Exception ex)
             {
@@ -523,17 +531,6 @@ namespace AutoExile
             _stats.SetRunning(Settings.Enable && GameController.InGame && Settings.Running.Value);
             _stats.SetBestFindsMinimumChaos(Settings.Loot.BestFindsMinChaosValue.Value);
             _stats.Pulse();
-            if (_loadedDllDiffersFromSource)
-            {
-                if (Settings.Running.Value)
-                {
-                    Settings.Running.Value = false;
-                    BotInput.StopMovement();
-                    BotInput.ReleaseAllKeys();
-                    LogMessage("[AutoExile] Bot paused: the loaded DLL differs from the latest Source build. Rebuild after stopping Loader, then restart ExileAPI.");
-                }
-                return base.Tick();
-            }
             if (!Settings.Enable || !GameController.InGame)
                 return base.Tick();
 
@@ -831,6 +828,7 @@ namespace AutoExile
 
             // Let the active mode decide what to do (may set up navigation paths)
             _mode.Tick(_ctx);
+            LogIdleDiagnosticIfNeeded();
 
             // Record dodge action (set during mode tick, after recorder snapshot)
             if (_mode is BossMode bm && !string.IsNullOrEmpty(bm.LastDodgeAction))
@@ -1771,6 +1769,8 @@ namespace AutoExile
             if (!gc.Player.IsAlive)
             {
                 // Track death for mode re-entry logic
+                if (!_wasDead)
+                    LogDeathDiagnostic(gc);
                 if (!_wasDead && _mode == _blightMode && _blightMode != null)
                     _blightMode.State.DeathCount++;
                 if (!_wasDead && _mode == _simulacrumMode && _simulacrumMode != null)
@@ -1877,6 +1877,81 @@ namespace AutoExile
             catch { }
 
             return true;
+        }
+
+        /// <summary>
+        /// Emits a locale-independent snapshot on the Player.IsAlive death edge.
+        /// This uses game state rather than resurrect-panel text, so every client
+        /// language produces the same diagnostic.
+        /// </summary>
+        private void LogDeathDiagnostic(GameController gc)
+        {
+            try
+            {
+                var modeDecision = (_mode as Modes.WaveFarm.WaveFarmMode)?.Decision
+                    ?? (_mode as SimulacrumMode)?.Decision
+                    ?? (_mode as HeistMode)?.Decision
+                    ?? (_mode as FollowerMode)?.Decision
+                    ?? (_mode as BossMode)?.Decision
+                    ?? "";
+                var modeStatus = (_mode as Modes.WaveFarm.WaveFarmMode)?.Status
+                    ?? (_mode as SimulacrumMode)?.StatusText
+                    ?? (_mode as BlightMode)?.StatusText
+                    ?? (_mode as HeistMode)?.StatusText
+                    ?? (_mode as FollowerMode)?.StatusText
+                    ?? (_mode as LabyrinthMode)?.StatusText
+                    ?? (_mode as BossMode)?.Status
+                    ?? "";
+                var areaName = gc.Area?.CurrentArea?.Name ?? "(unknown)";
+
+                LogMessage($"[AutoExile][Death] mode={_mode.Name} area=\"{areaName}\" " +
+                    $"hp={_combat.HpPercent:P0} es={_combat.EsPercent:P0} " +
+                    $"nearby={_combat.NearbyMonsterCount} cached={_combat.CachedMonsterCount} " +
+                    $"combat=\"{_combat.LastAction}\" decision=\"{modeDecision}\" status=\"{modeStatus}\" " +
+                    $"interactionBusy={_interaction.IsBusy} interaction=\"{_interaction.Status}\" " +
+                    $"lootNearby={_loot.HasLootNearby} lootCandidates={_loot.Candidates.Count} navigating={_navigation.IsNavigating} " +
+                    $"pathfinding={_navigation.IsPathfinding} path=\"{_navigation.PathfindingStatus}\" " +
+                    $"pathMs={_navigation.LastPathfindMs} recovery=\"{_navigation.LastRecoveryAction}\" " +
+                    $"channeling={_combat.IsChanneling} channel=\"{_combat.ChannelInputDiagnostics}\"");
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[AutoExile][Death] diagnostic failed: {ex.Message}");
+            }
+        }
+
+        private void LogIdleDiagnosticIfNeeded()
+        {
+            var isWaiting = _navigation.IsPathfinding || _interaction.IsBusy ||
+                _navigation.IsNavigating || _combat.IsChanneling || _combat.InCombat;
+            if (isWaiting)
+            {
+                _idleDiagnosticSince = DateTime.MinValue;
+                if (_navigation.IsPathfinding &&
+                    (DateTime.Now - _lastIdleDiagnosticAt).TotalSeconds >= IdleDiagnosticDelaySeconds)
+                {
+                    _lastIdleDiagnosticAt = DateTime.Now;
+                    LogMessage($"[AutoExile][AsyncWork] mode={_mode.Name} path=\"{_navigation.PathfindingStatus}\" " +
+                        $"channeling={_combat.IsChanneling} channel=\"{_combat.ChannelInputDiagnostics}\" " +
+                        $"nearby={_combat.NearbyMonsterCount} cached={_combat.CachedMonsterCount}");
+                }
+                return;
+            }
+
+            var now = DateTime.Now;
+            if (_idleDiagnosticSince == DateTime.MinValue)
+            {
+                _idleDiagnosticSince = now;
+                return;
+            }
+            if ((now - _idleDiagnosticSince).TotalSeconds < IdleDiagnosticDelaySeconds ||
+                (now - _lastIdleDiagnosticAt).TotalSeconds < IdleDiagnosticIntervalSeconds)
+                return;
+
+            _lastIdleDiagnosticAt = now;
+            LogMessage($"[AutoExile][Idle] mode={_mode.Name} reason=no navigation, interaction, combat, or channel " +
+                $"decision=\"{_combat.LastAction}\" path=\"{_navigation.PathfindingStatus}\" " +
+                $"nearby={_combat.NearbyMonsterCount} cached={_combat.CachedMonsterCount}");
         }
 
         public override void EntityAdded(Entity entity)
