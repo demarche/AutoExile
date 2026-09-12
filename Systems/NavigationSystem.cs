@@ -94,6 +94,13 @@ namespace AutoExile.Systems
         private int _stuckRecoveryCount;
         private int _totalStuckRecoveries; // persists across repaths, only resets on new target
         private const int MaxRecoveriesBeforeRepath = 3;
+        // Pathing-level recoveries (repath/escape probe) all rely on the same input
+        // layer (held move key + cursor position). If the game itself is unresponsive
+        // (busy cursor, stuck action gate from an aborted click sequence), none of them
+        // produce real movement no matter how many times we retry the same input calls.
+        // Once recoveries pile up this high, force-clear the input layer — the bot
+        // equivalent of a human clicking to unstick the cursor — before probing again.
+        private const int InputRecoveryThreshold = 8;
         private const float InteractSearchRadius = 28f; // grid units to search for interactables
         public int StuckRecoveries => _totalStuckRecoveries;
         public string LastRecoveryAction { get; private set; } = "";
@@ -725,9 +732,14 @@ namespace AutoExile.Systems
         /// </summary>
         public bool NavigateTo(GameController gc, Vector2 gridTarget, int maxNodes = 0)
         {
-            if (_pendingPathTask != null && !_pendingPathTask.IsCompleted &&
+            if (_pendingPathTask != null &&
                 Vector2.Distance(_pendingPathTarget, gridTarget) <= 10f)
-                return true;
+            {
+                // A completed task still belongs to this request until it is consumed.
+                // Replacing it here discarded every fast route before Tick could apply it.
+                if (_pendingPathTask.IsCompleted) ApplyCompletedPath(gc);
+                return IsNavigating;
+            }
 
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
             var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
@@ -784,7 +796,12 @@ namespace AutoExile.Systems
             CancelPendingPath();
             _pendingPathTarget = gridTarget;
             Destination = gridTarget;
-            IsNavigating = false;
+            // Navigation includes the planning phase. Callers must not select a new
+            // exploration target every frame while this route is being computed.
+            IsNavigating = true;
+            IsPaused = false;
+            CurrentNavPath.Clear();
+            CurrentWaypointIndex = 0;
             PathfindingStatus = $"computing route #{requestVersion}";
             _pendingPathCancellation = new CancellationTokenSource();
             var cancellationToken = _pendingPathCancellation.Token;
@@ -856,11 +873,13 @@ namespace AutoExile.Systems
                 LastPathfindTimedOut = false;
                 if (result.Cancelled)
                 {
+                    IsNavigating = false;
                     PathfindingStatus = "cancelled";
                     return;
                 }
                 if (result.Path.Count == 0)
                 {
+                    IsNavigating = false;
                     PathfindingStatus = $"failed after {LastPathfindMs}ms";
                     return;
                 }
@@ -1012,6 +1031,11 @@ namespace AutoExile.Systems
         /// </summary>
         private void EscapeProbe(GameController gc, Vector2 playerGrid)
         {
+            if (_totalStuckRecoveries > 0 && _totalStuckRecoveries % InputRecoveryThreshold == 0)
+            {
+                BotInput.ForceInputRecovery($"navigation stuck ×{_totalStuckRecoveries}");
+            }
+
             var waypoint = CurrentNavPath[CurrentWaypointIndex];
             var dirToWaypoint = waypoint.Position - playerGrid;
             if (dirToWaypoint.Length() > 0)

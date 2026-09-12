@@ -621,6 +621,7 @@ namespace AutoExile
             _navigation.DashMinDistance = Settings.Build.DashMinDistance.Value;
             _navigation.PathMergeThreshold = Settings.Build.PathMergeThreshold.Value;
             BotInput.ActionCooldownMs = Settings.ActionCooldownMs.Value;
+            BotInput.DiagnosticLog = _ctx.Log;
             BotInput.WindowRect = GameController.Window.GetWindowRectangleTimeCache;
             BotInput.TickHeldKeys(); // Safety watchdog — auto-release stale held keys
             BotInput.TickMovementLayer(); // Auto-resume movement after discrete actions
@@ -838,7 +839,7 @@ namespace AutoExile
             // This prevents stale walk commands: the walk command always targets the current path,
             // not a path that's about to be replaced.
             // Only tick nav when no async action is in flight (cursor settle / key hold).
-            if (canAct)
+            if (BotInput.CanAct)
                 _navigation.Tick(GameController);
 
             // Auto level gems (global, runs across all modes)

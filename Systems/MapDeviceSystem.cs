@@ -108,6 +108,7 @@ namespace AutoExile.Systems
         public MapDevicePhase Phase => _phase;
         public string Status { get; private set; } = "";
         public bool IsBusy => _phase != MapDevicePhase.Idle;
+        private DateTime _lastDiagnosticAt = DateTime.MinValue;
         public long ActivationSequence { get; private set; }
         public DateTime? LastActivationConfirmedAtUtc { get; private set; }
 
@@ -166,6 +167,13 @@ namespace AutoExile.Systems
         {
             if (_phase == MapDevicePhase.Idle)
                 return MapDeviceResult.None;
+
+            if ((DateTime.Now - _lastDiagnosticAt).TotalSeconds >= 2)
+            {
+                _lastDiagnosticAt = DateTime.Now;
+                BotInput.DiagnosticLog($"[MapDevice] phase={_phase} status={Status} " +
+                    $"path={nav.PathfindingStatus} input=[{BotInput.InputDiagnostics}]");
+            }
 
             var phaseElapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
 

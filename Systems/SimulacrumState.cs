@@ -46,8 +46,10 @@ namespace AutoExile.Systems
         private readonly List<RunRecord> _runHistory = new();
         public IReadOnlyList<RunRecord> RunHistory => _runHistory;
 
-        // Last valid monolith update — if stale >10s, assume wave inactive
-        private DateTime _lastMonolithUpdate = DateTime.MinValue;
+        private SimulacrumWaveObservation _observation = new();
+        public bool HasFreshWaveState => _observation.IsFresh(DateTime.Now);
+        public double WaveStateAgeSeconds => (DateTime.Now - _observation.LastUpdatedAt).TotalSeconds;
+        public string MonolithDiagnostics { get; private set; } = "not observed";
 
         // Position sanity
         private const float PositionSanityThreshold = 50f;
@@ -76,7 +78,8 @@ namespace AutoExile.Systems
             DeathCount = 0;
             HighestWaveThisRun = 0;
             RunStartedAt = DateTime.Now;
-            _lastMonolithUpdate = DateTime.MinValue;
+            _observation = new();
+            MonolithDiagnostics = "reset";
         }
 
         /// <summary>
@@ -93,7 +96,8 @@ namespace AutoExile.Systems
             IsWaveActive = false;
             CurrentWave = 0;
             CanStartWaveAt = DateTime.MinValue;
-            _lastMonolithUpdate = DateTime.MinValue;
+            _observation = new();
+            MonolithDiagnostics = "area changed";
         }
 
         public void RecordRunComplete()
@@ -169,33 +173,45 @@ namespace AutoExile.Systems
                 if (IsPositionSane(freshPos, MonolithPosition))
                     MonolithPosition = freshPos;
 
-                if (monolith.TryGetComponent<StateMachine>(out var state))
+                try
                 {
-                    var isActive = state.States.FirstOrDefault(s => s.Name == "active")?.Value > 0 &&
-                                   state.States.FirstOrDefault(s => s.Name == "goodbye")?.Value == 0;
-                    var wave = (int)(state.States.FirstOrDefault(s => s.Name == "wave")?.Value ?? 0);
-
-                    // Wave just ended — enforce delay before next start
-                    if (IsWaveActive && !isActive)
-                        CanStartWaveAt = DateTime.Now.AddSeconds(minWaveDelay);
-
-                    // Wave number changed
-                    if (wave != CurrentWave)
+                    // Read one snapshot; repeated States reads can straddle a wave transition.
+                    var states = monolith.GetComponent<StateMachine>()?.States?.ToArray();
+                    MonolithDiagnostics = $"id={monolith.Id} targetable={monolith.IsTargetable} " +
+                        $"targeted={monolith.GetComponent<Targetable>()?.isTargeted} " +
+                        $"states=[{(states == null ? "missing" : string.Join(",", states.Select(s => $"{s.Name}={s.Value}")))}]";
+                    if (_observation.Observe(
+                        (int?)states?.FirstOrDefault(s => s.Name == "active")?.Value,
+                        (int?)states?.FirstOrDefault(s => s.Name == "goodbye")?.Value,
+                        (int?)states?.FirstOrDefault(s => s.Name == "wave")?.Value, DateTime.Now))
                     {
-                        WaveStartedAt = DateTime.Now;
-                        if (wave > HighestWaveThisRun)
-                            HighestWaveThisRun = wave;
-                    }
+                        var isActive = _observation.IsActive;
+                        var wave = _observation.Wave;
 
-                    IsWaveActive = isActive;
-                    CurrentWave = wave;
-                    _lastMonolithUpdate = DateTime.Now;
+                        // Wave just ended — enforce delay before next start
+                        if (IsWaveActive && !isActive)
+                            CanStartWaveAt = DateTime.Now.AddSeconds(minWaveDelay);
+
+                        // Wave number changed
+                        if (wave != CurrentWave)
+                        {
+                            WaveStartedAt = DateTime.Now;
+                            if (wave > HighestWaveThisRun)
+                                HighestWaveThisRun = wave;
+                        }
+
+                        IsWaveActive = isActive;
+                        CurrentWave = wave;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    MonolithDiagnostics = $"id={monolith.Id} read failed: {ex.GetType().Name}: {ex.Message}";
                 }
             }
-            else if (DateTime.Now > _lastMonolithUpdate.AddSeconds(10))
+            else
             {
-                // Monolith out of range for too long — assume wave inactive
-                IsWaveActive = false;
+                MonolithDiagnostics = $"id={MonolithId} entity missing";
             }
 
             // --- Track stash (only search once — position is static) ---

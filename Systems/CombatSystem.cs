@@ -316,8 +316,9 @@ namespace AutoExile.Systems
         {
             var gc = ctx.Game;
             var settings = ctx.Settings.Build;
-            var sustainEnemyChannel = Profile.SustainEnemyChannelWithoutTarget ||
-                (ctx.Navigation.IsPathfinding && !ctx.Interaction.IsBusy);
+            // Only the mode can request targetless casting. Planning a route is not
+            // evidence of an enemy, and must not restart Spark during relocation.
+            var sustainEnemyChannel = Profile.SustainEnemyChannelWithoutTarget;
 
             WantsToMove = false;
 
@@ -409,6 +410,19 @@ namespace AutoExile.Systems
             MoveTargetGrid = DenseClusterCenter;
             MoveTarget = ToWorld(DenseClusterCenter);
             LastAction = $"aggressive: pathfind to density @ ({DenseClusterCenter.X:F0},{DenseClusterCenter.Y:F0}) dist={distance:F0}";
+        }
+
+        /// <summary>Stop combat input while a mode handles non-combat interaction.</summary>
+        public void Suspend()
+        {
+            if (_activeChannel != null)
+            {
+                BotInput.ReleaseKey(_activeChannel.Key);
+                _activeChannel = null;
+            }
+            WantsToMove = false;
+            InCombat = false;
+            Profile.SustainEnemyChannelWithoutTarget = false;
         }
 
         /// <summary>Reset state (call on mode exit).</summary>

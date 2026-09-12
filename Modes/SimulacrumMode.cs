@@ -29,18 +29,26 @@ namespace AutoExile.Modes
         private bool IsStationaryChannelActive =>
             _phase == SimPhase.WaveCycle &&
             _state.IsWaveActive &&
+            _waveActivationConfirmed &&
             _settings.StationaryChannelDuringWave.Value;
+
+        // Confirmation comes from observed wave state, never from merely queuing a click.
+        private bool _waveActivationConfirmed;
+        private DateTime _lastMonolithDiagnosticAt = DateTime.MinValue;
+        private string _lastWaveObservation = "";
+        private DateTime _lastMonolithClickDiagnosticAt = DateTime.MinValue;
 
         private Vector2? _channelPosition;
         private DateTime _channelPositionStartedAt = DateTime.MinValue;
         private bool _channelRepositioning;
         private DateTime _lastChannelDiagnosticAt = DateTime.MinValue;
-        private DateTime _channelRateWindowStart = DateTime.MinValue;
-        private int _channelRateWindowStartCount = -1;
         private float _channelPeakKillRate;
         private float _channelCurrentKillRate;
         private bool _channelRateEstablished;
         private const float ChannelKillRateWindowSeconds = 2f;
+        private readonly SparkProgressTracker _sparkProgress = new();
+        private DateTime _lastProgressSampleAt = DateTime.MinValue;
+        private DateTime _repositionStartedAt = DateTime.MinValue;
 
         // Rolling diagnostic history — sampled every ~250ms, dumped in full on death so
         // long-running Spark stand-still/hold issues can be diagnosed after the fact.
@@ -138,6 +146,8 @@ namespace AutoExile.Modes
 
             // Determine starting phase based on location
             var gc = ctx.Game;
+            _waveActivationConfirmed = false;
+
             if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
             {
                 _phase = SimPhase.InHideout;
@@ -221,6 +231,8 @@ namespace AutoExile.Modes
                 RecordSparkDiagnosticSample(ctx);
 
                 _state.Tick(gc, _settings.MinWaveDelaySeconds.Value);
+                _waveActivationConfirmed = _state.HasFreshWaveState && _state.IsWaveActive;
+                LogMonolithState(ctx);
 
                 if (_state.IsWaveActive && _state.CurrentWave > _lastStatsWaveStarted)
                 {
@@ -237,7 +249,9 @@ namespace AutoExile.Modes
 
                 var wasStationaryChannel = ctx.Combat.Profile.SustainEnemyChannelWithoutTarget;
                 var emergencySpark = _phase == SimPhase.WaveCycle &&
+                    !_channelRepositioning &&
                     _state.IsWaveActive &&
+                    _waveActivationConfirmed &&
                     _settings.EmergencySparkBelowEs.Value &&
                     ctx.Combat.HasEnemyChannel &&
                     ctx.Combat.NearbyMonsterCount > 0 &&
@@ -266,17 +280,19 @@ namespace AutoExile.Modes
 
                 // Disable combat during LootSweep/ExitMap — we need to navigate freely
                 // to pick up remaining items and reach the portal without being dragged into fights
-                bool combatAllowed = _phase != SimPhase.LootSweep && _phase != SimPhase.ExitMap;
+                bool combatAllowed = _waveActivationConfirmed &&
+                    _phase != SimPhase.LootSweep && _phase != SimPhase.ExitMap;
                 if (combatAllowed)
                 {
                     // Suppress cursor-moving skills when interaction is busy picking up loot
-                    ctx.Combat.SuppressPositioning = stationaryChannel || ctx.Interaction.IsBusy;
-                    ctx.Combat.SuppressTargetedSkills = ctx.Interaction.IsBusy;
+                    var relocating = _settings.StationaryChannelDuringWave.Value && _channelRepositioning && !emergencySpark;
+                    ctx.Combat.SuppressPositioning = stationaryChannel || ctx.Interaction.IsBusy || relocating;
+                    ctx.Combat.SuppressTargetedSkills = ctx.Interaction.IsBusy || relocating;
                     ctx.Combat.Tick(ctx);
                 }
-                else if (wasStationaryChannel)
+                else
                 {
-                    BotInput.ReleaseAllKeys();
+                    ctx.Combat.Suspend();
                 }
 
                 if (wasStationaryChannel && !stationaryChannel)
@@ -453,6 +469,7 @@ namespace AutoExile.Modes
                 var isPortalReentry = deathCount > 0;
                 _state.OnAreaChanged();
                 _state.DeathCount = deathCount;
+                _waveActivationConfirmed = false;
                 var areaHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
                 ctx.Stats.ObserveSimulacrumEntry(areaHash, gc.Area.CurrentArea.Name ?? "");
                 _phase = SimPhase.FindMonolith;
@@ -594,12 +611,15 @@ namespace AutoExile.Modes
                 return;
             }
 
-            // If wave is already active (re-entry after death), go straight to wave cycle
-            if (_state.IsWaveActive)
+            // If wave is already active (re-entry after death), go straight to wave cycle.
+            // This is a legitimate recovery — real combat is confirmed via the monolith's
+            // live StateMachine, so trust it even though the bot never clicked this run.
+            if (_state.IsWaveActive && _state.HasFreshWaveState)
             {
                 ctx.Navigation.Stop(ctx.Game);
                 _phase = SimPhase.WaveCycle;
                 _phaseStartTime = DateTime.Now;
+                _waveActivationConfirmed = true;
                 StatusText = "Wave already active — joining combat";
                 return;
             }
@@ -647,6 +667,17 @@ namespace AutoExile.Modes
             // Handle pending loot pickup results
             _lootTracker.HandleResult(interactionResult, ctx);
 
+            if (!_state.HasFreshWaveState)
+            {
+                ctx.Combat.Suspend();
+                ResetChannelTracking();
+                if (!ctx.Interaction.IsBusy)
+                    IdleNearMonolith(ctx);
+                Decision = "Wave state unavailable — returning to monolith to observe";
+                StatusText = "Waiting for valid monolith state";
+                return;
+            }
+
             if (ctx.Loot.TogglePhase != LootSystem.LabelTogglePhase.Idle)
             {
                 ctx.Loot.TickLabelToggle(gc);
@@ -669,7 +700,9 @@ namespace AutoExile.Modes
                 ResetChannelTracking();
             }
 
-            var emergencySpark = _settings.EmergencySparkBelowEs.Value &&
+            var emergencySpark = _state.IsWaveActive && _waveActivationConfirmed &&
+                !_channelRepositioning &&
+                _settings.EmergencySparkBelowEs.Value &&
                 ctx.Combat.HasEnemyChannel &&
                 ctx.Combat.NearbyMonsterCount > 0 &&
                 ctx.Combat.EsPercent < 0.30f;
@@ -688,16 +721,15 @@ namespace AutoExile.Modes
                     $"interactionBusy={ctx.Interaction.IsBusy} decision={Decision}");
             }
 
-                    // Spark/Spark of the Nova is a stationary channel build: keep the channel
-                    // active and only reposition when the current position stops producing kills.
-                    if ((IsStationaryChannelActive || emergencySpark) &&
-                        ctx.Combat.HasEnemyChannel &&
-                        ctx.Combat.NearbyMonsterCount > 0 &&
-                        !ctx.Interaction.IsBusy)
-                    {
-                    if (TickStationaryChannel(ctx, emergencySpark))
-                        return;
-                    }
+            // Spark/Spark of the Nova is a stationary channel build: keep the channel
+            // active and only reposition when the current position stops producing kills.
+            if ((IsStationaryChannelActive || emergencySpark) &&
+                ctx.Combat.HasEnemyChannel &&
+                !ctx.Interaction.IsBusy)
+            {
+                if (TickStationaryChannel(ctx, emergencySpark))
+                    return;
+            }
 
             // --- Priority 0: Don't interrupt active loot pickup ---
             // If interaction is busy (navigating to or clicking an item), let it finish.
@@ -1016,8 +1048,8 @@ namespace AutoExile.Modes
         /// </summary>
         private void ResetChannelKillRateTracking()
         {
-            _channelRateWindowStart = DateTime.MinValue;
-            _channelRateWindowStartCount = -1;
+            _sparkProgress.Reset(DateTime.Now);
+            _lastProgressSampleAt = DateTime.MinValue;
             _channelPeakKillRate = 0f;
             _channelCurrentKillRate = 0f;
             _channelRateEstablished = false;
@@ -1173,162 +1205,125 @@ namespace AutoExile.Modes
         private bool TickStationaryChannel(BotContext ctx, bool emergencySpark)
         {
             var gc = ctx.Game;
-            var enemyCount = ctx.Combat.CachedMonsterCount;
             var now = DateTime.Now;
-
-            // Start the position timer from the actual held-channel state. This also
-            // covers waves where Spark is sustained briefly before enemies are visible.
-            if (_channelPositionStartedAt == DateTime.MinValue && ctx.Combat.IsChanneling)
+            var enemies = ctx.Combat.NearbyMonsterCount;
+            if (enemies == 0)
             {
-                _channelPosition = gc.Player.GridPosNum;
-                _channelPositionStartedAt = now;
-            }
-
-            if (enemyCount <= 0)
-            {
-                if (emergencySpark || IsStationaryChannelActive)
-                {
-                    // Do not fall through to exploration immediately after the
-                    // monolith click. The first wave can expose monsters a few
-                    // ticks later, so bootstrap Spark at the current position.
-                    if (!_channelPosition.HasValue)
-                    {
-                        _channelPosition = gc.Player.GridPosNum;
-                        _channelPositionStartedAt = now;
-                    }
-                    var waitElapsed = (now - _channelPositionStartedAt).TotalSeconds;
-                    var waitSafetyLimit = _settings.MaxChannelPositionSeconds.Value * 2.0;
-                    if (waitElapsed >= waitSafetyLimit)
-                    {
-                        // No enemies showed up for way too long — stop holding a dead
-                        // spot and let the normal explore/search logic take over.
-                        ResetChannelTracking();
-                        BotInput.ReleaseAllKeys();
-                        Decision = $"Wave {_state.CurrentWave} — no enemies after {waitElapsed:F0}s, searching";
-                        StatusText = $"Wave {_state.CurrentWave}/15 — Spark idle too long, searching for enemies";
-                        return false;
-                    }
-                    _channelRepositioning = false;
-                    Decision = $"Wave {_state.CurrentWave} — waiting for enemies with Spark held ({waitElapsed:F0}s)";
-                    StatusText = $"Wave {_state.CurrentWave}/15 — Spark active, waiting for enemies";
-                    return true;
-                }
+                ctx.Combat.Suspend();
+                ResetChannelTracking();
+                Decision = $"Wave {_state.CurrentWave} — no nearby enemies, searching";
                 return false;
             }
 
-            if (emergencySpark)
+            SampleSparkProgress(ctx, now);
+            var noDamageSeconds = _sparkProgress.NoProgressSeconds(now);
+            var emergencyLimit = _settings.DangerousNoKillEscapeSeconds.Value;
+            if (emergencySpark && noDamageSeconds < emergencyLimit)
             {
-                if (!_channelPosition.HasValue)
-                {
-                    _channelPosition = gc.Player.GridPosNum;
-                    _channelPositionStartedAt = now;
-                }
+                // Keep recovery damage going at low ES, but never hold indefinitely
+                // against an invulnerable pack. Lack of damage also triggers escape.
+                ctx.Navigation.Stop(gc);
                 _channelRepositioning = false;
-                if (ctx.Navigation.IsNavigating)
-                    ctx.Navigation.Stop(gc);
-                Decision = $"Wave {_state.CurrentWave} — emergency Spark channel (ES {ctx.Combat.EsPercent:P0})";
-                StatusText = $"Wave {_state.CurrentWave}/15 — emergency Spark channel (ES {ctx.Combat.EsPercent:P0})";
+                _channelPosition ??= gc.Player.GridPosNum;
+                if (_channelPositionStartedAt == DateTime.MinValue) _channelPositionStartedAt = now;
+                Decision = $"Wave {_state.CurrentWave} — emergency Spark (ES {ctx.Combat.EsPercent:P0})";
+                StatusText = Decision;
                 return true;
             }
 
             if (_channelRepositioning)
             {
+                ctx.Combat.Suspend();
+                if ((now - _repositionStartedAt).TotalSeconds > 4 && !BotInput.IsMovementActive)
+                {
+                    ctx.Navigation.Stop(gc);
+                    _channelPosition = gc.Player.GridPosNum;
+                    _channelRepositioning = false;
+                    _channelPositionStartedAt = now;
+                    ResetChannelKillRateTracking();
+                    ctx.Log("[Simulacrum][SparkReposition] no movement for 4s; resume defense and retry");
+                    return true;
+                }
                 if (ctx.Navigation.IsNavigating)
                 {
                     Decision = $"Wave {_state.CurrentWave} — moving to next Spark position";
-                    StatusText = $"Wave {_state.CurrentWave}/15 — repositioning for Spark ({enemyCount} enemies)";
+                    StatusText = Decision;
                     return true;
                 }
-
-                if (_channelPosition.HasValue &&
-                    Vector2.Distance(gc.Player.GridPosNum, _channelPosition.Value) > 10f)
+                if (_channelPosition.HasValue && Vector2.Distance(gc.Player.GridPosNum, _channelPosition.Value) > 14f)
                 {
                     ctx.Navigation.NavigateTo(gc, _channelPosition.Value);
                     return true;
                 }
-
                 _channelRepositioning = false;
                 _channelPositionStartedAt = now;
-            }
-
-            // Track kill rate in a rolling window so a real slowdown (10/s → 1/s) is
-            // detected, instead of reacting to a single tick with no progress.
-            if (_channelRateWindowStartCount < 0)
-            {
-                _channelRateWindowStart = now;
-                _channelRateWindowStartCount = enemyCount;
-            }
-            var rateWindowElapsed = (now - _channelRateWindowStart).TotalSeconds;
-            if (rateWindowElapsed >= ChannelKillRateWindowSeconds)
-            {
-                var killed = Math.Max(0, _channelRateWindowStartCount - enemyCount);
-                _channelCurrentKillRate = (float)(killed / rateWindowElapsed);
-                _channelPeakKillRate = Math.Max(_channelPeakKillRate, _channelCurrentKillRate);
-                _channelRateEstablished = true;
-                _channelRateWindowStart = now;
-                _channelRateWindowStartCount = enemyCount;
-            }
-
-            var intensity = GetSparkIntensityStacks(ctx);
-            var intensityFloor = _settings.MinIntensityStacksBeforeReposition.Value;
-            var intensityFloorMet = intensity >= intensityFloor;
-            var killRateDropped = _channelRateEstablished && _channelPeakKillRate > 0.01f &&
-                _channelCurrentKillRate <= _channelPeakKillRate * _settings.KillRateDropRatio.Value;
-            var positionElapsed = _channelPositionStartedAt == DateTime.MinValue
-                ? 0
-                : (now - _channelPositionStartedAt).TotalSeconds;
-            var maxPositionSeconds = _settings.MaxChannelPositionSeconds.Value;
-            var timeLimitReached = positionElapsed >= maxPositionSeconds;
-            var dangerousNoKill = _channelRateEstablished &&
-                _settings.DangerousStationaryEnemyCount.Value > 0 &&
-                ctx.Combat.NearbyMonsterCount >= _settings.DangerousStationaryEnemyCount.Value &&
-                _channelCurrentKillRate <= 0.01f &&
-                rateWindowElapsed >= _settings.DangerousNoKillEscapeSeconds.Value;
-            // The time limit is unconditional — it must fire even if Intensity is never
-            // detected (buff name mismatch, missing data). The Intensity floor only gates
-            // the early "kill rate dropped" exit so a brief dip doesn't move us too soon.
-            var shouldReposition = _channelPosition.HasValue &&
-                (dangerousNoKill || timeLimitReached || (intensityFloorMet && killRateDropped));
-
-            if (_channelPosition.HasValue && !shouldReposition)
-            {
-                Decision = $"Wave {_state.CurrentWave} — Spark channel (intensity {intensity}/{intensityFloor}, {_channelCurrentKillRate:F1}/s vs peak {_channelPeakKillRate:F1}/s)";
-                StatusText = $"Wave {_state.CurrentWave}/15 — holding Spark ({positionElapsed:F1}s/{maxPositionSeconds:F0}s, {enemyCount} enemies)";
-                if (ctx.Navigation.IsNavigating)
-                    ctx.Navigation.Stop(gc);
-                return true;
-            }
-
-            if (ctx.Combat.TryGetOptimalRangedPosition(ctx, out var nextPosition))
-            {
-                var reason = dangerousNoKill
-                    ? $"no kills near {ctx.Combat.NearbyMonsterCount} enemies"
-                    : timeLimitReached ? $"{maxPositionSeconds:F0}s elapsed"
-                    : "kill rate dropped";
-                _channelPosition = nextPosition;
-                _channelPositionStartedAt = DateTime.MinValue;
-                _channelRepositioning = true;
                 ResetChannelKillRateTracking();
-                BotInput.ReleaseAllKeys();
-                ctx.Navigation.Stop(gc);
-                ctx.Navigation.NavigateTo(gc, nextPosition);
-                Decision = $"Wave {_state.CurrentWave} — leaving Spark position ({reason}, intensity {intensity})";
-                StatusText = $"Wave {_state.CurrentWave}/15 — moving to best Spark position";
+                noDamageSeconds = 0;
+            }
+
+            _channelPosition ??= gc.Player.GridPosNum;
+            if (_channelPositionStartedAt == DateTime.MinValue) _channelPositionStartedAt = now;
+            var positionSeconds = (now - _channelPositionStartedAt).TotalSeconds;
+            _channelCurrentKillRate = _sparkProgress.KillRate(now);
+            _channelPeakKillRate = Math.Max(_channelPeakKillRate, _channelCurrentKillRate);
+            _channelRateEstablished = positionSeconds >= ChannelKillRateWindowSeconds;
+            var danger = _settings.DangerousStationaryEnemyCount.Value > 0 &&
+                enemies >= _settings.DangerousStationaryEnemyCount.Value;
+            var stallLimit = danger || emergencySpark ? emergencyLimit : 3.0;
+            var maxSeconds = _settings.MaxChannelPositionSeconds.Value;
+            var stalled = noDamageSeconds >= Math.Min(stallLimit, maxSeconds);
+            var intensity = GetSparkIntensityStacks(ctx);
+            var slowed = _channelRateEstablished && _channelPeakKillRate > 0 &&
+                _channelCurrentKillRate <= _channelPeakKillRate * _settings.KillRateDropRatio.Value &&
+                intensity >= _settings.MinIntensityStacksBeforeReposition.Value && noDamageSeconds >= 1;
+            // Productive boss damage does not require kills. Intensity never vetoes a stall escape.
+            if (!stalled && !slowed && positionSeconds < maxSeconds)
+            {
+                if (ctx.Navigation.IsNavigating) ctx.Navigation.Stop(gc);
+                Decision = $"Wave {_state.CurrentWave} — Spark channel ({_channelCurrentKillRate:F1} kills/s, no damage {noDamageSeconds:F1}s)";
+                StatusText = $"Wave {_state.CurrentWave}/15 — holding Spark ({positionSeconds:F1}s, {enemies} nearby)";
                 return true;
             }
 
-            // No valid position found — fall back to normal target search. Mark as
-            // "repositioning" so combat positioning isn't suppressed while we're not
-            // actually anchored, and Spark isn't held uselessly while walking.
-            ResetChannelTracking();
-            _channelRepositioning = true;
+            var reason = stalled ? $"no damage for {noDamageSeconds:F1}s" : slowed ? "kill rate dropped" : "position time limit";
+            var oldPosition = gc.Player.GridPosNum;
+            var hasPosition = ctx.Combat.TryGetOptimalRangedPosition(ctx, out var nextPosition);
+            ctx.Combat.Suspend();
             BotInput.ReleaseAllKeys();
-            TickExploreForMonsters(ctx);
-            Decision = $"Wave {_state.CurrentWave} — no valid Spark position, fallback navigation";
-            StatusText = $"Wave {_state.CurrentWave}/15 — moving to find another Spark position";
+            ctx.Navigation.Stop(gc);
+            _channelPosition = hasPosition ? nextPosition : null;
+            _channelPositionStartedAt = DateTime.MinValue;
+            _channelRepositioning = true;
+            _repositionStartedAt = now;
+            ctx.Log($"[Simulacrum][SparkReposition] reason={reason} from={oldPosition} to={_channelPosition} " +
+                $"kills={_sparkProgress.TotalKills} ES={ctx.Combat.EsPercent:P0} intensity={intensity}");
+            ResetChannelKillRateTracking();
+            if (hasPosition) ctx.Navigation.NavigateTo(gc, nextPosition);
+            else TickExploreForMonsters(ctx);
+            Decision = $"Wave {_state.CurrentWave} — repositioning ({reason})";
+            StatusText = Decision;
             return true;
         }
 
+        private void SampleSparkProgress(BotContext ctx, DateTime now)
+        {
+            if ((now - _lastProgressSampleAt).TotalMilliseconds < 200) return;
+            _lastProgressSampleAt = now;
+            var samples = new List<MonsterHealthSample>();
+            foreach (var entity in ctx.Game.EntityListWrapper.OnlyValidEntities)
+            {
+                try
+                {
+                    if (entity.Type != EntityType.Monster || !entity.IsHostile ||
+                        Vector2.Distance(entity.GridPosNum, ctx.Game.Player.GridPosNum) > ctx.Settings.Build.CombatRange.Value)
+                        continue;
+                    var life = entity.GetComponent<Life>();
+                    if (life != null) samples.Add(new(entity.Id, entity.IsAlive ? (double)life.CurHP + life.CurES : 0));
+                }
+                catch { /* Missing memory is not a confirmed kill. */ }
+            }
+            _sparkProgress.Observe(samples, now);
+        }
         /// <summary>
         /// Find and navigate to monsters when none are in chase range.
         /// Three-tier fallback: cached distant monsters → reset exploration and explore → orbit monolith.
@@ -1494,11 +1489,12 @@ namespace AutoExile.Modes
 
         /// <summary>
         /// Navigate to monolith and click it to start the next wave.
-        /// Tries entity label first (most reliable), falls back to WorldToScreen click.
-        /// Only increments _waveStartAttempts when a click is actually sent.
+        /// Queues a single fixed-position click; the observed wave state confirms activation.
         /// </summary>
         private void TickStartWave(BotContext ctx)
         {
+            if (!_state.HasFreshWaveState || _state.IsWaveActive) return;
+            LogMonolithClick(ctx, "preflight");
             if (!_state.MonolithPosition.HasValue)
             {
                 StatusText = "Can't start wave — monolith not found";
@@ -1521,7 +1517,8 @@ namespace AutoExile.Modes
 
             ctx.Navigation.Stop(gc);
 
-            if (!ModeHelpers.CanAct(_lastActionTime, MajorActionCooldownMs)) return;
+            // Allow the server to acknowledge activation before another click is queued.
+            if (!ModeHelpers.CanAct(_lastActionTime, 650f)) return;
 
             // Resolve monolith entity
             Entity? monolith = null;
@@ -1542,19 +1539,11 @@ namespace AutoExile.Modes
                 return;
             }
 
-            // Try 1: Click entity label if visible (game renders a hoverable label on the monolith)
-            if (TryClickEntityLabel(gc, monolith))
-            {
-                _waveStartAttempts++;
-                StatusText = $"Clicking monolith label to start wave {_state.CurrentWave + 1} (attempt {_waveStartAttempts})";
-                return;
-            }
-
-            // Try 2: Click entity directly using bounds-based randomization
-            if (BotInput.ClickEntity(gc, monolith))
+            if (BotInput.ClickMonolith(gc, monolith, _waveStartAttempts))
             {
                 _lastActionTime = DateTime.Now;
                 _waveStartAttempts++;
+                LogMonolithClick(ctx, "fixed click queued", force: true);
                 StatusText = $"Clicking monolith to start wave {_state.CurrentWave + 1} (attempt {_waveStartAttempts})";
             }
             else
@@ -1563,32 +1552,37 @@ namespace AutoExile.Modes
             }
         }
 
-        /// <summary>
-        /// Try to find and click the monolith's interaction label rendered by the game.
-        /// These show up in the VisibleGroundItemLabels list for interactable entities.
-        /// </summary>
-        private bool TryClickEntityLabel(GameController gc, Entity monolith)
+        private void LogMonolithState(BotContext ctx)
         {
+            var observation = $"wave={_state.CurrentWave} active={_state.IsWaveActive} fresh={_state.HasFreshWaveState}";
+            if (observation == _lastWaveObservation &&
+                (DateTime.Now - _lastMonolithDiagnosticAt).TotalSeconds < 5) return;
+            _lastWaveObservation = observation;
+            _lastMonolithDiagnosticAt = DateTime.Now;
+            string labelState;
             try
             {
-                var labels = gc.IngameState.IngameUi.ItemsOnGroundLabelElement.VisibleGroundItemLabels;
-                if (labels == null) return false;
-
-                foreach (var label in labels)
-                {
-                    if (label.Entity?.Id != monolith.Id) continue;
-                    if (label.Label == null || !label.Label.IsVisible) continue;
-
-                    if (BotInput.ClickLabel(gc, label.ClientRect))
-                    {
-                        _lastActionTime = DateTime.Now;
-                        return true;
-                    }
-                    return false;
-                }
+                var label = ctx.Game.IngameState.IngameUi.ItemsOnGroundLabelElement.VisibleGroundItemLabels?
+                    .FirstOrDefault(l => l.Entity?.Id == _state.MonolithId && l.Label?.IsVisible == true);
+                labelState = label == null ? "none" : label.ClientRect.ToString();
             }
-            catch { }
-            return false;
+            catch (Exception ex) { labelState = $"unavailable:{ex.GetType().Name}"; }
+            ctx.Log($"[Simulacrum][MonolithState] {observation} age={_state.WaveStateAgeSeconds:F1}s " +
+                $"phase={_phase} label={labelState} {_state.MonolithDiagnostics} " +
+                $"nearby={ctx.Combat.NearbyMonsterCount} cached={ctx.Combat.CachedMonsterCount} " +
+                $"channeling={ctx.Combat.IsChanneling} input=[{BotInput.InputDiagnostics}] decision={Decision}");
+        }
+
+        private void LogMonolithClick(BotContext ctx, string reason, bool force = false)
+        {
+            if (!force && (DateTime.Now - _lastMonolithClickDiagnosticAt).TotalSeconds < 5) return;
+            _lastMonolithClickDiagnosticAt = DateTime.Now;
+            var distance = _state.MonolithPosition.HasValue
+                ? Vector2.Distance(ctx.Game.Player.GridPosNum, _state.MonolithPosition.Value) : -1;
+            ctx.Log($"[Simulacrum][MonolithClick] {reason} attempt={_waveStartAttempts} dist={distance:F1} " +
+                $"navigation={ctx.Navigation.IsNavigating} interaction={ctx.Interaction.IsBusy} " +
+                $"input=[{BotInput.InputDiagnostics}] {_state.MonolithDiagnostics} " +
+                $"recentInput=[{BotInput.RecentRawInputDiagnostics}]");
         }
 
         // =================================================================

@@ -106,6 +106,58 @@ namespace AutoExile.Systems
         public static int RawInputEventsPerSecond { get; private set; }
         private static int _rawInputSecondCount;
         private static DateTime _rawInputSecondStart = DateTime.MinValue;
+        private static readonly System.Collections.Concurrent.ConcurrentQueue<string> _recentRawInputs = new();
+        public static string RecentRawInputDiagnostics => string.Join("; ", _recentRawInputs.ToArray().TakeLast(16));
+        private static readonly InputSequenceGate _clickSequence = new();
+        private static readonly AsyncLocal<CancellationToken> _clickToken = new();
+        private static string _lastClickOutcome = "none";
+        public static Action<string> DiagnosticLog { get; set; } = _ => { };
+        private static string _inputStage = "idle";
+        public static string InputDiagnostics =>
+            $"canAct={CanAct} gateMs={Math.Max(0, (NextActionAt - DateTime.Now).TotalMilliseconds):F0} " +
+            $"clickRunning={_clickSequence.IsRunning} click={_lastClickOutcome} stage={_inputStage} " +
+            $"held=[{string.Join(",", _heldKeys.Keys)}] leftDown={_leftMouseDownAt:HH:mm:ss.fff} " +
+            $"rightDown={_rightMouseDownAt:HH:mm:ss.fff} move={IsMovementActive}/{IsMovementSuspended} " +
+            $"cursor={NativeMouseInput.Position} {GetCursorDiagnostics()}";
+
+        private static async Task RunClickSequence(string name, Func<Task> action)
+        {
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            var trace = name is "right" or "ctrl";
+            if (trace) DiagnosticLog($"[InputSequence] begin {name} thread={Environment.CurrentManagedThreadId} context={SynchronizationContext.Current?.GetType().Name ?? "none"}");
+            try
+            {
+                await _clickSequence.RunAsync(async token =>
+                {
+                    _clickToken.Value = token;
+                    _lastClickOutcome = $"{name}:running";
+                    try
+                    {
+                        await action().ConfigureAwait(false);
+                        _lastClickOutcome = $"{name}:completed";
+                    }
+                    finally
+                    {
+                        // Also releases a button if memory access or cancellation interrupted the click.
+                        ReleaseMouseButtons();
+                        NextActionAt = DateTime.Now.AddMilliseconds(ActionCooldownMs);
+                        _clickToken.Value = default;
+                    }
+                }, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { _lastClickOutcome = $"{name}:cancelled"; }
+            catch (Exception ex)
+            {
+                _lastClickOutcome = $"{name}:failed:{ex.GetType().Name}:{ex.Message}";
+                LogRawInput("ClickSequenceFailed", _lastClickOutcome);
+            }
+            finally
+            {
+                _inputStage = "idle";
+                if (trace || elapsed.ElapsedMilliseconds > 2000 || !_lastClickOutcome.EndsWith(":completed"))
+                    DiagnosticLog($"[InputSequence] end {_lastClickOutcome} elapsed={elapsed.ElapsedMilliseconds}ms recent=[{RecentRawInputDiagnostics}]");
+            }
+        }
 
         private static void LogRawInput(string eventType, string detail)
         {
@@ -117,6 +169,8 @@ namespace AutoExile.Systems
                 _rawInputSecondStart = now;
             }
             _rawInputSecondCount++;
+            _recentRawInputs.Enqueue($"{now:HH:mm:ss.fff} {eventType} {detail}");
+            while (_recentRawInputs.Count > 80) _recentRawInputs.TryDequeue(out _);
         }
 
         private static void LogAction(string type, Vector2? position, Keys? key, bool accepted)
@@ -177,6 +231,7 @@ namespace AutoExile.Systems
                 return false;
 
             SuspendMovement();
+            ReleaseAllKeys();
             var windowRect = gc.Window.GetWindowRectangle();
             var settle = RandSettle();
             var hold = RandHold();
@@ -186,13 +241,88 @@ namespace AutoExile.Systems
             NextActionAt = DateTime.Now.AddMilliseconds(
                 MaxHoverAttempts * (moveMs + settle) + hold + ActionCooldownMs);
 
-            _ = DoClickEntityWithVerify(gc, entity, screenCenter, halfW, halfH, windowRect, settle, hold);
+            _ = RunClickSequence($"entity:{entity.Id}", () =>
+                DoClickEntityWithVerify(gc, entity, screenCenter, halfW, halfH, windowRect, settle, hold));
             LogAction("ClickEntity", screenCenter, null, true);
             return true;
         }
 
+        /// <summary>
+        /// Monolith activation uses one fixed aim and one click. Preserve a confirmed
+        /// hover; otherwise prefer the interaction point over the visual bounds centre.
+        /// Retries choose a different anchor on the next mode tick, not a hover-search loop.
+        /// </summary>
+        public static bool ClickMonolith(GameController gc, Entity entity, int attempt)
+        {
+            if (!CanAct || !entity.IsValid || !entity.IsTargetable ||
+                entity.Metadata?.Contains("Objects/Afflictionator") != true) return false;
+
+            var window = gc.Window.GetWindowRectangle();
+            var hovered = entity.GetComponent<Targetable>()?.isTargeted == true;
+            var source = "hover";
+            var position = NativeMouseInput.Position;
+            if (!hovered)
+            {
+                SharpDX.RectangleF? labelRect = null;
+                try
+                {
+                    var label = gc.IngameState.IngameUi.ItemsOnGroundLabelElement.VisibleGroundItemLabels?
+                        .FirstOrDefault(l => l.Entity?.Id == entity.Id && l.Label?.IsVisible == true);
+                    if (label != null && IsRectOnScreen(label.ClientRect)) labelRect = label.ClientRect;
+                }
+                catch (Exception ex) { LogRawInput("MonolithLabel", ex.GetType().Name); }
+
+                Vector2 local;
+                if (labelRect.HasValue)
+                {
+                    local = new(labelRect.Value.Center.X, labelRect.Value.Center.Y);
+                    source = "label-centre";
+                }
+                else
+                {
+                    var interaction = entity.GetComponent<Render>()?.InteractCenterNum ?? entity.BoundsCenterPosNum;
+                    var anchor = (attempt % 3) switch
+                    {
+                        1 => entity.BoundsCenterPosNum,
+                        2 => (interaction + entity.BoundsCenterPosNum) / 2f,
+                        _ => interaction
+                    };
+                    local = gc.IngameState.Camera.WorldToScreen(anchor);
+                    source = $"anchor-{attempt % 3}";
+                }
+                position = new(window.X + local.X, window.Y + local.Y);
+            }
+
+            // Do not clamp a missed/offscreen target onto a different game/UI object.
+            if (!float.IsFinite(position.X) || !float.IsFinite(position.Y) ||
+                position.X < window.Left + 5 || position.X > window.Right - 5 ||
+                position.Y < window.Top + 5 || position.Y > window.Bottom - 5) return false;
+
+            // SuspendMovement snaps to the player. StopMovement preserves this hover.
+            StopMovement();
+            ReleaseAllKeys();
+            NextActionAt = DateTime.Now.AddMilliseconds(ActionCooldownMs + 75);
+            var id = entity.Id;
+            _ = RunClickSequence($"monolith:{id}", async () =>
+            {
+                await SendDelay().ConfigureAwait(false);
+                if (!hovered)
+                {
+                    NativeMouseInput.Move(position);
+                    await Task.Delay(30, _clickToken.Value).ConfigureAwait(false);
+                }
+                await SendDelay().ConfigureAwait(false);
+                SendLeftDown("monolith-fixed");
+                DiagnosticLog($"[Simulacrum][MonolithClick] mouse-down id={id} source={source} pos={position} hovered={hovered}");
+                await Task.Delay(40, _clickToken.Value).ConfigureAwait(false);
+                SendLeftUp("monolith-fixed");
+            });
+            LogAction("ClickMonolith", position, null, true);
+            return true;
+        }
+
         private const int MaxHoverAttempts = 2;
-        private const int HoverVerifyDelayMs = 35; // time after cursor settle to let game update isTargeted
+        private const int HoverVerifyDelayMs = 100; // allow game + ExileAPI to observe the final cursor position
 
         private static async Task DoClickEntityWithVerify(
             GameController gc, Entity entity, Vector2 screenCenter, float halfW, float halfH,
@@ -217,37 +347,40 @@ namespace AutoExile.Systems
                 // Pick a random position within entity bounds — first attempt is center-biased,
                 // subsequent attempts spread wider to find an unblocked spot
                 var spread = attempt == 0 ? 1f : 1f + attempt * 0.3f;
-                var clickPos = RandomizeWithinRect(screenCenter.X, screenCenter.Y,
-                    halfW * spread, halfH * spread);
+                var offset = attempt == 0 ? Vector2.Zero :
+                    RandomizeWithinRect(0, 0, halfW * spread, halfH * spread);
+                var clickPos = screenCenter + offset;
                 var absPos = new Vector2(windowRect.X + clickPos.X, windowRect.Y + clickPos.Y);
 
                 // Move cursor and settle
-                await MoveCursorTo(absPos);
-                await Task.Delay(settleMs);
+                await MoveCursorTo(absPos).ConfigureAwait(false);
+                await Task.Delay(settleMs).ConfigureAwait(false);
 
                 // Final snap — re-read entity bounds right before verification/click
                 try
                 {
                     if (GetEntityScreenBounds(gc, entity, out var snapCenter, out var snapHW, out var snapHH))
                     {
-                        var snapPos = RandomizeWithinRect(snapCenter.X, snapCenter.Y, snapHW, snapHH);
+                        var snapPos = snapCenter + offset;
                         var wr = gc.Window.GetWindowRectangle();
-                        Input.SetCursorPos(new Vector2(wr.X + snapPos.X, wr.Y + snapPos.Y));
+                        NativeMouseInput.Move(new Vector2(wr.X + snapPos.X, wr.Y + snapPos.Y));
                     }
                 }
                 catch { }
 
+                await Task.Delay(HoverVerifyDelayMs, _clickToken.Value).ConfigureAwait(false);
                 // Verify the game reports this entity as targeted (hover highlight)
                 try
                 {
                     var targetable = entity.GetComponent<Targetable>();
+                    LogRawInput("EntityHover", $"id={entity.Id} attempt={attempt + 1} cursor={NativeMouseInput.Position} targeted={targetable?.isTargeted}");
                     if (targetable?.isTargeted == true)
                     {
                         // Confirmed — click now
-                        await SendDelay();
+                        await SendDelay().ConfigureAwait(false);
                         SendLeftDown("entity-verified");
-                        await Task.Delay(holdMs);
-                        await SendDelay();
+                        await Task.Delay(holdMs).ConfigureAwait(false);
+                        await SendDelay().ConfigureAwait(false);
                         SendLeftUp("entity-verified");
                         return;
                     }
@@ -255,7 +388,7 @@ namespace AutoExile.Systems
                 catch { }
 
                 // Not targeted — wait briefly then try next position
-                await Task.Delay(HoverVerifyDelayMs);
+                await Task.Delay(HoverVerifyDelayMs).ConfigureAwait(false);
             }
 
             // Exhausted attempts — final snap then click anyway as fallback
@@ -265,14 +398,15 @@ namespace AutoExile.Systems
                 {
                     var lastPos = RandomizeWithinRect(lastCenter.X, lastCenter.Y, lastHW, lastHH);
                     var wr = gc.Window.GetWindowRectangle();
-                    Input.SetCursorPos(new Vector2(wr.X + lastPos.X, wr.Y + lastPos.Y));
+                    NativeMouseInput.Move(new Vector2(wr.X + lastPos.X, wr.Y + lastPos.Y));
                 }
             }
             catch { }
-            await SendDelay();
+            await Task.Delay(HoverVerifyDelayMs, _clickToken.Value).ConfigureAwait(false);
+            await SendDelay().ConfigureAwait(false);
             SendLeftDown("entity-fallback");
-            await Task.Delay(holdMs);
-            await SendDelay();
+            await Task.Delay(holdMs).ConfigureAwait(false);
+            await SendDelay().ConfigureAwait(false);
             SendLeftUp("entity-fallback");
         }
 
@@ -282,6 +416,9 @@ namespace AutoExile.Systems
         /// </summary>
         public static bool IsRectOnScreen(SharpDX.RectangleF rect)
         {
+            if (!float.IsFinite(rect.X) || !float.IsFinite(rect.Y) ||
+                !float.IsFinite(rect.Width) || !float.IsFinite(rect.Height) ||
+                rect.Width <= 0 || rect.Height <= 0) return false;
             if (WindowRect.Width < 10 || WindowRect.Height < 10)
                 return false;
 
@@ -350,6 +487,7 @@ namespace AutoExile.Systems
             if (!CanAct) return false;
             if (!IsRectOnScreen(rect)) return false;
             SuspendMovement();
+            ReleaseAllKeys();
             var windowRect = gc.Window.GetWindowRectangle();
             var settle = RandSettle();
             var hold = RandHold();
@@ -357,7 +495,8 @@ namespace AutoExile.Systems
             var moveMs = EstimateMoveMs(new Vector2(windowRect.X + center.X, windowRect.Y + center.Y));
             NextActionAt = DateTime.Now.AddMilliseconds(
                 MaxHoverAttempts * (moveMs + settle) + hold + ActionCooldownMs);
-            _ = DoClickLabelVerified(entity, rect, windowRect, settle, hold, rectProvider);
+            _ = RunClickSequence($"label:{entity.Id}", () =>
+                DoClickLabelVerified(entity, rect, windowRect, settle, hold, rectProvider));
             LogAction("ClickLabelVerified", center, null, true);
             return true;
         }
@@ -382,8 +521,8 @@ namespace AutoExile.Systems
                 var clickPos = RandomizeWithinRect(useRect);
                 var absPos = new Vector2(useWindowRect.X + clickPos.X, useWindowRect.Y + clickPos.Y);
 
-                await MoveCursorTo(absPos);
-                await Task.Delay(settleMs);
+                await MoveCursorTo(absPos).ConfigureAwait(false);
+                await Task.Delay(settleMs).ConfigureAwait(false);
 
                 // Final snap correction — re-read label position right before verification
                 if (rectProvider != null)
@@ -393,27 +532,28 @@ namespace AutoExile.Systems
                     {
                         var correctedPos = RandomizeWithinRect(correctedRect.Value);
                         var correctedAbs = new Vector2(useWindowRect.X + correctedPos.X, useWindowRect.Y + correctedPos.Y);
-                        Input.SetCursorPos(correctedAbs);
+                        NativeMouseInput.Move(correctedAbs);
                     }
                 }
 
+                await Task.Delay(HoverVerifyDelayMs, _clickToken.Value).ConfigureAwait(false);
                 try
                 {
                     var targetable = entity.GetComponent<Targetable>();
                     if (targetable?.isTargeted == true)
                     {
                         LastClickWasVerified = true;
-                        await SendDelay();
+                        await SendDelay().ConfigureAwait(false);
                         SendLeftDown("label-verified");
-                        await Task.Delay(holdMs);
-                        await SendDelay();
+                        await Task.Delay(holdMs).ConfigureAwait(false);
+                        await SendDelay().ConfigureAwait(false);
                         SendLeftUp("label-verified");
                         return;
                     }
                 }
                 catch { }
 
-                await Task.Delay(HoverVerifyDelayMs);
+                await Task.Delay(HoverVerifyDelayMs).ConfigureAwait(false);
             }
 
             // Verification failed on all attempts — DON'T click.
@@ -439,7 +579,8 @@ namespace AutoExile.Systems
             halfH = 8f;
 
             var windowRect = gc.Window.GetWindowRectangle();
-            if (screenCenter.X < 5 || screenCenter.X > windowRect.Width - 5 ||
+            if (!float.IsFinite(screenCenter.X) || !float.IsFinite(screenCenter.Y) ||
+                screenCenter.X < 5 || screenCenter.X > windowRect.Width - 5 ||
                 screenCenter.Y < 5 || screenCenter.Y > windowRect.Height - 5)
                 return false;
 
@@ -582,14 +723,14 @@ namespace AutoExile.Systems
                 return;
             }
             MarkInputEvent("LeftDown", context);
-            Input.LeftDown();
+            SendNativeMouse(0x0002, "left-down");
             _leftMouseDownAt = DateTime.Now;
         }
 
         private static void SendLeftUp(string context = "")
         {
             MarkInputEvent("LeftUp", context);
-            Input.LeftUp();
+            SendNativeMouse(0x0004, "left-up");
             _leftMouseDownAt = null;
         }
 
@@ -601,14 +742,14 @@ namespace AutoExile.Systems
                 return;
             }
             MarkInputEvent("RightDown", context);
-            Input.RightDown();
+            SendNativeMouse(0x0008, "right-down");
             _rightMouseDownAt = DateTime.Now;
         }
 
         private static void SendRightUp(string context = "")
         {
             MarkInputEvent("RightUp", context);
-            Input.RightUp();
+            SendNativeMouse(0x0010, "right-up");
             _rightMouseDownAt = null;
         }
 
@@ -661,15 +802,21 @@ namespace AutoExile.Systems
         /// </summary>
         private static async Task SendDelay()
         {
-            var elapsed = (DateTime.Now - _lastInputEvent).TotalMilliseconds;
-            if (elapsed < MinInputEventGapMs)
-                await Task.Delay((int)(MinInputEventGapMs - elapsed));
+            if (_clickSequence.IsRunning) _inputStage = "input-gap";
+            _clickToken.Value.ThrowIfCancellationRequested();
+            // Recheck after waking: releases from the tick loop can move this timestamp.
+            while (!CanSendInputEvent)
+            {
+                var remaining = MinInputEventGapMs - (DateTime.Now - _lastInputEvent).TotalMilliseconds;
+                await Task.Delay(Math.Max(1, (int)Math.Ceiling(remaining)), _clickToken.Value).ConfigureAwait(false);
+            }
+            _clickToken.Value.ThrowIfCancellationRequested();
         }
 
         private static readonly Random _rng = new();
 
         /// <summary>True if we can start a new action right now.</summary>
-        public static bool CanAct => ReplayMode || DateTime.Now >= NextActionAt;
+        public static bool CanAct => ReplayMode || (!_clickSequence.IsRunning && DateTime.Now >= NextActionAt);
 
         // ══════════════════════════════════════════════════════════════
         // Continuous movement layer
@@ -693,6 +840,39 @@ namespace AutoExile.Systems
 
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CursorInfo
+        {
+            public int Size;
+            public int Flags;
+            public IntPtr Handle;
+            public int X;
+            public int Y;
+        }
+
+        private static void SendNativeMouse(uint flags, string stage)
+        {
+            _inputStage = stage;
+            NativeMouseInput.SendButton(flags);
+        }
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetCursorInfo(ref CursorInfo info);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr LoadCursor(IntPtr instance, IntPtr cursorName);
+
+        private static string GetCursorDiagnostics()
+        {
+            var info = new CursorInfo { Size = Marshal.SizeOf<CursorInfo>() };
+            if (!GetCursorInfo(ref info)) return "osCursor=unavailable";
+            var busy = info.Handle == LoadCursor(IntPtr.Zero, new IntPtr(32514)) ||
+                       info.Handle == LoadCursor(IntPtr.Zero, new IntPtr(32650));
+            // Games may use custom cursors; retain the handle even when it isn't a standard wait cursor.
+            return $"osCursor=0x{info.Handle.ToInt64():X} flags={info.Flags} standardBusy={busy} modifiers={OsHasModifierHeld()}";
+        }
 
         [DllImport("user32.dll", EntryPoint = "mouse_event")]
         private static extern void MouseEvent(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
@@ -799,6 +979,7 @@ namespace AutoExile.Systems
         /// </summary>
         public static bool StartMovement(Vector2 absScreenPos, Keys moveKey)
         {
+            if (_clickSequence.IsRunning) return false;
             if (TryCaptureReplay("StartMovement", absScreenPos, moveKey)) return true;
             if (!ClampToWorldSafeZone(ref absScreenPos)) return false;
 
@@ -811,7 +992,7 @@ namespace AutoExile.Systems
             // No key release/press needed — the key is already held.
             if (IsMovementActive && _movementKey == moveKey && !IsMovementSuspended)
             {
-                Input.SetCursorPos(absScreenPos);
+                NativeMouseInput.Move(absScreenPos);
                 _movementCursorPos = absScreenPos;
                 return true;
             }
@@ -835,7 +1016,7 @@ namespace AutoExile.Systems
             // Ctrl+move (attack-in-place) / Shift+move / Alt+move.
             ReleaseAllModifiersBeforeMove();
 
-            Input.SetCursorPos(absScreenPos);
+            NativeMouseInput.Move(absScreenPos);
             _movementCursorPos = absScreenPos;
             _movementKey = moveKey;
 
@@ -870,6 +1051,7 @@ namespace AutoExile.Systems
 
         public static bool UpdateMovementCursor(Vector2 absScreenPos)
         {
+            if (_clickSequence.IsRunning) return false;
             if (!IsMovementActive || IsMovementSuspended) return false;
             if (TryCaptureReplay("UpdateMovementCursor", absScreenPos)) return true;
             if (!ClampToWorldSafeZone(ref absScreenPos)) return false;
@@ -883,7 +1065,7 @@ namespace AutoExile.Systems
                 return true; // Skip this update — position hasn't changed meaningfully
             }
 
-            Input.SetCursorPos(absScreenPos);
+            NativeMouseInput.Move(absScreenPos);
             _movementCursorPos = absScreenPos;
             _lastCursorUpdate = DateTime.Now;
             return true;
@@ -922,7 +1104,7 @@ namespace AutoExile.Systems
                 var playerScreenPos = new Vector2(
                     WindowRect.X + WindowRect.Width / 2f,
                     WindowRect.Y + WindowRect.Height / 2f);
-                Input.SetCursorPos(playerScreenPos);
+                NativeMouseInput.Move(playerScreenPos);
             }
 
             SendKeyUp(_movementKey, "suspend");
@@ -938,6 +1120,7 @@ namespace AutoExile.Systems
         /// </summary>
         public static void ResumeMovement()
         {
+            if (_clickSequence.IsRunning) return;
             if (!IsMovementActive || !IsMovementSuspended) return;
 
             // Enforce global input rate limit before re-pressing the movement key
@@ -947,7 +1130,7 @@ namespace AutoExile.Systems
             var target = NudgeOffPlayer(_movementCursorPos);
             _movementCursorPos = target;
             ReleaseAllModifiersBeforeMove();
-            Input.SetCursorPos(target);
+            NativeMouseInput.Move(target);
             SendKeyDown(_movementKey, "resume");
             IsMovementSuspended = false;
         }
@@ -1109,11 +1292,11 @@ namespace AutoExile.Systems
 
         private static async Task DoHoldKeyAt(Vector2 absPos, Keys key, long generation)
         {
-            await MoveCursorTo(absPos);
+            await MoveCursorTo(absPos).ConfigureAwait(false);
             if (generation != Volatile.Read(ref _holdGeneration)) return;
-            await Task.Delay(RandSettle());
+            await Task.Delay(RandSettle()).ConfigureAwait(false);
             if (generation != Volatile.Read(ref _holdGeneration)) return;
-            await SendDelay();
+            await SendDelay().ConfigureAwait(false);
             if (generation != Volatile.Read(ref _holdGeneration)) return;
             SendKeyDown(key);
             _heldKeys[key] = DateTime.Now;
@@ -1122,8 +1305,9 @@ namespace AutoExile.Systems
         /// <summary>Update a channelled skill cursor inside the world-safe region.</summary>
         public static bool UpdateWorldSkillCursor(Vector2 absPos)
         {
+            if (_clickSequence.IsRunning) return false;
             if (!ClampToWorldSafeZone(ref absPos)) return false;
-            Input.SetCursorPos(absPos);
+            NativeMouseInput.Move(absPos);
             return true;
         }
 
@@ -1191,16 +1375,36 @@ namespace AutoExile.Systems
                 (now - _leftMouseDownAt.Value).TotalMilliseconds >= StuckMouseButtonTimeoutMs)
             {
                 LogRawInput("LeftUp-WATCHDOG", $"forced release after {(now - _leftMouseDownAt.Value).TotalMilliseconds:F0}ms held");
-                Input.LeftUp();
+                SendNativeMouse(0x0004, "left-up");
                 _leftMouseDownAt = null;
             }
             if (_rightMouseDownAt.HasValue &&
                 (now - _rightMouseDownAt.Value).TotalMilliseconds >= StuckMouseButtonTimeoutMs)
             {
                 LogRawInput("RightUp-WATCHDOG", $"forced release after {(now - _rightMouseDownAt.Value).TotalMilliseconds:F0}ms held");
-                Input.RightUp();
+                SendNativeMouse(0x0010, "right-up");
                 _rightMouseDownAt = null;
             }
+        }
+
+        /// <summary>
+        /// Emulates the recovery a human performs when the game becomes unresponsive
+        /// to bot input (busy/spinning cursor, stuck action gate): force-releases every
+        /// held key and mouse button, stops the continuous movement layer, and clears
+        /// the action gate so the very next action isn't blocked by a stale timestamp
+        /// left over from an aborted async input sequence. Call this when a mode/system
+        /// detects it has requested movement or an action but observed zero real progress
+        /// for an extended period — the same signal a human uses to decide "I should click
+        /// to unstick this".
+        /// </summary>
+        public static void ForceInputRecovery(string context)
+        {
+            _clickSequence.Cancel();
+            ReleaseAllKeys();
+            ReleaseMouseButtons();
+            StopMovement();
+            NextActionAt = DateTime.Now;
+            LogRawInput("ForceInputRecovery", context);
         }
 
         // ══════════════════════════════════════════════════════════════
@@ -1266,7 +1470,9 @@ namespace AutoExile.Systems
         /// </summary>
         private static async Task MoveCursorTo(Vector2 target)
         {
-            var mp = Input.MousePosition;
+            if (_clickSequence.IsRunning) _inputStage = "cursor-move";
+            _clickToken.Value.ThrowIfCancellationRequested();
+            var mp = NativeMouseInput.Position;
             var start = new Vector2(mp.X, mp.Y);
             var delta = target - start;
             var dist = delta.Length();
@@ -1274,7 +1480,7 @@ namespace AutoExile.Systems
             if (dist < 5f)
             {
                 // Too close to bother interpolating
-                Input.SetCursorPos(target);
+                NativeMouseInput.Move(target);
                 return;
             }
 
@@ -1288,6 +1494,7 @@ namespace AutoExile.Systems
 
             for (int i = 1; i <= MoveSteps; i++)
             {
+                _clickToken.Value.ThrowIfCancellationRequested();
                 float progress = (float)i / MoveSteps;
                 var pos = start + delta * progress;
 
@@ -1300,14 +1507,14 @@ namespace AutoExile.Systems
                     pos += perp * jitter * taper;
                 }
 
-                Input.SetCursorPos(pos);
-                await Task.Delay(stepDelayMs);
+                NativeMouseInput.Move(pos);
+                await Task.Delay(stepDelayMs, _clickToken.Value).ConfigureAwait(false);
             }
 
             // Land with slight random offset — avoids pixel-perfect cursor patterns
             var jitterX = (float)(_rng.NextDouble() * 2 - 1) * LandingJitterPx;
             var jitterY = (float)(_rng.NextDouble() * 2 - 1) * LandingJitterPx;
-            Input.SetCursorPos(target + new Vector2(jitterX, jitterY));
+            NativeMouseInput.Move(target + new Vector2(jitterX, jitterY));
         }
 
         // ── Cursor + key press (walk commands, targeted skills) ──
@@ -1332,6 +1539,11 @@ namespace AutoExile.Systems
         /// <summary>Force cursor+key press, bypassing the input gate. For dodge — survival trumps input cadence.</summary>
         public static bool ForceCursorPressKey(Vector2 absPos, Keys key)
         {
+            if (_clickSequence.IsRunning)
+            {
+                _clickSequence.Cancel();
+                return false; // retry after the cancelled click has released its button
+            }
             if (!ClampToWorldSafeZone(ref absPos)) { LogAction("ForceCursorPressKey", absPos, key, false); return false; }
             SuspendMovement();
             ReleaseAllKeys();
@@ -1347,18 +1559,18 @@ namespace AutoExile.Systems
         private static async Task DoCursorPressKey(Vector2 absPos, Keys key, int settleMs, int holdMs,
             Func<Vector2?>? positionCorrection = null)
         {
-            await MoveCursorTo(absPos);
-            await Task.Delay(settleMs);
+            await MoveCursorTo(absPos).ConfigureAwait(false);
+            await Task.Delay(settleMs).ConfigureAwait(false);
 
             // Final position correction — snap to where the target is NOW
             var corrected = positionCorrection?.Invoke();
             if (corrected.HasValue)
-                Input.SetCursorPos(corrected.Value);
+                NativeMouseInput.Move(corrected.Value);
 
-            await SendDelay();
+            await SendDelay().ConfigureAwait(false);
             SendKeyDown(key);
-            await Task.Delay(holdMs);
-            await SendDelay();
+            await Task.Delay(holdMs).ConfigureAwait(false);
+            await SendDelay().ConfigureAwait(false);
             SendKeyUp(key);
         }
 
@@ -1401,10 +1613,10 @@ namespace AutoExile.Systems
 
         private static async Task DoPressKey(Keys key, int holdMs)
         {
-            await SendDelay();
+            await SendDelay().ConfigureAwait(false);
             SendKeyDown(key);
-            await Task.Delay(holdMs);
-            await SendDelay();
+            await Task.Delay(holdMs).ConfigureAwait(false);
+            await SendDelay().ConfigureAwait(false);
             SendKeyUp(key);
         }
 
@@ -1422,7 +1634,7 @@ namespace AutoExile.Systems
             var settle = RandSettle();
             var hold = RandHold();
             NextActionAt = DateTime.Now.AddMilliseconds(moveMs + settle + hold + ActionCooldownMs);
-            _ = DoClick(absPos, rightClick: false, settle, hold, positionCorrection);
+            _ = RunClickSequence("left", () => DoClick(absPos, rightClick: false, settle, hold, positionCorrection));
             LogAction("Click", absPos, null, true);
             return true;
         }
@@ -1453,7 +1665,7 @@ namespace AutoExile.Systems
             var settle = RandSettle();
             var hold = RandHold();
             NextActionAt = DateTime.Now.AddMilliseconds(moveMs + settle + hold + ActionCooldownMs);
-            _ = DoClick(absPos, rightClick: true, settle, hold);
+            _ = RunClickSequence("right", () => DoClick(absPos, rightClick: true, settle, hold));
             LogAction("RightClick", absPos, null, true);
             return true;
         }
@@ -1461,8 +1673,8 @@ namespace AutoExile.Systems
         private static async Task DoClick(Vector2 absPos, bool rightClick, int settleMs, int holdMs,
             Func<Vector2?>? positionCorrection = null)
         {
-            await MoveCursorTo(absPos);
-            await Task.Delay(settleMs);
+            await MoveCursorTo(absPos).ConfigureAwait(false);
+            await Task.Delay(settleMs).ConfigureAwait(false);
 
             // Final position correction — snap cursor to where the target is NOW,
             // not where it was when the click was initiated. During the interpolation +
@@ -1472,21 +1684,21 @@ namespace AutoExile.Systems
             // The cursor is already very close — this is just a small snap correction.
             var corrected = positionCorrection?.Invoke();
             if (corrected.HasValue)
-                Input.SetCursorPos(corrected.Value);
+                NativeMouseInput.Move(corrected.Value);
 
-            await SendDelay();
+            await SendDelay().ConfigureAwait(false);
             if (rightClick)
             {
                 SendRightDown();
-                await Task.Delay(holdMs);
-                await SendDelay();
+                await Task.Delay(holdMs).ConfigureAwait(false);
+                await SendDelay().ConfigureAwait(false);
                 SendRightUp();
             }
             else
             {
                 SendLeftDown();
-                await Task.Delay(holdMs);
-                await SendDelay();
+                await Task.Delay(holdMs).ConfigureAwait(false);
+                await SendDelay().ConfigureAwait(false);
                 SendLeftUp();
             }
         }
@@ -1504,26 +1716,30 @@ namespace AutoExile.Systems
             var hold = RandHold();
             // Ctrl down + settle + cursor move + settle + click hold + release + ctrl up
             NextActionAt = DateTime.Now.AddMilliseconds(hold + moveMs + settle + hold + ActionCooldownMs);
-            _ = DoCtrlClick(absPos, settle, hold);
+            _ = RunClickSequence("ctrl", () => DoCtrlClick(absPos, settle, hold));
             LogAction("CtrlClick", absPos, null, true);
             return true;
         }
 
         private static async Task DoCtrlClick(Vector2 absPos, int settleMs, int holdMs)
         {
-            await SendDelay();
-            SendKeyDown(Keys.ControlKey, "ctrl");
-            await Task.Delay(holdMs);
-            await MoveCursorTo(absPos);
-            await Task.Delay(settleMs);
-            await SendDelay();
-            SendLeftDown("ctrl-click");
-            await Task.Delay(holdMs);
-            await SendDelay();
-            SendLeftUp("ctrl-click");
-            await Task.Delay(holdMs);
-            await SendDelay();
-            SendKeyUp(Keys.ControlKey, "ctrl");
+            try
+            {
+                await SendDelay().ConfigureAwait(false);
+                SendKeyDown(Keys.ControlKey, "ctrl");
+                await Task.Delay(holdMs, _clickToken.Value).ConfigureAwait(false);
+                await MoveCursorTo(absPos).ConfigureAwait(false);
+                await Task.Delay(settleMs, _clickToken.Value).ConfigureAwait(false);
+                await SendDelay().ConfigureAwait(false);
+                SendLeftDown("ctrl-click");
+                await Task.Delay(holdMs, _clickToken.Value).ConfigureAwait(false);
+            }
+            finally
+            {
+                // Up events are cleanup: cancellation must never leak Ctrl or a mouse button.
+                if (_leftMouseDownAt.HasValue) SendLeftUp("ctrl-click-cleanup");
+                SendKeyUp(Keys.ControlKey, "ctrl-cleanup");
+            }
         }
 
         /// <summary>
@@ -1549,12 +1765,12 @@ namespace AutoExile.Systems
 
         private static async Task DoClickWithModifierHeld(Vector2 absPos, int settleMs, int holdMs)
         {
-            await MoveCursorTo(absPos);
-            await Task.Delay(settleMs);
-            await SendDelay();
+            await MoveCursorTo(absPos).ConfigureAwait(false);
+            await Task.Delay(settleMs).ConfigureAwait(false);
+            await SendDelay().ConfigureAwait(false);
             SendLeftDown("modifier-click");
-            await Task.Delay(holdMs);
-            await SendDelay();
+            await Task.Delay(holdMs).ConfigureAwait(false);
+            await SendDelay().ConfigureAwait(false);
             SendLeftUp("modifier-click");
         }
 
@@ -1602,26 +1818,26 @@ namespace AutoExile.Systems
             try
             {
                 // Press Ctrl
-                await SendDelay();
+                await SendDelay().ConfigureAwait(false);
                 Input.KeyDown(Keys.ControlKey);
                 MarkInputEvent("KeyDown", "Ctrl batch-start");
-                await Task.Delay(RandHold());
+                await Task.Delay(RandHold()).ConfigureAwait(false);
 
                 for (int i = 0; i < positions.Count; i++)
                 {
                     var pos = positions[i];
 
                     // Move cursor
-                    await MoveCursorTo(pos);
-                    await Task.Delay(RandSettle());
+                    await MoveCursorTo(pos).ConfigureAwait(false);
+                    await Task.Delay(RandSettle()).ConfigureAwait(false);
 
                     // Click
-                    await SendDelay();
-                    Input.LeftDown();
+                    await SendDelay().ConfigureAwait(false);
+                    SendNativeMouse(0x0002, "left-down");
                     MarkInputEvent("LeftDown", $"batch-click {i + 1}/{positions.Count}");
                     _leftMouseDownAt = DateTime.Now;
-                    await Task.Delay(RandHold());
-                    Input.LeftUp();
+                    await Task.Delay(RandHold()).ConfigureAwait(false);
+                    SendNativeMouse(0x0004, "left-up");
                     MarkInputEvent("LeftUp", $"batch-click {i + 1}/{positions.Count}");
                     _leftMouseDownAt = null;
 
@@ -1629,11 +1845,11 @@ namespace AutoExile.Systems
 
                     // Inter-item delay: random + action cooldown
                     if (i < positions.Count - 1)
-                        await Task.Delay(ActionCooldownMs + _rng.Next(20, 80));
+                        await Task.Delay(ActionCooldownMs + _rng.Next(20, 80)).ConfigureAwait(false);
                 }
 
                 // Release Ctrl
-                await Task.Delay(RandHold());
+                await Task.Delay(RandHold()).ConfigureAwait(false);
                 Input.KeyUp(Keys.ControlKey);
                 MarkInputEvent("KeyUp", "Ctrl batch-end");
             }
@@ -1647,7 +1863,7 @@ namespace AutoExile.Systems
             {
                 if (_leftMouseDownAt.HasValue)
                 {
-                    try { Input.LeftUp(); } catch { }
+                    try { SendNativeMouse(0x0004, "left-up"); } catch { }
                     _leftMouseDownAt = null;
                 }
                 IsBatchRunning = false;
@@ -1674,7 +1890,7 @@ namespace AutoExile.Systems
         /// </summary>
         private static int EstimateMoveMs(Vector2 target)
         {
-            var mp = Input.MousePosition;
+            var mp = NativeMouseInput.Position;
             var dist = (target - new Vector2(mp.X, mp.Y)).Length();
             if (dist < 5f) return 0;
             float t = Math.Clamp(dist / MoveMaxDistance, 0f, 1f);
@@ -1684,8 +1900,10 @@ namespace AutoExile.Systems
         /// <summary>Cancel any pending action, release held keys, stop movement, and reset gate.</summary>
         public static void Cancel()
         {
+            _clickSequence.Cancel();
             StopMovement();
             ReleaseAllKeys();
+            ReleaseMouseButtons();
             NextActionAt = DateTime.MinValue;
         }
     }
