@@ -111,20 +111,31 @@ namespace AutoExile.Systems
         private static readonly InputSequenceGate _clickSequence = new();
         private static readonly AsyncLocal<CancellationToken> _clickToken = new();
         private static string _lastClickOutcome = "none";
-        public static Action<string> DiagnosticLog { get; set; } = _ => { };
+        public static void DiagnosticLog(string message) => InputLatencyDiagnostics.Record(message);
+        public static long LastClickSequenceId { get; private set; }
         private static string _inputStage = "idle";
-        public static string InputDiagnostics =>
-            $"canAct={CanAct} gateMs={Math.Max(0, (NextActionAt - DateTime.Now).TotalMilliseconds):F0} " +
-            $"clickRunning={_clickSequence.IsRunning} click={_lastClickOutcome} stage={_inputStage} " +
-            $"held=[{string.Join(",", _heldKeys.Keys)}] leftDown={_leftMouseDownAt:HH:mm:ss.fff} " +
-            $"rightDown={_rightMouseDownAt:HH:mm:ss.fff} move={IsMovementActive}/{IsMovementSuspended} " +
-            $"cursor={NativeMouseInput.Position} {GetCursorDiagnostics()}";
+        public static string InputDiagnostics
+        {
+            get
+            {
+                try
+                {
+                    return $"canAct={CanAct} gateMs={Math.Max(0, (NextActionAt - DateTime.Now).TotalMilliseconds):F0} " +
+                        $"clickRunning={_clickSequence.IsRunning} click={_lastClickOutcome} stage={_inputStage} " +
+                        $"held=[{string.Join(",", _heldKeys.Keys)}] leftDown={_leftMouseDownAt:HH:mm:ss.fff} " +
+                        $"rightDown={_rightMouseDownAt:HH:mm:ss.fff} move={IsMovementActive}/{IsMovementSuspended} " +
+                        $"cursor={NativeMouseInput.Position} {GetCursorDiagnostics()}";
+                }
+                catch (Exception ex) { return $"diagnostics-unavailable={ex.GetType().Name}:{ex.Message} stage={_inputStage}"; }
+            }
+        }
 
         private static async Task RunClickSequence(string name, Func<Task> action)
         {
-            var elapsed = System.Diagnostics.Stopwatch.StartNew();
-            var trace = name is "right" or "ctrl";
-            if (trace) DiagnosticLog($"[InputSequence] begin {name} thread={Environment.CurrentManagedThreadId} context={SynchronizationContext.Current?.GetType().Name ?? "none"}");
+            var previousSequence = InputLatencyDiagnostics.SequenceId;
+            InputLatencyDiagnostics.SequenceId = LastClickSequenceId = InputLatencyDiagnostics.NewId();
+            using var trace = InputLatencyDiagnostics.Begin("click-sequence", true,
+                $"name={name} callerContext={SynchronizationContext.Current?.GetType().Name ?? "none"}");
             try
             {
                 await _clickSequence.RunAsync(async token =>
@@ -133,15 +144,21 @@ namespace AutoExile.Systems
                     _lastClickOutcome = $"{name}:running";
                     try
                     {
+                        token.ThrowIfCancellationRequested();
+                        DiagnosticLog($"event=dispatched name={name}");
+                        DiagnosticLog($"event=click-desktop desktop=[{NativeMouseInput.DescribeDesktop()}]");
                         await action().ConfigureAwait(false);
                         _lastClickOutcome = $"{name}:completed";
                     }
                     finally
                     {
                         // Also releases a button if memory access or cancellation interrupted the click.
-                        ReleaseMouseButtons();
-                        NextActionAt = DateTime.Now.AddMilliseconds(ActionCooldownMs);
-                        _clickToken.Value = default;
+                        try { ReleaseMouseButtons(); }
+                        finally
+                        {
+                            NextActionAt = DateTime.Now.AddMilliseconds(ActionCooldownMs);
+                            _clickToken.Value = default;
+                        }
                     }
                 }, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
             }
@@ -154,8 +171,10 @@ namespace AutoExile.Systems
             finally
             {
                 _inputStage = "idle";
-                if (trace || elapsed.ElapsedMilliseconds > 2000 || !_lastClickOutcome.EndsWith(":completed"))
-                    DiagnosticLog($"[InputSequence] end {_lastClickOutcome} elapsed={elapsed.ElapsedMilliseconds}ms recent=[{RecentRawInputDiagnostics}]");
+                trace.Result = _lastClickOutcome;
+                trace.Failed = !_lastClickOutcome.EndsWith(":completed");
+                if (trace.Failed) DiagnosticLog($"event=click-failed outcome={_lastClickOutcome} recent=[{RecentRawInputDiagnostics}]");
+                InputLatencyDiagnostics.SequenceId = previousSequence;
             }
         }
 
@@ -170,6 +189,8 @@ namespace AutoExile.Systems
             }
             _rawInputSecondCount++;
             _recentRawInputs.Enqueue($"{now:HH:mm:ss.fff} {eventType} {detail}");
+            if (InputLatencyDiagnostics.SequenceId != 0 && eventType.EndsWith("-DROPPED"))
+                DiagnosticLog($"event=input-dropped type={eventType} detail={detail}");
             while (_recentRawInputs.Count > 80) _recentRawInputs.TryDequeue(out _);
         }
 
@@ -281,14 +302,24 @@ namespace AutoExile.Systems
                 else
                 {
                     var interaction = entity.GetComponent<Render>()?.InteractCenterNum ?? entity.BoundsCenterPosNum;
-                    var anchor = (attempt % 3) switch
+                    var anchors = new[]
                     {
-                        1 => entity.BoundsCenterPosNum,
-                        2 => (interaction + entity.BoundsCenterPosNum) / 2f,
-                        _ => interaction
+                        interaction,
+                        entity.BoundsCenterPosNum,
+                        (interaction + entity.BoundsCenterPosNum) / 2f
                     };
-                    local = gc.IngameState.Camera.WorldToScreen(anchor);
-                    source = $"anchor-{attempt % 3}";
+                    local = new(float.NaN, float.NaN);
+                    for (var offset = 0; offset < anchors.Length; offset++)
+                    {
+                        var index = (attempt + offset) % anchors.Length;
+                        var candidate = gc.IngameState.Camera.WorldToScreen(anchors[index]);
+                        if (!float.IsFinite(candidate.X) || !float.IsFinite(candidate.Y) ||
+                            candidate.X < 5 || candidate.X > window.Width - 5 ||
+                            candidate.Y < 5 || candidate.Y > window.Height - 5) continue;
+                        local = candidate;
+                        source = $"anchor-{index}";
+                        break;
+                    }
                 }
                 position = new(window.X + local.X, window.Y + local.Y);
             }
@@ -299,12 +330,12 @@ namespace AutoExile.Systems
                 position.Y < window.Top + 5 || position.Y > window.Bottom - 5) return false;
 
             // SuspendMovement snaps to the player. StopMovement preserves this hover.
-            StopMovement();
-            ReleaseAllKeys();
             NextActionAt = DateTime.Now.AddMilliseconds(ActionCooldownMs + 75);
             var id = entity.Id;
             _ = RunClickSequence($"monolith:{id}", async () =>
             {
+                StopMovement();
+                ReleaseAllKeys();
                 await SendDelay().ConfigureAwait(false);
                 if (!hovered)
                 {
@@ -681,6 +712,8 @@ namespace AutoExile.Systems
             if (!CanSendInputEvent)
             {
                 LogRawInput("KeyDown-DROPPED", $"{key} {context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
+                if (InputLatencyDiagnostics.SequenceId != 0)
+                    throw new InvalidOperationException($"KeyDown {key} rejected by input rate gate");
                 return;
             }
             if (key == Keys.RButton)
@@ -695,6 +728,7 @@ namespace AutoExile.Systems
             }
 
             MarkInputEvent("KeyDown", $"{key} {context}".Trim());
+            using var trace = InputLatencyDiagnostics.Begin("ExileCore.Input.KeyDown", detail: $"key={key} context={context}");
             Input.KeyDown(key);
         }
 
@@ -712,6 +746,7 @@ namespace AutoExile.Systems
             }
 
             MarkInputEvent("KeyUp", $"{key} {context}".Trim());
+            using var trace = InputLatencyDiagnostics.Begin("ExileCore.Input.KeyUp", detail: $"key={key} context={context}");
             Input.KeyUp(key);
         }
 
@@ -720,6 +755,8 @@ namespace AutoExile.Systems
             if (!CanSendInputEvent)
             {
                 LogRawInput("LeftDown-DROPPED", $"{context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
+                if (InputLatencyDiagnostics.SequenceId != 0)
+                    throw new InvalidOperationException("LeftDown rejected by input rate gate");
                 return;
             }
             MarkInputEvent("LeftDown", context);
@@ -739,6 +776,8 @@ namespace AutoExile.Systems
             if (!CanSendInputEvent)
             {
                 LogRawInput("RightDown-DROPPED", $"{context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
+                if (InputLatencyDiagnostics.SequenceId != 0)
+                    throw new InvalidOperationException("RightDown rejected by input rate gate");
                 return;
             }
             MarkInputEvent("RightDown", context);
@@ -802,6 +841,7 @@ namespace AutoExile.Systems
         /// </summary>
         private static async Task SendDelay()
         {
+            using var trace = InputLatencyDiagnostics.Begin("input-gap");
             if (_clickSequence.IsRunning) _inputStage = "input-gap";
             _clickToken.Value.ThrowIfCancellationRequested();
             // Recheck after waking: releases from the tick loop can move this timestamp.
@@ -931,7 +971,7 @@ namespace AutoExile.Systems
             foreach (var k in toRelease)
             {
                 SendKeyUp(k, "movement-guard");
-                _heldKeys.Remove(k);
+                _heldKeys.TryRemove(k, out _);
             }
         }
 
@@ -992,7 +1032,7 @@ namespace AutoExile.Systems
             // No key release/press needed — the key is already held.
             if (IsMovementActive && _movementKey == moveKey && !IsMovementSuspended)
             {
-                NativeMouseInput.Move(absScreenPos);
+                if (!NativeMouseInput.TryMove(absScreenPos)) return false;
                 _movementCursorPos = absScreenPos;
                 return true;
             }
@@ -1016,7 +1056,7 @@ namespace AutoExile.Systems
             // Ctrl+move (attack-in-place) / Shift+move / Alt+move.
             ReleaseAllModifiersBeforeMove();
 
-            NativeMouseInput.Move(absScreenPos);
+            if (!NativeMouseInput.TryMove(absScreenPos)) return false;
             _movementCursorPos = absScreenPos;
             _movementKey = moveKey;
 
@@ -1065,7 +1105,7 @@ namespace AutoExile.Systems
                 return true; // Skip this update — position hasn't changed meaningfully
             }
 
-            NativeMouseInput.Move(absScreenPos);
+            if (!NativeMouseInput.TryMove(absScreenPos)) return false;
             _movementCursorPos = absScreenPos;
             _lastCursorUpdate = DateTime.Now;
             return true;
@@ -1104,7 +1144,7 @@ namespace AutoExile.Systems
                 var playerScreenPos = new Vector2(
                     WindowRect.X + WindowRect.Width / 2f,
                     WindowRect.Y + WindowRect.Height / 2f);
-                NativeMouseInput.Move(playerScreenPos);
+                NativeMouseInput.TryMove(playerScreenPos);
             }
 
             SendKeyUp(_movementKey, "suspend");
@@ -1130,7 +1170,7 @@ namespace AutoExile.Systems
             var target = NudgeOffPlayer(_movementCursorPos);
             _movementCursorPos = target;
             ReleaseAllModifiersBeforeMove();
-            NativeMouseInput.Move(target);
+            if (!NativeMouseInput.TryMove(target)) return;
             SendKeyDown(_movementKey, "resume");
             IsMovementSuspended = false;
         }
@@ -1208,7 +1248,7 @@ namespace AutoExile.Systems
         // ══════════════════════════════════════════════════════════════
 
         /// <summary>Currently held keys and when they were pressed.</summary>
-        private static readonly Dictionary<Keys, DateTime> _heldKeys = new();
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<Keys, DateTime> _heldKeys = new();
         private static long _holdGeneration;
 
         /// <summary>Auto-release held keys after this many seconds (safety watchdog).</summary>
@@ -1307,8 +1347,7 @@ namespace AutoExile.Systems
         {
             if (_clickSequence.IsRunning) return false;
             if (!ClampToWorldSafeZone(ref absPos)) return false;
-            NativeMouseInput.Move(absPos);
-            return true;
+            return NativeMouseInput.TryMove(absPos);
         }
 
         /// <summary>Release a specific held key.</summary>
@@ -1317,7 +1356,7 @@ namespace AutoExile.Systems
             // Cancel a matching hold even when its async cursor move has not yet
             // reached the key-down/tracking step.
             Interlocked.Increment(ref _holdGeneration);
-            if (_heldKeys.Remove(key))
+            if (_heldKeys.TryRemove(key, out _))
                 SendKeyUp(key);
         }
 
@@ -1358,7 +1397,7 @@ namespace AutoExile.Systems
             foreach (var key in expired)
             {
                 SendKeyUp(key);
-                _heldKeys.Remove(key);
+                _heldKeys.TryRemove(key, out _);
             }
         }
 

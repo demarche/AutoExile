@@ -173,6 +173,9 @@ namespace AutoExile
                 Log = msg => LogMessage($"[AutoExile] {msg}")
             };
 
+            InputLatencyDiagnostics.Start(NativeMouseInput.DescribeDesktop);
+            InputLatencyDiagnostics.Record("event=enabled version=input-latency-v1 dispatch=force-yield nativeMouse=Win32");
+
             RegisterMode(new IdleMode());
             _followerMode = new FollowerMode();
             RegisterMode(_followerMode);
@@ -528,6 +531,10 @@ namespace AutoExile
 
         public override Job Tick()
         {
+            using var tickTrace = InputLatencyDiagnostics.Begin("Tick");
+            InputLatencyDiagnostics.Frame("Tick", Settings.Enable && Settings.Running.Value && GameController.InGame);
+            using (InputLatencyDiagnostics.Begin("diagnostic-drain"))
+                InputLatencyDiagnostics.Drain(_ctx.Log);
             _stats.SetRunning(Settings.Enable && GameController.InGame && Settings.Running.Value);
             _stats.SetBestFindsMinimumChaos(Settings.Loot.BestFindsMinChaosValue.Value);
             _stats.Pulse();
@@ -537,7 +544,7 @@ namespace AutoExile
             // Web server: push status snapshot + process commands
             // Runs before all early returns so the dashboard stays live even when
             // POE is unfocused or an async action is in flight.
-            TickWebServer();
+            using (InputLatencyDiagnostics.Begin("Tick.web-server")) TickWebServer();
 
             // Update active-runtime accounting on every tick (even when POE is
             // unfocused) so the timer reflects real elapsed wall time accurately.
@@ -621,10 +628,12 @@ namespace AutoExile
             _navigation.DashMinDistance = Settings.Build.DashMinDistance.Value;
             _navigation.PathMergeThreshold = Settings.Build.PathMergeThreshold.Value;
             BotInput.ActionCooldownMs = Settings.ActionCooldownMs.Value;
-            BotInput.DiagnosticLog = _ctx.Log;
             BotInput.WindowRect = GameController.Window.GetWindowRectangleTimeCache;
-            BotInput.TickHeldKeys(); // Safety watchdog — auto-release stale held keys
-            BotInput.TickMovementLayer(); // Auto-resume movement after discrete actions
+            using (InputLatencyDiagnostics.Begin("Tick.input-maintenance"))
+            {
+                BotInput.TickHeldKeys(); // Safety watchdog — auto-release stale held keys
+                BotInput.TickMovementLayer(); // Auto-resume movement after discrete actions
+            }
 
             // Ensure skill bar is always up to date — NavigationSystem needs MovementSkills
             // and the live Move binding even when combat is disabled by the active mode.
@@ -828,7 +837,7 @@ namespace AutoExile
             }
 
             // Let the active mode decide what to do (may set up navigation paths)
-            _mode.Tick(_ctx);
+            using (InputLatencyDiagnostics.Begin("Tick.mode", detail: $"mode={_mode.Name}")) _mode.Tick(_ctx);
             LogIdleDiagnosticIfNeeded();
 
             // Record dodge action (set during mode tick, after recorder snapshot)
@@ -840,7 +849,7 @@ namespace AutoExile
             // not a path that's about to be replaced.
             // Only tick nav when no async action is in flight (cursor settle / key hold).
             if (BotInput.CanAct)
-                _navigation.Tick(GameController);
+                using (InputLatencyDiagnostics.Begin("Tick.navigation")) _navigation.Tick(GameController);
 
             // Auto level gems (global, runs across all modes)
             TickGemLevelUp();
@@ -850,6 +859,8 @@ namespace AutoExile
 
         public override void Render()
         {
+            using var renderTrace = InputLatencyDiagnostics.Begin("Render");
+            InputLatencyDiagnostics.Frame("Render", Settings.Enable && Settings.Running.Value && GameController.InGame);
             if (!Settings.Enable || !GameController.InGame)
                 return;
 
@@ -1281,6 +1292,8 @@ namespace AutoExile
         /// <summary>Called by ExileCore when plugin is being unloaded.</summary>
         public override void OnClose()
         {
+            InputLatencyDiagnostics.Stop();
+            if (_ctx != null) InputLatencyDiagnostics.Drain(_ctx.Log);
             BotInput.StopMovement();
             BotInput.ReleaseAllKeys();
             _webServer?.Stop();

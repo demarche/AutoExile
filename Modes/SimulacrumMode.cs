@@ -5,6 +5,7 @@ using ExileCore.Shared.Enums;
 using AutoExile.Systems;
 using AutoExile.Modes.Shared;
 using System.Numerics;
+using System.Diagnostics;
 
 namespace AutoExile.Modes
 {
@@ -37,6 +38,9 @@ namespace AutoExile.Modes
         private DateTime _lastMonolithDiagnosticAt = DateTime.MinValue;
         private string _lastWaveObservation = "";
         private DateTime _lastMonolithClickDiagnosticAt = DateTime.MinValue;
+        private long _monolithFirstRequestAt, _monolithLatestRequestAt, _monolithInputSequence;
+        private long _monolithLastWaitLogAt;
+        private int _monolithPendingRequests;
 
         private Vector2? _channelPosition;
         private DateTime _channelPositionStartedAt = DateTime.MinValue;
@@ -116,6 +120,8 @@ namespace AutoExile.Modes
 
         public void OnEnter(BotContext ctx)
         {
+            _monolithFirstRequestAt = _monolithLatestRequestAt = _monolithInputSequence = 0;
+            _monolithPendingRequests = 0;
             _settings = ctx.Settings.Simulacrum;
             _mapCompleted = false;
             _mapAborted = false;
@@ -232,6 +238,7 @@ namespace AutoExile.Modes
 
                 _state.Tick(gc, _settings.MinWaveDelaySeconds.Value);
                 _waveActivationConfirmed = _state.HasFreshWaveState && _state.IsWaveActive;
+                ObserveMonolithClickResponse();
                 LogMonolithState(ctx);
 
                 if (_state.IsWaveActive && _state.CurrentWave > _lastStatsWaveStarted)
@@ -392,6 +399,8 @@ namespace AutoExile.Modes
 
         private void OnAreaChanged(BotContext ctx, string newArea)
         {
+            _monolithFirstRequestAt = _monolithLatestRequestAt = _monolithInputSequence = 0;
+            _monolithPendingRequests = 0;
             var gc = ctx.Game;
 
             // Cancel any in-flight systems
@@ -1539,8 +1548,16 @@ namespace AutoExile.Modes
                 return;
             }
 
+            var requestedAt = Stopwatch.GetTimestamp();
             if (BotInput.ClickMonolith(gc, monolith, _waveStartAttempts))
             {
+                if (_monolithFirstRequestAt == 0) _monolithFirstRequestAt = requestedAt;
+                _monolithLatestRequestAt = requestedAt;
+                _monolithInputSequence = BotInput.LastClickSequenceId;
+                _monolithPendingRequests++;
+                InputLatencyDiagnostics.Record($"event=monolith-request inputSeq={_monolithInputSequence} " +
+                    $"wave={_state.CurrentWave} pendingRequests={_monolithPendingRequests} " +
+                    $"sinceFirstMs={Stopwatch.GetElapsedTime(_monolithFirstRequestAt).TotalMilliseconds:F1}");
                 _lastActionTime = DateTime.Now;
                 _waveStartAttempts++;
                 LogMonolithClick(ctx, "fixed click queued", force: true);
@@ -1571,6 +1588,28 @@ namespace AutoExile.Modes
                 $"phase={_phase} label={labelState} {_state.MonolithDiagnostics} " +
                 $"nearby={ctx.Combat.NearbyMonsterCount} cached={ctx.Combat.CachedMonsterCount} " +
                 $"channeling={ctx.Combat.IsChanneling} input=[{BotInput.InputDiagnostics}] decision={Decision}");
+        }
+
+        private void ObserveMonolithClickResponse()
+        {
+            if (_monolithFirstRequestAt == 0) return;
+            var now = Stopwatch.GetTimestamp();
+            var elapsed = Stopwatch.GetElapsedTime(_monolithFirstRequestAt, now).TotalMilliseconds;
+            var active = _state.HasFreshWaveState && _state.IsWaveActive;
+            if (!active && (elapsed < 2000 ||
+                Stopwatch.GetElapsedTime(_monolithLastWaitLogAt, now).TotalMilliseconds < 2000)) return;
+            _monolithLastWaitLogAt = now;
+            // This observes game state; a manual click may also have caused activation.
+            InputLatencyDiagnostics.Record($"event={(active ? "wave-active-observed" : "wave-unconfirmed")} " +
+                $"inputSeq={_monolithInputSequence} wave={_state.CurrentWave} " +
+                $"pendingRequests={_monolithPendingRequests} sinceFirstMs={elapsed:F1} " +
+                $"sinceLatestMs={Stopwatch.GetElapsedTime(_monolithLatestRequestAt, now).TotalMilliseconds:F1} " +
+                $"fresh={_state.HasFreshWaveState}");
+            if (active)
+            {
+                _monolithFirstRequestAt = _monolithLatestRequestAt = _monolithInputSequence = 0;
+                _monolithPendingRequests = 0;
+            }
         }
 
         private void LogMonolithClick(BotContext ctx, string reason, bool force = false)
