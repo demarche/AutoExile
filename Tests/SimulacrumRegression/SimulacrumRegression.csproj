@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Systems/SimulacrumWaveObservation.cs" Link="SimulacrumWaveObservation.cs" />
+    <Compile Include="../../Systems/InputSequenceGate.cs" Link="InputSequenceGate.cs" />
+    <Compile Include="../../Systems/InputLatencyDiagnostics.cs" Link="InputLatencyDiagnostics.cs" />
+    <Compile Include="../../Systems/SparkProgressTracker.cs" Link="SparkProgressTracker.cs" />
+  </ItemGroup>
+</Project>
