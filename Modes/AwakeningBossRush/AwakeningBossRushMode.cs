@@ -951,7 +951,20 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     {
         if (ExitHideoutEditing(ctx)) return false;
         var device = ctx.Game.EntityListWrapper.OnlyValidEntities.FirstOrDefault(e => e.Path.Contains("MappingDevice", StringComparison.OrdinalIgnoreCase));
-        if (device == null || device.DistancePlayer <= 40) { if (device != null && _walkingToDevice) { _walkingToDevice = false; ctx.Navigation.Stop(ctx.Game); } return true; }
+        // Only walk when the device is off-screen: walking (click-to-move) through the old map's portals next to the
+        // device entered that map once (unexpected_map_before_activation, 13:10).
+        bool onScreen = false;
+        if (device != null)
+        {
+            try
+            {
+                var p = ctx.Game.IngameState.Camera.WorldToScreen(device.GetComponent<Render>()?.InteractCenterNum ?? device.BoundsCenterPosNum);
+                var w = ctx.Game.Window.GetWindowRectangle();
+                onScreen = p.X > 60 && p.Y > 60 && p.X < w.Width - 60 && p.Y < w.Height - 160;
+            }
+            catch { }
+        }
+        if (device == null || onScreen || device.DistancePlayer <= 40) { if (device != null && _walkingToDevice) { _walkingToDevice = false; ctx.Navigation.Stop(ctx.Game); } return true; }
         if (!_walkingToDevice) _log.Event(Run, "hideout.walk_to_device", new { distance = device.DistancePlayer });
         _walkingToDevice = true; _phaseAt = DateTime.UtcNow;
         Navigate(ctx, device.GridPosNum); Status = $"Walking to the map device ({device.DistancePlayer:0})";
@@ -1226,7 +1239,19 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // The tab is open and holds no acceptable map: that is "supplies exhausted", not a 30 s input timeout.
         if (ctx.Stash.Status.StartsWith("Waiting for 'Metadata/Items/Maps/MapKeyTier16'", StringComparison.Ordinal))
         {
-            if (_restockEmptySince == DateTime.MinValue) _restockEmptySince = DateTime.UtcNow;
+            if (_restockEmptySince == DateTime.MinValue)
+            {
+                _restockEmptySince = DateTime.UtcNow;
+                // Diagnostics: why is no map in the visible tab acceptable?
+                try
+                {
+                    var stash = ctx.Game.IngameState.IngameUi.StashElement;
+                    var maps = stash?.VisibleStash?.VisibleInventoryItems?.Where(i => i.Item?.Path?.Contains("MapKey") == true)
+                        .Select(i => { var m = AwakeningGameReader.ReadMap(ctx.Game, i.Item, "Dunes"); return new { m.Name, m.Tier, reject = AwakeningMapPolicy.Rejections(m) }; }).ToArray();
+                    _log.Event(Run, "map.restock_candidates", new { tab = stash?.IndexVisibleStash, count = maps?.Length, maps });
+                }
+                catch (Exception ex) { _log.Event(Run, "map.restock_candidates", new { error = ex.Message }); }
+            }
             else if ((DateTime.UtcNow - _restockEmptySince).TotalSeconds > 4)
             {
                 ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
@@ -1445,7 +1470,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var inside = hazards.Where(h =>
         {
             var ground = h.Kind.StartsWith("ground:", StringComparison.Ordinal);
-            if (ground && Run.Phase == AwakeningPhase.Loot && _lootId != 0 && healthy) return false;
+            if (ground && Run.Phase == AwakeningPhase.Loot && healthy) return false;
             var margin = ground || h.Kind.StartsWith("bearer", StringComparison.Ordinal) ? 6 : 3;
             return Vector2.Distance(player, h.Pos) < h.Radius + margin;
         }).ToList();
@@ -1563,9 +1588,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     // Positioning targets (scout, drop site, reposition) are moved out of degen ground / Bearer areas.
     // Item pickups are exempt: the item itself decides where we must stand (SafetyTick guards the pool there).
+    private bool _navExact;
+    public const float LootApproachDistance = 28;
     private Vector2 SafeDestination(BotContext ctx, Vector2 target)
     {
-        if (Run.Phase == AwakeningPhase.Loot && _lootId != 0) return target;
+        if (_navExact || (Run.Phase == AwakeningPhase.Loot && _lootId != 0)) return target;
         List<(Vector2 Pos, float Radius, string Kind)> hazards;
         try { hazards = Hazards(ctx).Where(h => h.Kind.StartsWith("ground:", StringComparison.Ordinal) || h.Kind.StartsWith("bearer", StringComparison.Ordinal)).ToList(); }
         catch { return target; }
@@ -1860,6 +1887,16 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             var visibleLabel = labelOnScreen && (label!.Label.IsVisible || label.Label.IsVisibleLocal);
             // Filter-hidden labels may be absent from VisibleGroundItemLabels entirely.
             // A nearby world item is enough to request Alt; the click still needs a fresh verified label.
+            // 2026-09-21: drops 58–76 grid away were requested from where the character stood; the label was off-screen or
+            // hidden, the interaction never clicked ("timeout 5s, 0 clicks") and 100c of Chisels/Splinters were skipped.
+            // Walk up to the drop first, then pick it up with its label on screen.
+            var dropDistance = Vector2.Distance(ctx.Game.Player.GridPosNum, candidate.World.GridPosNum);
+            if (dropDistance > LootApproachDistance)
+            {
+                _navExact = true; Navigate(ctx, candidate.World.GridPosNum); _navExact = false;
+                Status = $"Walking to {candidate.Name} ({dropDistance:0})"; return;
+            }
+            if (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding) { ctx.Navigation.Stop(ctx.Game); _destination = null; }
             var revealHiddenLabel = !visibleLabel && Vector2.Distance(ctx.Game.Player.GridPosNum, candidate.World.GridPosNum) < 80;
             if (ctx.Interaction.PickupGroundItem(candidate.World, ctx.Navigation, requireProximity: !labelOnScreen && !revealHiddenLabel, revealHiddenLabel: revealHiddenLabel))
             {
