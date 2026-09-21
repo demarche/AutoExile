@@ -210,7 +210,10 @@ public sealed class AwakeningExchange
             long covered = 0; var chosen = levels[0];
             foreach (var l in levels) { chosen = l; covered += Math.Max(1, l.Listed); if (covered >= request.Quantity) break; }
             var (rw, rh) = Reduce(chosen.Get, chosen.Give);
-            want = (long)Math.Ceiling(request.Quantity / (double)rw) * rw; have = want / rw * rh;
+            // 2026-09-21: rounding up to the reduced lot (80:239) bought 80 Sacrifice at Noon for a request of 19.
+            // Order exactly the requested quantity and round the Chaos up so the ratio still meets that ask.
+            want = request.Quantity; have = (long)Math.Ceiling(request.Quantity * (double)rh / rw);
+            if (have <= 0) { Fail("bad_amounts"); return; }
         }
         else if (request.Kind == ExchangeKind.SellAtBid)
         {

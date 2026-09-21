@@ -248,7 +248,8 @@ public sealed class AwakeningMarketBuyer
     private void GoHome(GameController gc, string reason, bool research = false)
     {
         _research = research;
-        _log("market.go_home", new { reason, bought = Bought, spent = Spent, research });
+        _leaveHash = AreaHash(gc);
+        _log("market.go_home", new { reason, bought = Bought, spent = Spent, research, leaveHash = _leaveHash, homeHash = _homeHash });
         foreach (var k in HideoutKeys) _keys.Enqueue(k);
         Set(Step.Home, "returning with /hideout (" + reason + ")");
     }
@@ -276,11 +277,15 @@ public sealed class AwakeningMarketBuyer
         if (Bought > 0) { _step = Step.Done; _stepAt = DateTime.UtcNow; Status = $"Market: bought {Bought} map(s) for {Spent:0.#}c ({reason})"; }
         else Fail(reason);
     }
+    private long _leaveHash;
     private bool IsHome(GameController gc)
     {
         var area = gc.Area?.CurrentArea;
         if (gc.IsLoading || area?.IsHideout != true) return false;
         var hash = AreaHash(gc);
+        // 2026-09-21: a seller whose hideout is also "Luxurious Hideout" left the bot waiting 60 s at home. After
+        // "/hideout" the area simply has to change from the one we left and still be a hideout.
+        if (_step == Step.Home && _leaveHash != 0 && hash != _leaveHash && SellerGrid(gc) == null) return true;
         return _sellerHash == 0 ? hash == _homeHash || area.Name == _homeArea : hash != _sellerHash && (area.Name == _homeArea || hash == _homeHash);
     }
 

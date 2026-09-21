@@ -1283,7 +1283,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                     var maps = stash?.VisibleStash?.VisibleInventoryItems?.Where(i => i.Item?.Path?.Contains("MapKey") == true)
                         .Select(i => { var m = AwakeningGameReader.ReadMap(ctx.Game, i.Item, "Dunes"); return new { m.Name, m.Tier, reject = AwakeningMapPolicy.Rejections(m) }; }).ToArray();
                     var tabs = ctx.Game.IngameState.ServerData.PlayerStashTabs?.Select(t => new { t.Name, type = t.TabType.ToString(), t.VisibleIndex }).ToArray();
-                    _log.Event(Run, "map.restock_candidates", new { tab = stash?.IndexVisibleStash, count = maps?.Length, maps, tabs });
+                    var all = stash?.VisibleStash?.VisibleInventoryItems;
+                    _log.Event(Run, "map.restock_candidates", new { tab = stash?.IndexVisibleStash, visibleName = stash?.VisibleStash?.GetType().Name,
+                        total = all?.Count, sample = all?.Take(8).Select(i => i.Item?.Path).ToArray(), count = maps?.Length, maps, tabs });
                 }
                 catch (Exception ex) { _log.Event(Run, "map.restock_candidates", new { error = ex.Message }); }
             }
