@@ -141,6 +141,58 @@ public static class AwakeningUiInspector
             new JsonSerializerOptions { WriteIndented = false }));
         return file;
     }
+    /// <summary>Dumps the items under a UI grid (e.g. a seller's "Select Items To Buy" tab): entity, map read-out,
+    /// listed price and every scalar property of the inventory element (to find the "highlighted" flag).</summary>
+    public static string DumpItems(GameController gc, string directory, string label, string rootPath)
+    {
+        var start = FindByPath(gc.IngameState.IngameUi, rootPath);
+        var items = new List<object>();
+        if (start != null)
+        {
+            var kids = start.Children;
+            for (var i = 0; i < kids.Count; i++)
+            {
+                var el = kids[i];
+                if (el == null) continue;
+                object? row = null;
+                try
+                {
+                    var inv = el.AsObject<ExileCore.PoEMemory.Elements.InventoryElements.NormalInventoryItem>();
+                    var entity = inv?.Item;
+                    var props = new Dictionary<string, object?>();
+                    if (inv != null)
+                        foreach (var pr in inv.GetType().GetProperties())
+                        {
+                            if (pr.GetIndexParameters().Length > 0) continue;
+                            var t = pr.PropertyType;
+                            if (!(t.IsPrimitive || t.IsEnum || t == typeof(string))) continue;
+                            try { props[pr.Name] = pr.GetValue(inv)?.ToString(); } catch { }
+                        }
+                    object? price = null;
+                    try
+                    {
+                        var baseComp = entity?.GetComponent<ExileCore.PoEMemory.Components.Base>();
+                        price = AwakeningGameReader.Property(baseComp, "PublicPrice");
+                    }
+                    catch { }
+                    var map = entity != null ? AwakeningGameReader.ReadMap(gc, entity) : null;
+                    row = new
+                    {
+                        p = rootPath + "," + i, r = el.GetClientRect().ToString(), visible = el.IsVisible,
+                        path = entity?.Path, name = entity != null ? AwakeningGameReader.Name(gc, entity) : null,
+                        price = price?.ToString(), tier = map?.Tier, quantity = map?.Quantity,
+                        rejections = map != null ? AwakeningMapPolicy.Rejections(map) : null,
+                        mods = map?.Mods.Select(m => m.Text).ToArray(), props
+                    };
+                }
+                catch (Exception ex) { row = new { p = rootPath + "," + i, error = ex.Message }; }
+                items.Add(row);
+            }
+        }
+        var file = Path.Combine(directory, $"items-{label}-{DateTime.Now:yyyyMMdd-HHmmss}.json");
+        File.WriteAllText(file, JsonSerializer.Serialize(new { utc = DateTime.UtcNow, label, rootPath, found = start != null, items }));
+        return file;
+    }
     /// <summary>"50,2,3" = IngameUi child 50 → child 2 → child 3.</summary>
     public static Element? FindByPath(Element root, string path)
     {

@@ -192,3 +192,31 @@ dotnet run --project Tests/AwakeningRegression/AwakeningRegression.csproj
 修正済み・Reload済み: 移動キーが実スキルに割り当てられていれば開封前に停止。HoldKeyは移動解除直後の入力レート制限が解除されるまでfalseを返し、送信されていない攻撃を保持済みと記録しない。quietなLootスキャン後の死亡位置確認範囲を60gにし岩越しの無駄な接近を減らす。取得確認済みアイテムの未解決名を除去。別インスタンスへの誤入場はレビュー後に新Runへ移し古い討伐情報を引き継がない。
 
 最新検証: ビルド0エラー、Awakening101・制御25・Navigation5チェック成功。MVID=df4b09d4-f5ff-42cf-91c2-b7e1f29048e4。BotはHideout停止中。完走Successと連続2Mapは未検証。manualContinuousはstatusに公開し、manual_loop.continued/stoppedをVerbose/JSONLへ記録する。連続周回のレビューは状態機械による成功確認であり、Codexのコード改善を自動実行したという意味ではない。
+
+## 2026-09-21 夜 ゲーム内マーケットでのMap自動購入
+
+目的: Atlas・Tmpタブの T16 マップが尽きたときに、ゲーム内マーケット（`/`）から自動で補充して周回を止めないため。
+
+### 事前設定（手動・1回だけ）
+- マーケットの検索条件はゲーム側に保存されるので、一度入力すれば次回以降も残る（ただしカテゴリ変更などで Map/Chart フィルターの値が消えることがある）。
+- Type Filters: Item Category = Map（指定しないとジェムなどが混ざる）。
+- Map/Chart Filters: Map Tier 16〜16、Increased Item Quantity Min 115、Increased Packsize Min 40。
+- Stat Filters に NOT グループ: Area is influenced by The Shaper（シェイパーガーディアンマップ除外。5c で大量に並ぶ）＋ AwakeningMapPolicy の NG mod 一式。
+- 3.29 の通常マップは基底名が「Map (Tier 16)」。レイアウト（Dunes）は Atlas で選んだノードで決まるので、マップ名での絞り込みは不要（名前欄は空）。
+
+### bot の動作（AwakeningMarketBuyer）
+1. `/` でマーケットを開き、下部の search を押す（上部タブの search と区別するため Y 座標が大きい方）。
+2. 検索結果（IngameUi の "Search Results" ペイン、[0,3,1,0] が一覧）を読み、各行の価格 `~b/o N chaos`、IIQ、Pack Size、P/S タグ数、mod 文面を bot 自身の NG ルールで再チェック。安い順に最初の合格行の売り手へ移動ボタン [0,1,2,0,4,0] で飛ぶ。
+3. 売り手の "Select Items To Buy" 窓（[8,1,表示中タブ,0] がグリッド）で、各アイテムのエンティティを直接読み（価格は Base.PublicPrice）、T16・NG なし・IIQ/Pack・mod 数を確認し、最初の価格 + MapFollowUpOverChaos 以内、かつ MapMaxUnitChaos 以下なら Ctrl+左クリックで購入（価格が同じならダイアログなし）。グリッドの要素数が 1 減ったことで購入成功を確認。
+4. 目標数に達する／この売り手に条件内の品が無くなる／インベントリ満杯 で `/hideout` により帰宅。不足分は次に安い売り手で繰り返し（検索は最大 6 回）。
+5. 購入価格は economy.jsonl に purchase / price として記録（Invest はマップ使用時に計上される既存の仕組み）。
+
+### 周回への組み込み
+- OpenMap で「マップが無い」→ RestockMap（Tmp タブ）→ Tmp にも合格マップが無い → `awakening.economy.autoBuyMaps` が true なら MarketBuy フェーズで MapBuyCount 枚購入 → インベントリのマップで OpenMap を再開。購入できなければ `supplies_exhausted:market_<理由>` で停止。
+- 手動テスト: `awakening.market_buy`（value = 枚数）、中止は `awakening.market_cancel`。状態は `/api/status` の `awakening.market`。
+- 2026-09-21 21:34 実機確認: 2 枚購入（6c + 7c）、売り手 2 人を巡回して自宅へ戻ることを確認。
+
+### 実装メモ
+- UI 調査用に `inspect_ui` へ `|hidden`（非表示要素も出力）、`inspect_items`（グリッドのアイテムをエンティティ付きで出力）を追加。
+- `ui_type` は入力前に End + Back×40 で全消去。括弧は JIS 配列なので Shift+8 = `(`、Shift+9 = `)`。
+- 移動ボタンのダイアログやドロップダウンの選択肢は ExileAPI から文字が読めない（Trade Filters の Buyout 通貨などは結果側の `~b/o N chaos` で判定）。

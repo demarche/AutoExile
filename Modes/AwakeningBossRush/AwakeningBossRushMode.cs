@@ -26,6 +26,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private readonly AwakeningTelemetry _log;
     private readonly AwakeningLedger _ledger;
     private readonly AwakeningExchange _exchange;
+    private readonly AwakeningMarketBuyer _market;
+    private bool _marketManual, _marketTried, _marketStarted;
     private bool _exchangeManual;
     private readonly Queue<Keys> _uiKeys = new();
     private static Element? ResolveUi(BotContext ctx, string spec)
@@ -120,6 +122,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         _log = new(_directory, log, Supervisor.Generation);
         _ledger = new(_directory);
         _exchange = new((name, data) => _log.Event(Run, name, data));
+        _market = new((name, data) => _log.Event(Run, name, data));
         RefreshAnalysis();
         _log.Event(Run, "plugin.loaded", new { Supervisor.Generation, Supervisor.Mvid, Supervisor.StorageError });
     }
@@ -157,7 +160,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         Supervisor.PersistenceRetries, Supervisor.LastPersistenceWarning,
         netChaosPerHour = Run.CostKnown && Run.RevenueKnown && Run.OperatingSeconds > 0 ? (double?)((Run.RevenueChaos - Run.CostChaos) * 3600 / Run.OperatingSeconds) : null,
         modRisk = _risks, economy = _ledger.Summary(),
-        exchange = new { busy = _exchange.Busy, status = _exchange.Status, fail = _exchange.FailReason, quote = _exchange.LastQuote, manual = _exchangeManual } }, AwakeningJson.Options);
+        exchange = new { busy = _exchange.Busy, status = _exchange.Status, fail = _exchange.FailReason, quote = _exchange.LastQuote, manual = _exchangeManual },
+        market = new { busy = _market.Busy, status = _market.Status, fail = _market.FailReason, bought = _market.Bought, spent = _market.Spent, manual = _marketManual } }, AwakeningJson.Options);
     private void RefreshAnalysis() => _risks = AwakeningModRiskAnalyzer.Analyze(Supervisor.State.History.Append(Run)).Take(30).ToArray();
 
     private bool _manualContinuous;
@@ -217,6 +221,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _log.Event(Run, "ui.inspected", new { file });
             return Supervisor.RecordCommand(id, "inspected:" + Path.GetFileName(file));
         }
+        if (action == "inspect_items")
+        {
+            // Read-only: value = "label|rootPath" — dumps the items under a grid element (seller stash, etc.).
+            var parts = (review ?? "").Split('|');
+            if (parts.Length < 2) return "rejected: value = label|rootPath";
+            var label = Regex.Replace(parts[0], @"[^A-Za-z0-9_-]", "");
+            var file = AwakeningUiInspector.DumpItems(ctx.Game, _directory, label, parts[1]);
+            return Supervisor.RecordCommand(id, "inspected:" + Path.GetFileName(file));
+        }
         if (action is "exchange_quote" or "exchange_buy" or "exchange_sell" or "exchange_list")
         {
             // Manual/calibration orders: value = "Item|Quantity|MaxUnitChaos" (quote: "Want|Have").
@@ -235,6 +248,17 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _exchange.Start(request); _exchangeManual = true;
             return Supervisor.RecordCommand(id, "exchange_started:" + request.Kind);
         }
+        if (action == "market_buy")
+        {
+            // Manual map purchase through the in-game market: value = count (default MapBuyCount). Bot must be stopped, in the hideout.
+            if (ctx.Settings.Running.Value || HasActiveAttempt) return "rejected: stop the loop first";
+            if (ctx.Game.Area?.CurrentArea?.IsHideout != true) return "rejected: hideout required";
+            if (_market.Busy) return "rejected: market purchase already running";
+            var count = int.TryParse(review, out var n) && n > 0 ? n : ctx.Settings.Awakening.Economy.MapBuyCount.Value;
+            _market.Start(ctx.Game, MarketRequest(ctx, count)); _marketManual = true;
+            return Supervisor.RecordCommand(id, "market_started:" + count);
+        }
+        if (action == "market_cancel") { _market.Cancel(); _marketManual = false; return Supervisor.RecordCommand(id, "market_cancelled"); }
         if (action == "exchange_cancel") { _exchange.Cancel(); _exchangeManual = false; return Supervisor.RecordCommand(id, "exchange_cancelled"); }
         if (action is "ui_click" or "ui_type" or "ui_key")
         {
@@ -363,7 +387,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             _inspectionStatus = "";
             _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
-            _mapRestockAttempted = false; _mapRestockStarted = false;
+            _mapRestockAttempted = false; _mapRestockStarted = false; _marketTried = false; _marketStarted = false;
             _defensiveClear = false;
             _lootDefenseActive = false; _lootDefenseSuppressedUntil = DateTime.MinValue;
             _uniqueEvidence.Clear();
@@ -409,6 +433,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             var next = _uiKeys.Peek();
             var sent = (next & Keys.Shift) != 0 ? BotInput.PressShiftKey(next & Keys.KeyCode) : BotInput.PressKey(next);
             if (sent) _uiKeys.Dequeue();
+        }
+        if (_marketManual)
+        {
+            if (_market.Busy) { _market.Tick(ctx); Status = _market.Status; }
+            else { _marketManual = false; Status = _market.Status; RecordMarketResult("manual"); }
         }
         if (_exchangeManual)
         {
@@ -566,6 +595,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 case AwakeningPhase.OpenMap: OpenMap(ctx); break;
                 case AwakeningPhase.RestockMap: RestockMap(ctx); break;
                 case AwakeningPhase.Restock: Restock(ctx); break;
+                case AwakeningPhase.MarketBuy: MarketBuy(ctx); break;
                 case AwakeningPhase.EnterPortal: EnterPortal(ctx); break;
                 case AwakeningPhase.Scout: if (!SafetyTick(ctx)) Scout(ctx); break;
                 case AwakeningPhase.Fight: if (!SafetyTick(ctx)) Fight(ctx, false); break;
@@ -1168,7 +1198,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             if (_restockEmptySince == DateTime.MinValue) _restockEmptySince = DateTime.UtcNow;
             else if ((DateTime.UtcNow - _restockEmptySince).TotalSeconds > 4)
-            { ctx.Stash.Cancel(ctx.Game, ctx.Navigation); Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:no_acceptable_T16_in_Tmp"); return; }
+            {
+                ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
+                if (ctx.Settings.Awakening.Economy.AutoBuyMaps.Value && !_marketTried)
+                { _marketTried = true; _marketStarted = false; SetPhase(AwakeningPhase.MarketBuy, "no_T16_in_Tmp_buy_from_market"); return; }
+                Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:no_acceptable_T16_in_Tmp"); return;
+            }
         }
         else _restockEmptySince = DateTime.MinValue;
         if (result == StashResult.Failed) { Finish(ctx, AttemptOutcome.OperationalFailure, "Tmp_no_usable_map:" + Status); return; }
@@ -1176,6 +1211,31 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
         _log.Event(Run, "map.restocked", new { tab = "Tmp", count = 1 });
         SetPhase(AwakeningPhase.OpenMap, "Tmp_map_ready");
+    }
+    private MarketMapRequest MarketRequest(BotContext ctx, int count)
+    {
+        var e = ctx.Settings.Awakening.Economy;
+        return new(count, e.MapMaxUnitChaos.Value, e.MapFollowUpOverChaos.Value, e.MapMinQuantity.Value, e.MapMinPackSize.Value, e.MapMinAffixesEach.Value);
+    }
+    private void RecordMarketResult(string source)
+    {
+        foreach (var p in _market.Purchases) { _ledger.Purchase("Map (Tier 16)", 1, p.Price, "market:" + p.Seller); _ledger.Price("Map (Tier 16)", p.Price, "market:" + source); }
+        _market.Purchases.Clear();
+    }
+    private void MarketBuy(BotContext ctx)
+    {
+        // Maps ran out (Atlas + Tmp): buy MapBuyCount maps through the in-game market, then open the map from the inventory.
+        if (!_marketStarted)
+        {
+            if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible == true || ctx.Game.IngameState.IngameUi.Atlas?.IsVisible == true)
+            { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
+            _market.Start(ctx.Game, MarketRequest(ctx, ctx.Settings.Awakening.Economy.MapBuyCount.Value)); _marketStarted = true; return;
+        }
+        if (_market.Busy) { _market.Tick(ctx); Status = _market.Status; return; }
+        RecordMarketResult("auto");
+        _log.Event(Run, "market.restock_done", new { ok = _market.Succeeded, bought = _market.Bought, spent = _market.Spent, reason = _market.FailReason });
+        if (_market.Succeeded) { _mapRestockAttempted = false; SetPhase(AwakeningPhase.OpenMap, "market_maps_bought"); return; }
+        Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:market_" + _market.FailReason);
     }
     private void EnterPortal(BotContext ctx)
     {
