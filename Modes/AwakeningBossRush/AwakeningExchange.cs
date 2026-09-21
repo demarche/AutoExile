@@ -33,6 +33,8 @@ public sealed class AwakeningExchange
     private int _fillAttempts, _collectClicks;
     private int _orderWant, _orderHave;
     private string _searched = "";
+    private int _placeClicks, _slotsBefore;
+    private DateTime _placeAt;
 
     public string Status { get; private set; } = "";
     public bool Busy => _step is not (Step.Idle or Step.Done or Step.Failed);
@@ -48,7 +50,7 @@ public sealed class AwakeningExchange
 
     public void Start(ExchangeRequest request)
     {
-        _request = request; _fillAttempts = 0; _collectClicks = 0; _keys.Clear(); _searched = "";
+        _request = request; _fillAttempts = 0; _collectClicks = 0; _keys.Clear(); _searched = ""; _placeClicks = 0;
         FilledWant = 0; PaidHave = 0; UnitChaos = 0; FailReason = ""; LastQuote = null;
         _startedAt = DateTime.UtcNow; Set(Step.Open, "opening Faustus");
         _log("exchange.started", request);
@@ -242,7 +244,8 @@ public sealed class AwakeningExchange
     private bool Fill(GameController gc, Element? field, int value)
     {
         if (field == null) { Fail("input_field_missing"); return false; }
-        if (ReadNumber(field) == value) { _fillAttempts = 0; return true; }
+        // The fields show the market suggestion as placeholder text: a value only counts after we typed it ourselves.
+        if (_fillAttempts > 0 && ReadNumber(field) == value) { _fillAttempts = 0; return true; }
         if (++_fillAttempts > 4) { Fail("field_not_verified:" + value); return false; }
         Click(gc, field);
         for (var i = 0; i < 10; i++) _keys.Enqueue(Keys.Back);
@@ -250,14 +253,30 @@ public sealed class AwakeningExchange
         Status = "typing " + value; return false;
     }
 
+    // "n/10" order slots next to Place Order: a placed order raises n (or completes at once and shows a finished card).
+    private static int? OrderSlots(Element panel)
+    {
+        var text = Descendants(panel).Select(Text).FirstOrDefault(t => Regex.IsMatch(t.Trim(), @"^\d+/\d+$"));
+        return text != null && int.TryParse(text.Trim().Split('/')[0], out var n) ? n : null;
+    }
     private void TickPlace(GameController gc, Element panel)
     {
+        if (_placeClicks > 0)
+        {
+            var slots = OrderSlots(panel);
+            if ((slots.HasValue && slots.Value > _slotsBefore) || FinishedSlots(panel).Count > 0)
+            {
+                _log("exchange.order_placed", new { _request, _orderWant, _orderHave, slots, clicks = _placeClicks });
+                Set(Step.AwaitFill, "waiting for the order to fill"); return;
+            }
+            if ((DateTime.UtcNow - _placeAt).TotalSeconds < 2.5) { Status = "Faustus: confirming the order"; return; }
+            if (_placeClicks >= 3) { Fail("order_not_registered"); return; }
+        }
+        else _slotsBefore = OrderSlots(panel) ?? 0;
         var label = Descendants(panel).FirstOrDefault(e => Text(e).Trim().Equals("place order", StringComparison.OrdinalIgnoreCase));
         var button = label?.Parent ?? label;
-        if (button == null) { Status = "place order button not found"; return; }
-        Click(gc, button);
-        _log("exchange.order_placed", new { _request, _orderWant, _orderHave });
-        Set(Step.AwaitFill, "waiting for the order to fill");
+        if (button == null) { Status = "Faustus: place order button not found"; return; }
+        if (BotInput.Click(Abs(gc, button.GetClientRect().Center))) { _actionAt = _placeAt = DateTime.UtcNow; _placeClicks++; Status = "Faustus: clicked place order"; }
     }
 
     private void TickAwait(GameController gc, Element panel)

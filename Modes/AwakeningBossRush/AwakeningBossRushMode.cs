@@ -151,7 +151,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private void RefreshAnalysis() => _risks = AwakeningModRiskAnalyzer.Analyze(Supervisor.State.History.Append(Run)).Take(30).ToArray();
 
     private bool _manualContinuous;
-    private bool _stopAfterMap, _ledgerStarted, _restockTried;
+    private bool _stopAfterMap, _ledgerStarted, _restockTried, _listingChecked, _restockBackToPrepare;
+    private readonly HashSet<string> _listedThisSession = new();
     private DateTime _restockEmptySince = DateTime.MinValue;
 
     public void ManualStart(BotContext ctx, string source = "user_insert")
@@ -320,7 +321,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _scoutRepositionUntil = DateTime.MinValue;
             _deviceMaterialPaths.Clear();
             _materialIndex = 0; _withdrawing = false; _indexStarted = false; _lootId = 0;
-            _lootAttempts.Clear(); _unblockAttempts.Clear(); _scoutIgnored.Clear(); _lootSkipped.Clear(); _lootInterrupted = false; _enRouteLoot = false; _pushIgnoredUntil.Clear(); _dropSiteReached = false; _restockTried = false; _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
+            _lootAttempts.Clear(); _unblockAttempts.Clear(); _scoutIgnored.Clear(); _lootSkipped.Clear(); _lootInterrupted = false; _enRouteLoot = false; _pushIgnoredUntil.Clear(); _dropSiteReached = false; _restockTried = false; _listingChecked = false; _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
             _lastClock = Stopwatch.GetTimestamp(); _phaseAt = DateTime.UtcNow; _lastPosition = ctx.Game.Player.GridPosNum;
             _lastProgress = DateTime.UtcNow; _damage.Reset(DateTime.UtcNow);
             Run.BuildConfiguration = AwakeningJson.Serialize(AutoExile.WebServer.SettingsApi.SerializeFlat(ctx.Settings)
@@ -717,6 +718,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private void Prepare(BotContext ctx)
     {
         if (ctx.Game.Area?.CurrentArea?.IsHideout != true) { Status = "Waiting for hideout"; return; }
+        if (!Run.ActivationRequested && !Run.ActivationConfirmed && !_listingChecked && PlanListings(ctx)) return;
         var moveConflict = ctx.Combat.MovementBindingConflict(ctx.Game, ctx.Navigation.MoveKey);
         if (moveConflict != null)
         {
@@ -881,6 +883,29 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         CancelInput(ctx);
         SetPhase(AwakeningPhase.Restock, "restock_via_faustus");
     }
+    // Held Chaos below the threshold: list Chisels/Writ at (lowest competing ask - undercut) once per session each.
+    // The orders fill later; the items leave the stash, so they are never listed twice.
+    private bool PlanListings(BotContext ctx)
+    {
+        _listingChecked = true;
+        var economy = ctx.Settings.Awakening.Economy;
+        if (!economy.AutoRestock.Value || economy.ListBelowChaos.Value <= 0) return false;
+        var chaos = AwakeningExchange.CountHeld(ctx.Game, "Chaos Orb");
+        if (chaos >= economy.ListBelowChaos.Value) return false;
+        _restockQueue.Clear();
+        foreach (var name in SellableNames.Where(n => !_listedThisSession.Contains(n)))
+        {
+            var held = AwakeningExchange.CountHeld(ctx.Game, name);
+            if (held <= 0) continue;
+            _listedThisSession.Add(name);
+            _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.ListAtAskMinus, "Chaos Orb", name, held, 0, economy.ListUndercutChaos.Value));
+        }
+        if (_restockQueue.Count == 0) return false;
+        _log.Event(Run, "listing.planned", new { chaos, threshold = economy.ListBelowChaos.Value, orders = _restockQueue.ToArray() });
+        _restockBackToPrepare = true; CancelInput(ctx);
+        SetPhase(AwakeningPhase.Restock, "list_below_chaos_threshold");
+        return true;
+    }
     private void Restock(BotContext ctx)
     {
         var economy = ctx.Settings.Awakening.Economy;
@@ -889,6 +914,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             var done = _restockCurrent; _restockCurrent = null;
             RecordExchangeResult(ctx, "restock");
+            if (!_exchange.Succeeded && done.Kind == ExchangeKind.ListAtAskMinus) _log.Event(Run, "listing.skipped", new { done.HaveName, _exchange.FailReason });
             if (!_exchange.Succeeded && done.Kind == ExchangeKind.BuyAtAsk)
             {
                 if (_exchange.FailReason.StartsWith("price_above_cap")) { Finish(ctx, AttemptOutcome.OperationalFailure, "restock_price_above_cap:" + done.WantName); return; }
@@ -898,6 +924,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (_restockQueue.Count == 0)
         {
             if (ctx.Game.IngameState.IngameUi.CurrencyExchangePanel?.IsVisible == true) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
+            if (_restockBackToPrepare) { _restockBackToPrepare = false; SetPhase(AwakeningPhase.Prepare, "listing_complete"); return; }
             _indexStarted = false; ctx.StashIndex.Reset();
             SetPhase(AwakeningPhase.IndexStash, "restock_complete_reindex"); return;
         }
@@ -930,11 +957,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private void RecordExchangeResult(BotContext ctx, string source)
     {
         var r = _exchange.Succeeded ? _exchangeLastRequest() : null;
-        if (r == null || _exchange.FilledWant <= 0) return;
+        if (r == null || (r.Kind != ExchangeKind.ListAtAskMinus && _exchange.FilledWant <= 0)) return;
         if (r.Kind == ExchangeKind.BuyAtAsk)
         { _ledger.Price(r.WantName, _exchange.UnitChaos, "faustus_ask"); _ledger.Purchase(r.WantName, _exchange.FilledWant, _exchange.UnitChaos, source); }
         else if (r.Kind == ExchangeKind.SellAtBid)
             _ledger.AddSale(r.HaveName, _exchange.PaidHave, _exchange.UnitChaos, "faustus_bid_" + source);
+        else if (r.Kind == ExchangeKind.ListAtAskMinus)
+            _ledger.Listing(r.HaveName, r.Quantity, _exchange.UnitChaos, source);
     }
     private ExchangeRequest? _exchangeLastRequest() => _exchange.Request;
     private void Index(BotContext ctx)
