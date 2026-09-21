@@ -543,7 +543,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             var outcome = AwakeningSupervisor.Watchdog(Run, gc.Player.IsAlive, inMap, ctx.Settings.Awakening.TimeoutSeconds.Value);
             if (outcome != AttemptOutcome.None)
             {
-                if (outcome == AttemptOutcome.Death) Run.Deaths++;
+                if (outcome == AttemptOutcome.Death) { Run.Deaths++; LogThreatContext(ctx, "death.context"); }
                 Finish(ctx, outcome, outcome == AttemptOutcome.Death ? "player_dead" : "300_second_deadline"); return;
             }
             if ((now - _saveAt).TotalSeconds >= 1)
@@ -1378,9 +1378,19 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (hint != null) { Navigate(ctx, hint.GridPosNum); return; }
         Explore(ctx);
     }
+    private static bool IsBearer(Entity e)
+    {
+        if ((e.Path?.Contains("bearer", StringComparison.OrdinalIgnoreCase) ?? false) || (e.RenderName?.Contains("bearer", StringComparison.OrdinalIgnoreCase) ?? false)) return true;
+        try { return e.GetComponent<ObjectMagicProperties>()?.Mods?.Any(m => m != null && m.Contains("bearer", StringComparison.OrdinalIgnoreCase)) == true; } catch { return false; }
+    }
+    private List<(Vector2 Pos, float Radius, string Kind)> _hazardCache = new();
+    private DateTime _hazardCacheAt;
     private List<(Vector2 Pos, float Radius, string Kind)> Hazards(BotContext ctx)
     {
+        if ((DateTime.UtcNow - _hazardCacheAt).TotalMilliseconds < 200) return _hazardCache;
+        _hazardCacheAt = DateTime.UtcNow;
         var list = new List<(Vector2 Pos, float Radius, string Kind)>();
+        _hazardCache = list;
         var gc = ctx.Game; var player = gc.Player.GridPosNum;
         try
         {
@@ -1395,7 +1405,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                         var animation = e.GetComponent<Animated>()?.BaseAnimatedObjectEntity?.Path;
                         if (animation != null && DangerAnimation.IsMatch(animation)) kind = "effect:" + animation;
                     }
-                    else if (e.Path.Contains("Bearer", StringComparison.OrdinalIgnoreCase)) kind = "bearer_effect:" + e.Path;
+                    else if (IsBearer(e)) kind = "bearer_effect:" + e.Path;
                     if (kind == null) continue;
                     var size = e.GetComponent<Positioned>()?.Size ?? 10;
                     list.Add((e.GridPosNum, Math.Clamp((float)size, 8f, 40f), kind));
@@ -1404,10 +1414,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 foreach (var e in daemons)
                     if (e?.Path?.Contains("UberMapExarchDaemon") == true && e.IsHostile && Vector2.Distance(player, e.GridPosNum) < 80)
                         list.Add((e.GridPosNum, Math.Clamp((float)(e.GetComponent<Positioned>()?.Size ?? 15), 10f, 40f), "exarch_daemon"));
+            // "Bearer" monsters (name, metadata path or monster mod) hurt a lot around them; any non-effect entity so a
+            // corpse/remnant that keeps a Bearer path is avoided as well.
             foreach (var e in gc.EntityListWrapper.OnlyValidEntities)
-                if (e.Type == EntityType.Monster && e.IsAlive && e.IsHostile && Vector2.Distance(player, e.GridPosNum) < 80 &&
-                    ((e.Path?.Contains("Bearer", StringComparison.OrdinalIgnoreCase) ?? false) || (e.RenderName?.Contains("Bearer", StringComparison.OrdinalIgnoreCase) ?? false)))
-                    list.Add((e.GridPosNum, BearerAvoidRadius, "bearer:" + e.RenderName));
+                if (e.Type != EntityType.Effect && e.Type != EntityType.Player && Vector2.Distance(player, e.GridPosNum) < 80 &&
+                    (e.Type != EntityType.Monster || (e.IsAlive && e.IsHostile)) && IsBearer(e))
+                    list.Add((e.GridPosNum, BearerAvoidRadius, "bearer:" + (e.RenderName ?? e.Path)));
         }
         catch { }
         foreach (var h in list)
@@ -1427,7 +1439,16 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var peak = _poolHistory.Max(x => x.Pool);
         var burst = max > 0 && (peak - pool) / max >= BurstFraction;
         var hazards = Hazards(ctx);
-        var inside = hazards.Where(h => Vector2.Distance(player, h.Pos) < h.Radius + 3).ToList();
+        // Ground degen and Bearers: keep a wider margin so the character steps away before standing in them.
+        // While picking up loot with a healthy pool (>= 70 %), brief contact with degen ground is accepted (it is damage over time).
+        var healthy = max > 0 && pool / max >= 0.7f;
+        var inside = hazards.Where(h =>
+        {
+            var ground = h.Kind.StartsWith("ground:", StringComparison.Ordinal);
+            if (ground && Run.Phase == AwakeningPhase.Loot && _lootId != 0 && healthy) return false;
+            var margin = ground || h.Kind.StartsWith("bearer", StringComparison.Ordinal) ? 6 : 3;
+            return Vector2.Distance(player, h.Pos) < h.Radius + margin;
+        }).ToList();
         if (now < _escapeUntil && (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding))
         { TravelSustain(ctx); Status = "Escaping danger"; return true; }
         if (inside.Count == 0 && !burst) return false;
@@ -1465,6 +1486,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         Navigate(ctx, best.Value);
         _escapeUntil = now.AddSeconds(1.2);
         _runEscapes++;
+        if (burst) LogThreatContext(ctx, "safety.burst_context");
         _log.Event(Run, "safety.escape", new { burst, poolLostPct = max > 0 ? Math.Round((peak - pool) / max * 100) : 0,
             hazards = inside.Select(h => h.Kind).Distinct().ToArray(), blinked, x = best.Value.X, y = best.Value.Y, Run.Phase });
         Status = blinked ? "Escaping danger (movement skill)" : "Escaping danger";
@@ -1530,6 +1552,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     private void Navigate(BotContext ctx, Vector2 target)
     {
+        target = SafeDestination(ctx, target);
         TravelSustain(ctx);
         if (ctx.Navigation.IsPathfinding) return;
         if (_destination.HasValue && Vector2.Distance(target, _destination.Value) < 12 && ctx.Navigation.IsNavigating) return;
@@ -1537,6 +1560,56 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         _lastProgress = DateTime.UtcNow; _lastPosition = ctx.Game.Player.GridPosNum;
         if (!ctx.Navigation.NavigateTo(ctx.Game, target)) ctx.Exploration.MarkRegionFailed(target);
         _log.Event(Run, "navigation.requested", new { target.X, target.Y, ctx.Navigation.PathfindingStatus });
+    }
+    // Positioning targets (scout, drop site, reposition) are moved out of degen ground / Bearer areas.
+    // Item pickups are exempt: the item itself decides where we must stand (SafetyTick guards the pool there).
+    private Vector2 SafeDestination(BotContext ctx, Vector2 target)
+    {
+        if (Run.Phase == AwakeningPhase.Loot && _lootId != 0) return target;
+        List<(Vector2 Pos, float Radius, string Kind)> hazards;
+        try { hazards = Hazards(ctx).Where(h => h.Kind.StartsWith("ground:", StringComparison.Ordinal) || h.Kind.StartsWith("bearer", StringComparison.Ordinal)).ToList(); }
+        catch { return target; }
+        if (hazards.Count == 0) return target;
+        for (var pass = 0; pass < 3; pass++)
+        {
+            var hit = hazards.FirstOrDefault(h => Vector2.Distance(target, h.Pos) < h.Radius + 6);
+            if (hit.Kind == null) return target;
+            var dir = target - hit.Pos; if (dir.Length() < 0.5f) dir = ctx.Game.Player.GridPosNum - hit.Pos;
+            if (dir.Length() < 0.5f) dir = new Vector2(1, 0);
+            var moved = hit.Pos + Vector2.Normalize(dir) * (hit.Radius + 10);
+            var walk = ctx.Navigation.FindNearestWalkable(ctx.Game, moved, 6);
+            if (!walk.HasValue) return target;
+            if (pass == 0) _log.Event(Run, "safety.destination_moved", new { from = new[] { target.X, target.Y }, to = new[] { walk.Value.X, walk.Value.Y }, hit.Kind });
+            target = walk.Value;
+        }
+        return target;
+    }
+    // Forensics for the improvement loop: what was around the character on a damage burst or a death.
+    private DateTime _threatLogAt;
+    private void LogThreatContext(BotContext ctx, string name)
+    {
+        if (name != "death.context" && (DateTime.UtcNow - _threatLogAt).TotalSeconds < 3) return;
+        _threatLogAt = DateTime.UtcNow;
+        try
+        {
+            var gc = ctx.Game; var player = gc.Player.GridPosNum;
+            var near = gc.EntityListWrapper.OnlyValidEntities
+                .Where(e => e.Type is EntityType.Monster or EntityType.Effect or EntityType.Daemon && Vector2.Distance(player, e.GridPosNum) < 50)
+                .OrderBy(e => Vector2.Distance(player, e.GridPosNum)).Take(14)
+                .Select(e =>
+                {
+                    string[] mods = [];
+                    try { mods = e.GetComponent<ObjectMagicProperties>()?.Mods?.Take(8).ToArray() ?? []; } catch { }
+                    string? anim = null;
+                    try { anim = e.GetComponent<Animated>()?.BaseAnimatedObjectEntity?.Path; } catch { }
+                    return new { type = e.Type.ToString(), e.RenderName, e.Path, e.IsAlive, e.IsHostile, rarity = e.Rarity.ToString(),
+                        d = Math.Round(Vector2.Distance(player, e.GridPosNum)), size = e.GetComponent<Positioned>()?.Size, mods, anim };
+                }).ToArray();
+            var life = gc.Player.GetComponent<Life>();
+            _log.Event(Run, name, new { Run.Phase, hp = life?.CurHP, es = life?.CurES, x = player.X, y = player.Y,
+                hazards = Hazards(ctx).Select(h => new { h.Kind, h.Radius, d = Math.Round(Vector2.Distance(player, h.Pos)) }).ToArray(), near });
+        }
+        catch (Exception ex) { _log.Event(Run, name, new { error = ex.Message }); }
     }
     private static void TravelSustain(BotContext ctx)
     {
