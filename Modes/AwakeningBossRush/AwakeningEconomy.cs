@@ -81,6 +81,9 @@ public sealed class AwakeningLedger
         lock (_gate) Invest += quantity * unitChaos;
         Append(_economyFile, new { utc = DateTime.UtcNow, type = "invest", item, quantity, unitChaos, total = quantity * unitChaos, source });
     }
+    // Purchases are price history (what supplies really cost); Invest is booked when a map consumes them.
+    public void Purchase(string item, int quantity, double unitChaos, string source) =>
+        Append(_economyFile, new { utc = DateTime.UtcNow, type = "purchase", item, quantity, unitChaos, total = quantity * unitChaos, source });
     public void AddLoot(string item, int quantity, double stackChaos)
     {
         lock (_gate) LootValue += stackChaos;

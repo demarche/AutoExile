@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 
 namespace AutoExile.Modes.AwakeningBossRush;
 
-public enum AwakeningPhase { Dormant, Prepare, IndexStash, Withdraw, OpenMap, EnterPortal, Scout, Fight, Loot, MapBoss, Return, OpenStash, ExternalStash, AwaitingReview, Stopped, RestockMap }
+public enum AwakeningPhase { Dormant, Prepare, IndexStash, Withdraw, OpenMap, EnterPortal, Scout, Fight, Loot, MapBoss, Return, OpenStash, ExternalStash, AwaitingReview, Stopped, RestockMap, Restock }
 public enum AttemptOutcome { None, Success, Death, Timeout, ManualIntervention, OperationalFailure }
 public enum BossLife { Alive, Dormant, Missing, DeadConfirmed }
 public enum InvitationDecision { Unknown, No, Yes }

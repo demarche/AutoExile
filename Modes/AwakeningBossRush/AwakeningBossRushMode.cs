@@ -24,6 +24,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private AwakeningRun Run => Supervisor.Run;
     private readonly AwakeningTelemetry _log;
     private readonly AwakeningLedger _ledger;
+    private readonly AwakeningExchange _exchange;
+    private bool _exchangeManual;
+    private readonly Queue<ExchangeRequest> _restockQueue = new();
+    private ExchangeRequest? _restockCurrent;
+    private int _restockSales;
+    private static readonly string[] SellableNames = ["Maven's Chisel of Proliferation", "Maven's Chisel of Avarice", "Maven's Chisel of Divination",
+        "Maven's Chisel of Procurement", "Maven's Chisel of Scarabs", "The Maven's Writ"];
     private readonly List<object> _runLoot = new();
     private int _runEscapes;
     private string _countedRunId = "";
@@ -102,6 +109,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         Supervisor = new(_directory, typeof(AwakeningBossRushMode).Assembly.ManifestModule.ModuleVersionId.ToString());
         _log = new(_directory, log, Supervisor.Generation);
         _ledger = new(_directory);
+        _exchange = new((name, data) => _log.Event(Run, name, data));
         RefreshAnalysis();
         _log.Event(Run, "plugin.loaded", new { Supervisor.Generation, Supervisor.Mvid, Supervisor.StorageError });
     }
@@ -138,11 +146,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         checkpointError = Supervisor.StorageError, telemetryError = _log.Error, telemetryDropped = _log.Dropped,
         Supervisor.PersistenceRetries, Supervisor.LastPersistenceWarning,
         netChaosPerHour = Run.CostKnown && Run.RevenueKnown && Run.OperatingSeconds > 0 ? (double?)((Run.RevenueChaos - Run.CostChaos) * 3600 / Run.OperatingSeconds) : null,
-        modRisk = _risks, economy = _ledger.Summary() }, AwakeningJson.Options);
+        modRisk = _risks, economy = _ledger.Summary(),
+        exchange = new { busy = _exchange.Busy, status = _exchange.Status, fail = _exchange.FailReason, quote = _exchange.LastQuote, manual = _exchangeManual } }, AwakeningJson.Options);
     private void RefreshAnalysis() => _risks = AwakeningModRiskAnalyzer.Analyze(Supervisor.State.History.Append(Run)).Take(30).ToArray();
 
     private bool _manualContinuous;
-    private bool _stopAfterMap, _ledgerStarted;
+    private bool _stopAfterMap, _ledgerStarted, _restockTried;
     private DateTime _restockEmptySince = DateTime.MinValue;
 
     public void ManualStart(BotContext ctx, string source = "user_insert")
@@ -194,6 +203,25 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _log.Event(Run, "ui.inspected", new { file });
             return Supervisor.RecordCommand(id, "inspected:" + Path.GetFileName(file));
         }
+        if (action is "exchange_quote" or "exchange_buy" or "exchange_sell" or "exchange_list")
+        {
+            // Manual/calibration orders: value = "Item|Quantity|MaxUnitChaos" (quote: "Want|Have").
+            if (ctx.Settings.Running.Value || HasActiveAttempt) return "rejected: stop the loop first";
+            if (ctx.Game.Area?.CurrentArea?.IsHideout != true) return "rejected: hideout required";
+            var parts = review.Split('|');
+            int qty = parts.Length > 1 && int.TryParse(parts[1], out var q) ? q : 1;
+            double cap = parts.Length > 2 && double.TryParse(parts[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var c) ? c : 0;
+            var request = action switch
+            {
+                "exchange_quote" => new ExchangeRequest(ExchangeKind.Quote, parts[0], parts.Length > 1 ? parts[1] : "Chaos Orb", 1),
+                "exchange_buy" => new ExchangeRequest(ExchangeKind.BuyAtAsk, parts[0], "Chaos Orb", qty, cap),
+                "exchange_sell" => new ExchangeRequest(ExchangeKind.SellAtBid, "Chaos Orb", parts[0], qty),
+                _ => new ExchangeRequest(ExchangeKind.ListAtAskMinus, "Chaos Orb", parts[0], qty, 0, ctx.Settings.Awakening.Economy.ListUndercutChaos.Value)
+            };
+            _exchange.Start(request); _exchangeManual = true;
+            return Supervisor.RecordCommand(id, "exchange_started:" + request.Kind);
+        }
+        if (action == "exchange_cancel") { _exchange.Cancel(); _exchangeManual = false; return Supervisor.RecordCommand(id, "exchange_cancelled"); }
         if (action == "economy_reset") { _ledger.ResetSession(); return Supervisor.RecordCommand(id, "economy_reset"); }
         if (action == "fresh")
         {
@@ -292,7 +320,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _scoutRepositionUntil = DateTime.MinValue;
             _deviceMaterialPaths.Clear();
             _materialIndex = 0; _withdrawing = false; _indexStarted = false; _lootId = 0;
-            _lootAttempts.Clear(); _unblockAttempts.Clear(); _scoutIgnored.Clear(); _lootSkipped.Clear(); _lootInterrupted = false; _enRouteLoot = false; _pushIgnoredUntil.Clear(); _dropSiteReached = false; _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
+            _lootAttempts.Clear(); _unblockAttempts.Clear(); _scoutIgnored.Clear(); _lootSkipped.Clear(); _lootInterrupted = false; _enRouteLoot = false; _pushIgnoredUntil.Clear(); _dropSiteReached = false; _restockTried = false; _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
             _lastClock = Stopwatch.GetTimestamp(); _phaseAt = DateTime.UtcNow; _lastPosition = ctx.Game.Player.GridPosNum;
             _lastProgress = DateTime.UtcNow; _damage.Reset(DateTime.UtcNow);
             Run.BuildConfiguration = AwakeningJson.Serialize(AutoExile.WebServer.SettingsApi.SerializeFlat(ctx.Settings)
@@ -326,6 +354,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         _ctx = ctx;
         _observedUtc = DateTime.UtcNow;
         if (_shutdownRequested) { ctx.Settings.Running.Value = false; return; }
+        if (_exchangeManual)
+        {
+            if (_exchange.Busy) { _exchange.Tick(ctx); Status = _exchange.Status; }
+            else { _exchangeManual = false; Status = _exchange.Status; RecordExchangeResult(ctx, "manual"); }
+        }
         if (_inspecting && (DateTime.UtcNow - _inspectionStarted).TotalSeconds > 30)
         {
             _inspecting = false; _inspectionStatus = "failed:inspection_wall_deadline";
@@ -476,6 +509,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 case AwakeningPhase.Withdraw: Withdraw(ctx); break;
                 case AwakeningPhase.OpenMap: OpenMap(ctx); break;
                 case AwakeningPhase.RestockMap: RestockMap(ctx); break;
+                case AwakeningPhase.Restock: Restock(ctx); break;
                 case AwakeningPhase.EnterPortal: EnterPortal(ctx); break;
                 case AwakeningPhase.Scout: if (!SafetyTick(ctx)) Scout(ctx); break;
                 case AwakeningPhase.Fight: if (!SafetyTick(ctx)) Fight(ctx, false); break;
@@ -821,6 +855,88 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         catch { }
         return null;
     }
+    // Supplies: bring every material up to its target through Faustus at the lowest ask. Chaos short → sell Chisels/Writ at the best bid first.
+    private int HeldMaterial(BotContext ctx, string name)
+    {
+        var held = AwakeningExchange.CountHeld(ctx.Game, name);
+        try { held = Math.Max(held, ctx.StashIndex.Tabs.SelectMany(t => t.Items).Where(e => e.BaseName.Equals(name, StringComparison.OrdinalIgnoreCase)).Sum(e => e.Stack)); } catch { }
+        if (_deviceMaterialPaths.ContainsKey(name)) held++;
+        return held;
+    }
+    private void PlanRestock(BotContext ctx)
+    {
+        var economy = ctx.Settings.Awakening.Economy;
+        _restockTried = true; _restockQueue.Clear(); _restockSales = 0;
+        foreach (var name in MaterialNames)
+        {
+            var target = name.StartsWith("Horned") ? economy.ScarabTarget.Value : economy.SacrificeTarget.Value;
+            var need = target - HeldMaterial(ctx, name);
+            if (need <= 0) continue;
+            var category = name.StartsWith("Horned") ? NinjaPriceCategory.Scarab : NinjaPriceCategory.Fragment;
+            var ninja = ctx.NinjaPrice.GetPrice(name, category).MinChaosValue;
+            // Safety cap: never pay more than 1.5x the poe.ninja price (or 300c when unknown).
+            _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.BuyAtAsk, name, "Chaos Orb", need, ninja > 0 ? ninja * 1.5 : 300));
+        }
+        _log.Event(Run, "restock.planned", _restockQueue.ToArray());
+        CancelInput(ctx);
+        SetPhase(AwakeningPhase.Restock, "restock_via_faustus");
+    }
+    private void Restock(BotContext ctx)
+    {
+        var economy = ctx.Settings.Awakening.Economy;
+        if (_exchange.Busy) { _exchange.Tick(ctx); Status = _exchange.Status; _phaseAt = DateTime.UtcNow; return; }
+        if (_restockCurrent != null)
+        {
+            var done = _restockCurrent; _restockCurrent = null;
+            RecordExchangeResult(ctx, "restock");
+            if (!_exchange.Succeeded && done.Kind == ExchangeKind.BuyAtAsk)
+            {
+                if (_exchange.FailReason.StartsWith("price_above_cap")) { Finish(ctx, AttemptOutcome.OperationalFailure, "restock_price_above_cap:" + done.WantName); return; }
+                if (economy.StopWhenOutOfChaos.Value) { Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:restock_failed:" + _exchange.FailReason); return; }
+            }
+        }
+        if (_restockQueue.Count == 0)
+        {
+            if (ctx.Game.IngameState.IngameUi.CurrencyExchangePanel?.IsVisible == true) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
+            _indexStarted = false; ctx.StashIndex.Reset();
+            SetPhase(AwakeningPhase.IndexStash, "restock_complete_reindex"); return;
+        }
+        var next = _restockQueue.Peek();
+        if (next.Kind == ExchangeKind.BuyAtAsk)
+        {
+            var chaos = AwakeningExchange.CountHeld(ctx.Game, "Chaos Orb");
+            var estimate = next.MaxUnitChaos / 1.5 * next.Quantity;
+            if (chaos < estimate)
+            {
+                var sellable = economy.SellWhenChaosShort.Value && _restockSales < SellableNames.Length
+                    ? SellableNames.Skip(_restockSales).FirstOrDefault(n => AwakeningExchange.CountHeld(ctx.Game, n) > 0) : null;
+                if (sellable != null)
+                {
+                    _restockSales = Array.IndexOf(SellableNames, sellable) + 1;
+                    _restockCurrent = new ExchangeRequest(ExchangeKind.SellAtBid, "Chaos Orb", sellable, AwakeningExchange.CountHeld(ctx.Game, sellable));
+                    _log.Event(Run, "restock.sell_for_chaos", new { chaos, estimate, sellable });
+                    _exchange.Start(_restockCurrent); return;
+                }
+                if (chaos < next.MaxUnitChaos / 1.5 && economy.StopWhenOutOfChaos.Value)
+                { Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:out_of_chaos"); return; }
+                // Buy what the chaos allows.
+                var affordable = (int)Math.Floor(chaos / Math.Max(1, next.MaxUnitChaos / 1.5));
+                if (affordable < next.Quantity) { _restockQueue.Dequeue(); _restockCurrent = next with { Quantity = Math.Max(1, affordable) }; _exchange.Start(_restockCurrent); return; }
+            }
+        }
+        _restockCurrent = _restockQueue.Dequeue();
+        _exchange.Start(_restockCurrent);
+    }
+    private void RecordExchangeResult(BotContext ctx, string source)
+    {
+        var r = _exchange.Succeeded ? _exchangeLastRequest() : null;
+        if (r == null || _exchange.FilledWant <= 0) return;
+        if (r.Kind == ExchangeKind.BuyAtAsk)
+        { _ledger.Price(r.WantName, _exchange.UnitChaos, "faustus_ask"); _ledger.Purchase(r.WantName, _exchange.FilledWant, _exchange.UnitChaos, source); }
+        else if (r.Kind == ExchangeKind.SellAtBid)
+            _ledger.AddSale(r.HaveName, _exchange.PaidHave, _exchange.UnitChaos, "faustus_bid_" + source);
+    }
+    private ExchangeRequest? _exchangeLastRequest() => _exchange.Request;
     private void Index(BotContext ctx)
     {
         if (!_indexStarted) { ctx.StashIndex.Start(ctx.Settings.Awakening.SupplyTab.Value, includeFragmentSections: true); _indexStarted = true; }
@@ -839,7 +955,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             if (carried != null) { materials.Add(new(name, carried)); _log.Event(Run, "recipe.inventory_stock", new { name, path = carried }); continue; }
             var matches = entries.Where(e => e.BaseName.Equals(name, StringComparison.OrdinalIgnoreCase)
                 || (ctx.Game.Files.BaseItemTypes.Translate(e.ItemPath)?.BaseName?.Equals(name, StringComparison.OrdinalIgnoreCase) == true)).ToList();
-            if (matches.Count == 0) { _log.Event(Run, "materials.unresolved", entries.Select(x => new { x.ItemPath, x.BaseName, x.TabName })); Finish(ctx, AttemptOutcome.OperationalFailure, "material_not_found:" + name); return; }
+            if (matches.Count == 0)
+            {
+                _log.Event(Run, "materials.unresolved", entries.Select(x => new { x.ItemPath, x.BaseName, x.TabName }));
+                if (ctx.Settings.Awakening.Economy.AutoRestock.Value && !_restockTried) { PlanRestock(ctx); return; }
+                Finish(ctx, AttemptOutcome.OperationalFailure, "material_not_found:" + name); return;
+            }
             materials.Add(new(name, matches[0].ItemPath));
         }
         Run.Recipe = materials; _materialIndex = 0;
