@@ -1688,6 +1688,34 @@ namespace AutoExile.Systems
             return true;
         }
 
+        /// <summary>Shift+key (typing '(' / ')' into UI text boxes). Returns false if gate is closed.</summary>
+        public static bool PressShiftKey(Keys key)
+        {
+            if (!CanAct) { LogAction("PressShiftKey", null, key, false); return false; }
+            SuspendMovement();
+            ReleaseAllKeys();
+            var hold = RandHold();
+            NextActionAt = DateTime.Now.AddMilliseconds(hold * 3 + ActionCooldownMs);
+            _ = DoPressShiftKey(key, hold);
+            LogAction("PressShiftKey", null, key, true);
+            return true;
+        }
+
+        private static async Task DoPressShiftKey(Keys key, int holdMs)
+        {
+            try
+            {
+                await SendDelay().ConfigureAwait(false);
+                SendKeyDown(Keys.ShiftKey, "shift");
+                await Task.Delay(holdMs).ConfigureAwait(false);
+                await SendDelay().ConfigureAwait(false);
+                SendKeyDown(key);
+                await Task.Delay(holdMs).ConfigureAwait(false);
+                SendKeyUp(key);
+            }
+            finally { SendKeyUp(Keys.ShiftKey, "shift-cleanup"); }
+        }
+
         private static async Task DoPressKey(Keys key, int holdMs)
         {
             await SendDelay().ConfigureAwait(false);

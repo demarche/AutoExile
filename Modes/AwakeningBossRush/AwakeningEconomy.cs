@@ -114,8 +114,9 @@ public sealed class AwakeningLedger
 /// <summary>Dumps visible UI element trees and drives single UI actions so new panels (Faustus exchange, market) can be calibrated without screenshots.</summary>
 public static class AwakeningUiInspector
 {
-    public static string Dump(GameController gc, string directory, string label, string? rootPath = null, int maxDepth = 9)
+    public static string Dump(GameController gc, string directory, string label, string? rootPath = null, int maxDepth = 9, bool includeHidden = false)
     {
+        _includeHidden = includeHidden;
         var root = gc.IngameState.IngameUi;
         var nodes = new List<object>();
         if (!string.IsNullOrWhiteSpace(rootPath))
@@ -175,6 +176,7 @@ public static class AwakeningUiInspector
         }
         return null;
     }
+    private static bool _includeHidden;
     private static object Node(Element e, string path, int depth, int maxDepth)
     {
         string? text = null; string rect = ""; int count = 0;
@@ -187,9 +189,10 @@ public static class AwakeningUiInspector
             {
                 var list = e.Children;
                 for (var i = 0; i < list.Count && i < 150; i++)
-                    if (list[i] != null && list[i].IsVisible) kids.Add(Node(list[i], path + "," + i, depth + 1, maxDepth));
+                    if (list[i] != null && (_includeHidden || list[i].IsVisible)) kids.Add(Node(list[i], path + "," + i, depth + 1, maxDepth));
             }
             catch { }
-        return new { p = path, t = string.IsNullOrEmpty(text) ? null : text, r = rect, n = count, c = kids.Count > 0 ? kids : null };
+        bool? hidden = null; if (_includeHidden) try { hidden = !e.IsVisible ? true : null; } catch { }
+        return new { p = path, t = string.IsNullOrEmpty(text) ? null : text, r = rect, n = count, h = hidden, c = kids.Count > 0 ? kids : null };
     }
 }

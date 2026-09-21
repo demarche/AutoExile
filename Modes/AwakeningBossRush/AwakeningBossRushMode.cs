@@ -209,11 +209,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (action == "inspect_ui")
         {
             // Read-only: dumps the visible UI trees (e.g. an open Faustus exchange or market) for calibration.
-            // value = "label" or "label|rootPath|depth"
+            // value = "label" or "label|rootPath|depth" (+ "|hidden" to include invisible children)
             var parts = (review ?? "").Split('|');
             var label = Regex.Replace(string.IsNullOrWhiteSpace(parts[0]) ? "manual" : parts[0], @"[^A-Za-z0-9_-]", "");
             var depth = parts.Length > 2 && int.TryParse(parts[2], out var dd) ? dd : 9;
-            var file = AwakeningUiInspector.Dump(ctx.Game, _directory, label, parts.Length > 1 && parts[1].Length > 0 ? parts[1] : null, depth);
+            var file = AwakeningUiInspector.Dump(ctx.Game, _directory, label, parts.Length > 1 && parts[1].Length > 0 ? parts[1] : null, depth, parts.Length > 3 && parts[3] == "hidden");
             _log.Event(Run, "ui.inspected", new { file });
             return Supervisor.RecordCommand(id, "inspected:" + Path.GetFileName(file));
         }
@@ -258,13 +258,17 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 return Supervisor.RecordCommand(id, (ok ? "clicked:" : "click_blocked:") + rect);
             }
             if (!BotInput.Click(abs)) return Supervisor.RecordCommand(id, "click_blocked");
-            for (var i = 0; i < 30; i++) _uiKeys.Enqueue(Keys.Back);
+            _uiKeys.Enqueue(Keys.End);
+            for (var i = 0; i < 40; i++) _uiKeys.Enqueue(Keys.Back);
             foreach (var ch in (parts.Length > 1 ? parts[1] : "").ToUpperInvariant())
             {
                 if (char.IsLetterOrDigit(ch)) _uiKeys.Enqueue((Keys)ch);
                 else if (ch == ' ') _uiKeys.Enqueue(Keys.Space);
                 else if (ch == '.') _uiKeys.Enqueue(Keys.OemPeriod);
                 else if (ch == '-') _uiKeys.Enqueue(Keys.OemMinus);
+                // JIS keyboard layout (this PC): Shift+8 = '(' and Shift+9 = ')'.
+                else if (ch == '(') _uiKeys.Enqueue(Keys.D8 | Keys.Shift);
+                else if (ch == ')') _uiKeys.Enqueue(Keys.D9 | Keys.Shift);
             }
             return Supervisor.RecordCommand(id, "typing_queued:" + _uiKeys.Count + ":" + rect);
         }
@@ -400,7 +404,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         _ctx = ctx;
         _observedUtc = DateTime.UtcNow;
         if (_shutdownRequested) { ctx.Settings.Running.Value = false; return; }
-        if (_uiKeys.Count > 0 && BotInput.CanAct && BotInput.PressKey(_uiKeys.Peek())) _uiKeys.Dequeue();
+        if (_uiKeys.Count > 0 && BotInput.CanAct)
+        {
+            var next = _uiKeys.Peek();
+            var sent = (next & Keys.Shift) != 0 ? BotInput.PressShiftKey(next & Keys.KeyCode) : BotInput.PressKey(next);
+            if (sent) _uiKeys.Dequeue();
+        }
         if (_exchangeManual)
         {
             if (_exchange.Busy) { _exchange.Tick(ctx); Status = _exchange.Status; }
