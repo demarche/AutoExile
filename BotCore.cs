@@ -11,6 +11,7 @@ using AutoExile.Modes.BossEncounters;
 using AutoExile.Systems;
 using AutoExile.WebServer;
 using AutoExile.Statistics;
+using AutoExile.Modes.AwakeningBossRush;
 using System.IO;
 using System.Linq;
 using System.Numerics;
@@ -28,6 +29,7 @@ namespace AutoExile
         private BotContext _ctx = null!;
         private IBotMode _mode = new IdleMode();
         private readonly Dictionary<string, IBotMode> _modes = new();
+        private AwakeningBossRushMode? _awakeningMode;
 
         // Systems
         private NavigationSystem _navigation = new();
@@ -200,6 +202,8 @@ namespace AutoExile
             waveFarm.Register(new Modes.WaveFarm.FarmPlans.AlchAndGoPlan());
             waveFarm.Register(new Modes.WaveFarm.FarmPlans.StackedDeckPlan());
             RegisterMode(waveFarm);
+            _awakeningMode = new AwakeningBossRushMode(DirectoryFullName, _ctx.Log);
+            RegisterMode(_awakeningMode);
 
             // Picking a farm strategy in the web UI auto-applies that plan's defaults
             // (scarab slots, altar mod weights). Fires regardless of current bot mode
@@ -249,6 +253,7 @@ namespace AutoExile
             _profileManager.Initialize(DirectoryFullName);
             _profileManager.OnProfileSwitched += _ => _runtime.Reset();
             _profileManager.LoadActive(Settings);
+            if (_mode == _awakeningMode) Settings.Running.Value = false;
 
             // SQLite is the canonical stats store. The legacy JSONL files are imported
             // once by StatsService but are never dual-written after migration.
@@ -538,6 +543,14 @@ namespace AutoExile
             _stats.SetRunning(Settings.Enable && GameController.InGame && Settings.Running.Value);
             _stats.SetBestFindsMinimumChaos(Settings.Loot.BestFindsMinChaosValue.Value);
             _stats.Pulse();
+            // Awakening's start/stop must not depend on the overlay Render callback.
+            if (_mode == _awakeningMode && Settings.Enable && GameController.InGame && GameController.IsForeGroundCache &&
+                Settings.ToggleRunning.PressedOnce())
+            {
+                if (!Settings.Running.Value) _awakeningMode?.ManualStart(_ctx);
+                else Settings.Running.Value = false;
+            }
+            if (_mode == _awakeningMode) _awakeningMode?.Observe(_ctx);
             if (!Settings.Enable || !GameController.InGame)
                 return base.Tick();
 
@@ -566,6 +579,18 @@ namespace AutoExile
             {
                 _lastConfigSave = DateTime.Now;
                 _profileManager?.SaveActive(Settings);
+            }
+
+            // External plugins own cursor/keys until their actual operation completes.
+            // Skip input maintenance, UI dismissal, combat, navigation and gem clicks too.
+            if (_mode == _awakeningMode && _awakeningMode?.ExternalInputOwned == true && Settings.Running.Value)
+            {
+                if (GameController.IsForeGroundCache && !GameController.IsLoading && GameController.Player != null)
+                {
+                    if (!GameController.Player.IsAlive) HandleInterrupts();
+                    else { _wasDead = false; _reviveDelayMs = 0; _awakeningMode.Tick(_ctx); }
+                }
+                return base.Tick();
             }
 
             // Don't do anything when POE isn't the active window
@@ -865,9 +890,11 @@ namespace AutoExile
                 return;
 
             // Toggle running hotkey — checked in Render so it's never blocked by early returns in Tick
-            if (Settings.ToggleRunning.PressedOnce())
+            if (_mode != _awakeningMode && Settings.ToggleRunning.PressedOnce())
             {
-                Settings.Running.Value = !Settings.Running.Value;
+                if (_mode == _awakeningMode && !Settings.Running.Value)
+                    _awakeningMode?.ManualStart(_ctx);
+                else Settings.Running.Value = !Settings.Running.Value;
                 if (Settings.Running.Value)
                 {
                     if (!_lootTracker.IsActive)
@@ -1084,6 +1111,14 @@ namespace AutoExile
             // Process commands from web UI
             while (_webServer.TryDequeueCommand(out var cmd))
             {
+                if (cmd.Action.StartsWith("awakening.", StringComparison.Ordinal) && _awakeningMode != null)
+                {
+                    var action = cmd.Action[10..];
+                    if (action == "arm" && _mode != _awakeningMode && _awakeningMode.Supervisor.ValidateRequest(cmd.RequestId ?? "", cmd.Generation ?? "") == null)
+                        SetMode(AwakeningBossRushMode.ModeName);
+                    _awakeningMode.Command(_ctx, action, cmd.RequestId ?? "", cmd.Generation ?? "", cmd.Value ?? "", cmd.ExpectedMvid ?? "");
+                    continue;
+                }
                 switch (cmd.Action)
                 {
                     case "start":
@@ -1113,6 +1148,8 @@ namespace AutoExile
                 { status = waveFarm.Status; decision = waveFarm.Decision; }
                 else if (_mode is SimulacrumMode sim)
                 { phase = sim.Phase.ToString(); decision = sim.Decision; status = sim.StatusText; }
+                else if (_mode is AwakeningBossRushMode awakening)
+                { phase = awakening.Supervisor.Run.Phase.ToString(); decision = awakening.Decision; status = awakening.Status; }
                 else if (_mode is BlightMode blight)
                 { phase = blight.Phase.ToString(); status = blight.StatusText; }
                 else if (_mode is HeistMode heist)
@@ -1201,6 +1238,7 @@ namespace AutoExile
                 _webServer.UpdateStatus(new BotStatusSnapshot
                 {
                     Running = Settings.Running.Value,
+                    Awakening = _awakeningMode?.Snapshot(),
                     InGame = GameController.InGame,
                     Mode = _mode?.Name ?? "Unknown",
                     Phase = phase,
@@ -1292,6 +1330,7 @@ namespace AutoExile
         /// <summary>Called by ExileCore when plugin is being unloaded.</summary>
         public override void OnClose()
         {
+            _awakeningMode?.Dispose();
             InputLatencyDiagnostics.Stop();
             if (_ctx != null) InputLatencyDiagnostics.Drain(_ctx.Log);
             BotInput.StopMovement();

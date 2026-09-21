@@ -108,6 +108,7 @@ namespace AutoExile
         // --- Farming Mode ---
 
         public FarmingSettings Farming { get; set; } = new FarmingSettings();
+        public Modes.AwakeningBossRush.AwakeningSettings Awakening { get; set; } = new();
 
         // --- Boss Mode ---
 

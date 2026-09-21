@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Modes/AwakeningBossRush/AwakeningModels.cs" Link="AwakeningModels.cs" />
+    <Compile Include="../../Modes/AwakeningBossRush/AwakeningPolicies.cs" Link="AwakeningPolicies.cs" />
+    <Compile Include="../../Modes/AwakeningBossRush/AwakeningSupervisor.cs" Link="AwakeningSupervisor.cs" />
+    <Compile Include="../../Modes/AwakeningBossRush/AwakeningModRiskAnalyzer.cs" Link="AwakeningModRiskAnalyzer.cs" />
+    <Compile Include="../../Modes/AwakeningBossRush/AwakeningTelemetry.cs" Link="AwakeningTelemetry.cs" />
+    <Compile Include="../../Systems/SparkProgressTracker.cs" Link="SparkProgressTracker.cs" />
+  </ItemGroup>
+</Project>

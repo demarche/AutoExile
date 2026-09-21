@@ -39,6 +39,10 @@ namespace AutoExile.Systems
         private DateTime _phaseStartTime = DateTime.MinValue;
         private int _targetTabIndex;
         private int _totalTabs;
+        private string? _onlyTabName;
+        private bool _includeFragmentSections;
+        private int _fragmentSection;
+        private bool _fragmentSectionSelected;
 
         private const float TabSwitchSettleMs  = 400f;
         private const float TabReadSettleMs    = 350f;  // extra wait after arriving before reading
@@ -60,8 +64,12 @@ namespace AutoExile.Systems
         // ── Public API ──────────────────────────────────────────────────────────
 
         /// <summary>Start a full stash scan. Stash must already be open.</summary>
-        public void Start()
+        public void Start(string? onlyTabName = null, bool includeFragmentSections = false)
         {
+            _onlyTabName = string.IsNullOrWhiteSpace(onlyTabName) ? null : onlyTabName;
+            _includeFragmentSections = includeFragmentSections;
+            _fragmentSection = 0;
+            _fragmentSectionSelected = false;
             Tabs.Clear();
             _allItems.Clear();
             _phase = IndexPhase.Starting;
@@ -109,7 +117,8 @@ namespace AutoExile.Systems
             switch (_phase)
             {
                 case IndexPhase.Starting:
-                    _targetTabIndex = 0;
+                    _targetTabIndex = _onlyTabName == null ? 0 : names.ToList().FindIndex(n => n.Equals(_onlyTabName, StringComparison.OrdinalIgnoreCase));
+                    if (_targetTabIndex < 0) { Status = "Stash tab not found: " + _onlyTabName; _phase = IndexPhase.Failed; return; }
                     _phase = IndexPhase.SwitchingTab;
                     _lastActionTime = DateTime.MinValue;
                     break;
@@ -168,6 +177,14 @@ namespace AutoExile.Systems
 
             var tabName = names[_targetTabIndex];
             var visibleInv = stashEl.VisibleStash;
+            if (_includeFragmentSections && FragmentStashNavigation.IsFragmentTab(gc) && !_fragmentSectionSelected)
+            {
+                var section = _fragmentSection == 0 ? "Fragments" : "Scarabs";
+                Status = "Selecting " + tabName + " / " + section;
+                if (FragmentStashNavigation.Select(gc, section))
+                { _fragmentSectionSelected = true; _phaseStartTime = DateTime.Now; }
+                return;
+            }
             var items = visibleInv?.VisibleInventoryItems;
 
             // Wait until items collection is non-null, unless we've exceeded the max wait
@@ -213,6 +230,14 @@ namespace AutoExile.Systems
 
             Tabs.Add(summary);
             Status = $"Tab {_targetTabIndex + 1}/{_totalTabs} '{tabName}': {summary.Items.Count} items";
+
+            if (_includeFragmentSections && FragmentStashNavigation.IsFragmentTab(gc) && _fragmentSection == 0)
+            {
+                _fragmentSection = 1; _fragmentSectionSelected = false; _phaseStartTime = DateTime.Now;
+                return;
+            }
+            _fragmentSection = 0; _fragmentSectionSelected = false;
+            if (_onlyTabName != null) { FinalizeIndex(gc); return; }
 
             // Move to next tab
             _targetTabIndex++;

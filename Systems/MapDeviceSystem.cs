@@ -61,6 +61,8 @@ namespace AutoExile.Systems
         /// Empty/null = skip the scarab insertion phase entirely.
         /// </summary>
         public IReadOnlyList<string>? ScarabPaths { get; set; }
+        public StrictMapRecipe? StrictRecipe { get; private set; }
+        public int StrictAtlasNodeOffset { get; set; } = 2;
 
         // Navigation to device — track failed close-approach attempts
         private int _navAttempts;
@@ -118,7 +120,7 @@ namespace AutoExile.Systems
         /// and should return true for the desired map type.
         /// </summary>
         public bool Start(Func<Element, bool> mapFilter, string? inventoryFragmentPath = null,
-            IReadOnlyList<string>? scarabPaths = null)
+            IReadOnlyList<string>? scarabPaths = null, StrictMapRecipe? strictRecipe = null)
         {
             if (_phase != MapDevicePhase.Idle)
                 return false;
@@ -128,6 +130,8 @@ namespace AutoExile.Systems
             // Reset scarab list every Start() — caller must opt in each run, otherwise
             // a stale wave-farm config could insert scarabs into a Boss/Sim device.
             ScarabPaths = scarabPaths;
+            StrictRecipe = strictRecipe;
+            if (StrictRecipe != null) StrictRecipe.ActivationSent = false;
             _phase = MapDevicePhase.NavigateToDevice;
             _phaseStartTime = DateTime.Now;
             _lastActionTime = DateTime.MinValue;
@@ -152,6 +156,7 @@ namespace AutoExile.Systems
             _mapFilter = null;
             _inventoryFragmentPath = null;
             ScarabPaths = null;
+            StrictRecipe = null;
             TargetMapName = null;
             MinMapTier = 0;
             _autoMatchRightClickAttempted = false;
@@ -242,6 +247,13 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
+            if (StrictRecipe != null)
+            {
+                nav.Stop(gc);
+                _phase = MapDevicePhase.OpenDevice; _phaseStartTime = DateTime.Now;
+                Status = "[StrictRecipe] Open device through verified interaction point";
+                return MapDeviceResult.InProgress;
+            }
             // Distance check in grid units
             var playerGrid = gc.Player.GridPosNum;
             var deviceGrid = device.GridPosNum;
@@ -330,7 +342,7 @@ namespace AutoExile.Systems
             }
 
             // Click the device — bounds-based randomization to avoid overlapping entities
-            if (!BotInput.ClickEntity(gc, device))
+            if (!BotInput.ClickEntity(gc, device, requireVerified: StrictRecipe != null))
             {
                 Status = "[Open] Device off screen or gate blocked";
                 return MapDeviceResult.InProgress;
@@ -356,6 +368,27 @@ namespace AutoExile.Systems
             // (auto-inserted on atlas open OR placed by a prior tick that we're racing
             // against). Skip ALL map insertion logic. If scarabs are configured for
             // this run we still need the InsertScarabs phase before activating.
+            if (StrictRecipe != null && (atlas.GetChildAtIndex(7)?.IsVisible != true ||
+                !string.Equals(atlas.GetChildFromIndices(MapNameTextPath)?.Text, StripMapPrefix(TargetMapName), StringComparison.OrdinalIgnoreCase)))
+                return TickSelectAtlasNode(gc, atlas);
+            if (StrictRecipe != null && IsMapInDevice(atlas))
+            {
+                var loaded = StrictMapRecipe.ReadSlots(gc)?.FirstOrDefault(x => x.Path.Contains("/Maps/"));
+                if (loaded != null && !StrictRecipe.MapAllowed(loaded))
+                {
+                    Status = "[StrictRecipe] returning rejected map before selecting a valid key";
+                    if (BotInput.CanAct && (DateTime.Now - _lastActionTime).TotalMilliseconds >= 750)
+                    {
+                        var item = atlas.GetChildFromIndices(DeviceSlotsPath)?.GetChildAtIndex(0)?.GetChildAtIndex(1);
+                        if (item != null)
+                        {
+                            var rejectedRect = item.GetClientRect(); var rejectedWindow = gc.Window.GetWindowRectangle();
+                            if (BotInput.CtrlClick(new(rejectedWindow.X + rejectedRect.Center.X, rejectedWindow.Y + rejectedRect.Center.Y))) _lastActionTime = DateTime.Now;
+                        }
+                    }
+                    return MapDeviceResult.InProgress;
+                }
+            }
             if (IsActivateButtonReady(atlas))
             {
                 _phase = NextPhaseAfterMapLoaded();
@@ -640,8 +673,8 @@ namespace AutoExile.Systems
                     return MapDeviceResult.InProgress;
                 }
 
-                var uiIndex = nodeIndex + 2;
-                if (uiIndex >= canvas.ChildCount)
+                var uiIndex = nodeIndex + (StrictRecipe != null ? StrictAtlasNodeOffset : 2);
+                if (uiIndex < 0 || uiIndex >= canvas.ChildCount)
                 {
                     Status = $"[Select] Atlas node UI index {uiIndex} out of range ({canvas.ChildCount} children)";
                     _phase = MapDevicePhase.Idle;
@@ -733,6 +766,15 @@ namespace AutoExile.Systems
 
         private MapDeviceResult TickActivate(GameController gc)
         {
+            if (StrictRecipe != null)
+            {
+                if (StrictRecipe.ActivationSent)
+                { _phase = MapDevicePhase.WaitForPortals; _phaseStartTime = DateTime.Now; return MapDeviceResult.InProgress; }
+                if (!StrictRecipe.Verify(gc, out var verification))
+                { Status = "[StrictRecipe] " + verification; return MapDeviceResult.InProgress; }
+                var ready = StrictRecipe.PrepareActivation(gc);
+                if (!ready.Ready) { Status = "[StrictRecipe] " + ready.Reason; return MapDeviceResult.InProgress; }
+            }
             var atlas = gc.IngameState.IngameUi.Atlas;
             if (atlas?.IsVisible != true)
             {
@@ -765,6 +807,14 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
+            if (StrictRecipe != null)
+            {
+                if (!BotInput.CanAct) return MapDeviceResult.InProgress;
+                StrictRecipe.PriorPortals = StrictMapRecipe.Portals(gc).Select(x => (long)x.Id).ToHashSet();
+                if (!StrictRecipe.RecordActivationRequest())
+                { Status = "[StrictRecipe] activation journal refused request"; return MapDeviceResult.InProgress; }
+                StrictRecipe.ActivationSent = true;
+            }
             if (!BotInput.ClickLabel(gc, activateBtn.GetClientRect()))
             {
                 Status = "[Activate] Waiting for input gate";
@@ -789,7 +839,8 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Failed;
             }
 
-            var portal = FindNearestPortal(gc);
+            var portal = StrictRecipe == null ? FindNearestPortal(gc) : StrictMapRecipe.Portals(gc)
+                .FirstOrDefault(x => !StrictRecipe.PriorPortals.Contains(x.Id));
             if (portal != null)
             {
                 // Wait 1s after first portal appears for all 6 to spawn,
@@ -807,6 +858,7 @@ namespace AutoExile.Systems
                 }
 
                 ActivationSequence++;
+                StrictRecipe?.ConfirmActivation(StrictMapRecipe.Portals(gc).Where(x => !StrictRecipe.PriorPortals.Contains(x.Id)).Select(x => (long)x.Id).ToList());
                 LastActivationConfirmedAtUtc = DateTime.UtcNow;
                 _phase = MapDevicePhase.EnterPortal;
                 _phaseStartTime = DateTime.Now;
@@ -873,7 +925,8 @@ namespace AutoExile.Systems
                 // Interaction finished without area change — it either failed or
                 // succeeded but the entity vanished (portal consumed). Check if
                 // we're still in hideout — if so, retry with fresh portal reference.
-                var portal = FindNearestPortal(gc);
+                var portal = StrictRecipe == null ? FindNearestPortal(gc) : StrictMapRecipe.Portals(gc)
+                    .FirstOrDefault(x => !StrictRecipe.PriorPortals.Contains(x.Id));
                 if (portal == null)
                 {
                     Status = "Portal disappeared";
@@ -930,6 +983,7 @@ namespace AutoExile.Systems
 
         private bool IsMapInDevice(Element atlas)
         {
+            if (StrictRecipe != null && atlas.GetChildAtIndex(7)?.IsVisible != true) return false;
             var slots = atlas.GetChildFromIndices(DeviceSlotsPath);
             if (slots == null) return false;
 
@@ -1003,6 +1057,7 @@ namespace AutoExile.Systems
         /// </summary>
         private MapDeviceResult TickInsertScarabs(GameController gc)
         {
+            if (StrictRecipe != null) return TickInsertStrictMaterials(gc);
             var atlas = gc.IngameState.IngameUi.Atlas;
             if (atlas?.IsVisible != true)
             {
@@ -1092,6 +1147,28 @@ namespace AutoExile.Systems
         }
 
         // --- Static map filter helpers ---
+        private MapDeviceResult TickInsertStrictMaterials(GameController gc)
+        {
+            if ((DateTime.Now - _lastActionTime).TotalMilliseconds < InsertSettleMs) return MapDeviceResult.InProgress;
+            var slots = StrictMapRecipe.ReadSlots(gc);
+            if (slots == null) { Status = "[StrictRecipe] waiting for readable slots"; return MapDeviceResult.InProgress; }
+            var missing = StrictRecipe!.Materials.FirstOrDefault(m => slots.Count(e => e.Path.Equals(m.Path, StringComparison.OrdinalIgnoreCase)) < m.Count);
+            if (missing == null)
+            {
+                if (!StrictRecipe.Verify(gc, out var reason)) { Status = "[StrictRecipe] " + reason; return MapDeviceResult.InProgress; }
+                _phase = MapDevicePhase.Activate; _phaseStartTime = DateTime.Now; return MapDeviceResult.InProgress;
+            }
+            var inventory = gc.IngameState.ServerData?.PlayerInventories?[0]?.Inventory?.InventorySlotItems;
+            var item = inventory?.FirstOrDefault(x => x.Item?.Path?.Equals(missing.Path, StringComparison.OrdinalIgnoreCase) == true);
+            if (item == null) { Status = "[StrictRecipe] missing " + missing.Name; return MapDeviceResult.InProgress; }
+            if (slots.Count >= 6) { Status = "[StrictRecipe] incompatible occupied slots"; return MapDeviceResult.InProgress; }
+            if (!CanAct()) return MapDeviceResult.InProgress;
+            var rect = item.GetClientRect(); var win = gc.Window.GetWindowRectangle();
+            if (BotInput.CtrlClick(new Vector2(win.X + rect.Center.X, win.Y + rect.Center.Y))) _lastActionTime = DateTime.Now;
+            Status = "[StrictRecipe] inserting " + missing.Name;
+            return MapDeviceResult.InProgress;
+        }
+
 
         /// <summary>
         /// Filter for blighted maps (has InfectedMap mod, NOT UberInfectedMap).

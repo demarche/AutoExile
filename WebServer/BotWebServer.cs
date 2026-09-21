@@ -1085,6 +1085,7 @@ namespace AutoExile.WebServer
 
     public class BotStatusSnapshot
     {
+        public object? Awakening { get; init; }
         public bool Running { get; init; }
         public bool InGame { get; init; }
         public string Mode { get; init; } = "Idle";
@@ -1190,6 +1191,9 @@ namespace AutoExile.WebServer
 
     public class WebCommand
     {
+        public string? RequestId { get; set; }
+        public string? Generation { get; set; }
+        public string? ExpectedMvid { get; set; }
         public string Action { get; set; } = "";
         public string? Value { get; set; }
     }

@@ -245,10 +245,10 @@ namespace AutoExile.Systems
         /// keeps sampling positions until it finds one that targets the correct entity.
         /// </summary>
         /// <returns>True if the click sequence was initiated, false if gate blocked or entity off-screen.</returns>
-        public static bool ClickEntity(GameController gc, Entity entity)
+        public static bool ClickEntity(GameController gc, Entity entity, bool requireVerified = false)
         {
             if (!CanAct) return false;
-            if (!GetEntityScreenBounds(gc, entity, out var screenCenter, out var halfW, out var halfH))
+            if (!GetInteractionScreenBounds(gc, entity, requireVerified, out var screenCenter, out var halfW, out var halfH))
                 return false;
 
             SuspendMovement();
@@ -263,7 +263,7 @@ namespace AutoExile.Systems
                 MaxHoverAttempts * (moveMs + settle) + hold + ActionCooldownMs);
 
             _ = RunClickSequence($"entity:{entity.Id}", () =>
-                DoClickEntityWithVerify(gc, entity, screenCenter, halfW, halfH, windowRect, settle, hold));
+                DoClickEntityWithVerify(gc, entity, screenCenter, halfW, halfH, windowRect, settle, hold, requireVerified));
             LogAction("ClickEntity", screenCenter, null, true);
             return true;
         }
@@ -355,9 +355,43 @@ namespace AutoExile.Systems
         private const int MaxHoverAttempts = 2;
         private const int HoverVerifyDelayMs = 100; // allow game + ExileAPI to observe the final cursor position
 
+        private static bool GetInteractionScreenBounds(GameController gc, Entity entity, bool preferLabel,
+            out Vector2 center, out float halfW, out float halfH)
+        {
+            if (preferLabel)
+            {
+                var worldLabel = gc.IngameState.IngameUi.ItemsOnGroundLabelElement.LabelsOnGround?
+                    .FirstOrDefault(l => l?.ItemOnGround?.Id == entity.Id && l.Label != null && (l.Label.IsVisible || l.Label.IsVisibleLocal) && IsRectOnScreen(l.Label.GetClientRect()));
+                if (worldLabel != null)
+                {
+                    var r = worldLabel.Label.GetClientRect();
+                    center = new(r.Center.X, r.Center.Y); halfW = r.Width * 0.15f; halfH = r.Height * 0.15f;
+                    return true;
+                }
+                var label = gc.IngameState.IngameUi.ItemsOnGroundLabelElement.VisibleGroundItemLabels?
+                    .FirstOrDefault(l => l.Entity?.Id == entity.Id && l.Label?.IsVisible == true && IsRectOnScreen(l.ClientRect));
+                if (label != null)
+                {
+                    var r = label.ClientRect;
+                    center = new(r.Center.X, r.Center.Y); halfW = r.Width * 0.2f; halfH = r.Height * 0.2f;
+                    return true;
+                }
+                var render = entity.GetComponent<Render>();
+                if (render != null)
+                {
+                    center = gc.IngameState.Camera.WorldToScreen(render.InteractCenterNum);
+                    halfW = 6; halfH = 4;
+                    var wr = gc.Window.GetWindowRectangle();
+                    if (float.IsFinite(center.X) && float.IsFinite(center.Y) && center.X > 5 && center.Y > 5 &&
+                        center.X < wr.Width - 5 && center.Y < wr.Height - 5) return true;
+                }
+            }
+            return GetEntityScreenBounds(gc, entity, out center, out halfW, out halfH);
+        }
+
         private static async Task DoClickEntityWithVerify(
             GameController gc, Entity entity, Vector2 screenCenter, float halfW, float halfH,
-            SharpDX.RectangleF windowRect, int settleMs, int holdMs)
+            SharpDX.RectangleF windowRect, int settleMs, int holdMs, bool requireVerified)
         {
             for (int attempt = 0; attempt < MaxHoverAttempts; attempt++)
             {
@@ -365,7 +399,7 @@ namespace AutoExile.Systems
                 // movement during interpolation + settle (player sliding from momentum)
                 try
                 {
-                    if (GetEntityScreenBounds(gc, entity, out var freshCenter, out var freshHW, out var freshHH))
+                    if (GetInteractionScreenBounds(gc, entity, requireVerified && attempt == 0, out var freshCenter, out var freshHW, out var freshHH))
                     {
                         screenCenter = freshCenter;
                         halfW = freshHW;
@@ -390,7 +424,7 @@ namespace AutoExile.Systems
                 // Final snap — re-read entity bounds right before verification/click
                 try
                 {
-                    if (GetEntityScreenBounds(gc, entity, out var snapCenter, out var snapHW, out var snapHH))
+                    if (GetInteractionScreenBounds(gc, entity, requireVerified && attempt == 0, out var snapCenter, out var snapHW, out var snapHH))
                     {
                         var snapPos = snapCenter + offset;
                         var wr = gc.Window.GetWindowRectangle();
@@ -405,7 +439,7 @@ namespace AutoExile.Systems
                 {
                     var targetable = entity.GetComponent<Targetable>();
                     LogRawInput("EntityHover", $"id={entity.Id} attempt={attempt + 1} cursor={NativeMouseInput.Position} targeted={targetable?.isTargeted}");
-                    if (targetable?.isTargeted == true)
+                    if (targetable?.isTargeted == true || gc.IngameState.IngameUi.ItemsOnGroundLabelElement.ItemOnHover?.Id == entity.Id)
                     {
                         // Confirmed — click now
                         await SendDelay().ConfigureAwait(false);
@@ -422,6 +456,11 @@ namespace AutoExile.Systems
                 await Task.Delay(HoverVerifyDelayMs).ConfigureAwait(false);
             }
 
+            if (requireVerified)
+            {
+                LogRawInput("EntityHoverRejected", $"id={entity.Id} no verified target; no click");
+                return;
+            }
             // Exhausted attempts — final snap then click anyway as fallback
             try
             {
@@ -513,12 +552,16 @@ namespace AutoExile.Systems
         /// </summary>
         /// <returns>True if initiated, false if gate blocked. Check WasVerified after completion.</returns>
         public static bool ClickLabelVerified(GameController gc, SharpDX.RectangleF rect, Entity entity,
-            Func<SharpDX.RectangleF?>? rectProvider = null)
+            Func<SharpDX.RectangleF?>? rectProvider = null, bool preserveHighlight = false)
         {
             if (!CanAct) return false;
             if (!IsRectOnScreen(rect)) return false;
             SuspendMovement();
-            ReleaseAllKeys();
+            if (preserveHighlight)
+            {
+                foreach (var key in _heldKeys.Keys.Where(k => k != Keys.Menu)) ReleaseKey(key);
+            }
+            else ReleaseAllKeys();
             var windowRect = gc.Window.GetWindowRectangle();
             var settle = RandSettle();
             var hold = RandHold();
@@ -1284,10 +1327,11 @@ namespace AutoExile.Systems
         /// <summary>
         /// Hold a key down (KeyDown without KeyUp). The key stays held until
         /// ReleaseKey, ReleaseAllKeys, or the timeout watchdog releases it.
-        /// Automatically releases any previously held instance of this key.
+        /// Repeated requests preserve an existing hold without another input event.
         /// </summary>
         public static bool HoldKey(Keys key)
         {
+            if (_heldKeys.ContainsKey(key)) return true;
             if (TryCaptureReplay("HoldKey", key: key)) return true;
             if (!CanAct) return false;
 
@@ -1295,12 +1339,9 @@ namespace AutoExile.Systems
             Interlocked.Increment(ref _holdGeneration);
             SuspendMovement();
 
-            // Release if already held (prevents double-down)
-            if (_heldKeys.ContainsKey(key))
-            {
-                SendKeyUp(key);
-            }
-
+            // Stopping movement emits KeyUp and starts the rate-limit gap.
+            // Retry next frame instead of recording a hold whose KeyDown was dropped.
+            if (!CanSendInputEvent) return false;
             SendKeyDown(key);
             _heldKeys[key] = DateTime.Now;
             NextActionAt = DateTime.Now.AddMilliseconds(ActionCooldownMs);
@@ -1313,15 +1354,12 @@ namespace AutoExile.Systems
         /// </summary>
         public static bool HoldKeyAt(Vector2 absPos, Keys key)
         {
+            if (_heldKeys.ContainsKey(key)) return UpdateWorldSkillCursor(absPos);
             if (TryCaptureReplay("HoldKeyAt", absPos, key)) return true;
             if (!CanAct) return false;
             if (!ClampToWorldSafeZone(ref absPos)) return false;
 
             SuspendMovement();
-
-            // Release if already held
-            if (_heldKeys.ContainsKey(key))
-                SendKeyUp(key);
 
             var moveMs = EstimateMoveMs(absPos);
             NextActionAt = DateTime.Now.AddMilliseconds(moveMs + ActionCooldownMs);

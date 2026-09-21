@@ -56,6 +56,7 @@ namespace AutoExile.Systems
 
         /// <summary>Entity path substring of fragment to withdraw from stash.</summary>
         public string? WithdrawFragmentPath { get; set; }
+        public Func<Entity, bool>? WithdrawItemFilter { get; private set; }
 
         /// <summary>How many fragments to withdraw (ctrl+clicks). Each click withdraws one stack unit.</summary>
         public int WithdrawCount { get; set; }
@@ -77,6 +78,7 @@ namespace AutoExile.Systems
         private StashPhase _afterTabSwitch;
         private int _withdrawsRemaining;
         private int _withdrawListIndex; // which entry of WithdrawList we're processing
+        private string? _withdrawFragmentSection;
 
         // Incubator state
         private bool _cursorHasIncubator;
@@ -100,7 +102,8 @@ namespace AutoExile.Systems
             string? withdrawFragmentPath = null,
             int withdrawCount = 0,
             Func<ServerInventory.InventSlotItem, bool>? itemFilter = null,
-            IReadOnlyList<(string PathSubstring, int Count)>? withdrawList = null)
+            IReadOnlyList<(string PathSubstring, int Count)>? withdrawList = null,
+            Func<Entity, bool>? withdrawItemFilter = null)
         {
             if (_phase != StashPhase.Idle)
                 return false;
@@ -108,7 +111,9 @@ namespace AutoExile.Systems
             // Reset config — every Start() is a clean slate.
             StoreTabName         = storeTabName;
             WithdrawTabName      = withdrawTabName;
+            _withdrawFragmentSection = null;
             WithdrawFragmentPath = withdrawFragmentPath;
+            WithdrawItemFilter = withdrawItemFilter;
             WithdrawCount        = withdrawCount;
             ItemFilter           = itemFilter;
 
@@ -515,6 +520,14 @@ namespace AutoExile.Systems
             // Find ALL matching items in the visible stash tab. Batch-clicking ONE
             // position N times only works for stacks; for non-stackable items
             // (maps) each one occupies a different slot and we need to click each.
+            var section = FragmentStashNavigation.SectionFor(currentPath);
+            if (section != null && FragmentStashNavigation.IsFragmentTab(gc) && _withdrawFragmentSection != section)
+            {
+                Status = "Selecting fragment section: " + section;
+                if (FragmentStashNavigation.Select(gc, section))
+                { _withdrawFragmentSection = section; _lastActionTime = DateTime.Now; }
+                return StashResult.InProgress;
+            }
             var items = stashEl.VisibleStash?.VisibleInventoryItems;
             if (items == null)
             {
@@ -531,7 +544,7 @@ namespace AutoExile.Systems
             foreach (var item in items)
             {
                 var entity = item.Entity;
-                if (entity?.Path?.Contains(currentPath, StringComparison.OrdinalIgnoreCase) == true)
+                if (entity?.Path?.Contains(currentPath, StringComparison.OrdinalIgnoreCase) == true && (WithdrawItemFilter?.Invoke(entity) ?? true))
                 {
                     var rect = item.GetClientRect();
                     positions.Add(new Vector2(

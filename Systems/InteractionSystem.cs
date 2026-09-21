@@ -63,7 +63,7 @@ namespace AutoExile.Systems
         /// Uses InteractRadius to determine when close enough to click.
         /// </summary>
         public bool InteractWithEntity(Entity entity, NavigationSystem? nav = null,
-            bool requireProximity = true)
+            bool requireProximity = true, bool requireVerified = false)
         {
             if (_currentTarget != null)
                 return false;
@@ -74,6 +74,7 @@ namespace AutoExile.Systems
                 TargetType = InteractionTargetType.WorldEntity,
                 InitialState = CaptureEntityState(entity),
                 RequireProximity = requireProximity,
+                RequireVerified = requireVerified,
                 InteractRange = InteractRadius,
                 Nav = nav,
                 Phase = requireProximity ? InteractionPhase.Navigating : InteractionPhase.Clicking,
@@ -91,7 +92,7 @@ namespace AutoExile.Systems
         /// If requireProximity is true, will navigate to the item first.
         /// </summary>
         public bool PickupGroundItem(Entity itemEntity, NavigationSystem? nav = null,
-            bool requireProximity = true)
+            bool requireProximity = true, bool revealHiddenLabel = false)
         {
             if (_currentTarget != null)
                 return false;
@@ -100,6 +101,7 @@ namespace AutoExile.Systems
             {
                 EntityId = itemEntity.Id,
                 TargetType = InteractionTargetType.GroundItem,
+                RevealHiddenLabel = revealHiddenLabel,
                 RequireProximity = requireProximity,
                 InteractRange = InteractRadius,
                 Nav = nav,
@@ -147,7 +149,7 @@ namespace AutoExile.Systems
                 (DateTime.Now - _lastClickTime).TotalMilliseconds < ClickCooldownMs)
                 return InteractionResult.InProgress;
 
-            return _currentTarget.Phase switch
+            var result = _currentTarget.Phase switch
             {
                 InteractionPhase.Navigating => TickNavigating(gc),
                 InteractionPhase.Clicking => _currentTarget.TargetType == InteractionTargetType.GroundItem
@@ -155,6 +157,8 @@ namespace AutoExile.Systems
                     : TickWorldEntity(gc),
                 _ => InteractionResult.InProgress
             };
+            if (result != InteractionResult.InProgress) BotInput.ReleaseKey(System.Windows.Forms.Keys.Menu);
+            return result;
         }
 
         // --- Navigation phase ---
@@ -248,6 +252,20 @@ namespace AutoExile.Systems
         private InteractionResult TickGroundItem(GameController gc)
         {
             var target = _currentTarget!;
+
+            // Opt-in for price-qualified Awakening loot hidden by the user's filter.
+            // Hold once, preserve through the verified click, release on cancel/completion.
+            if (target.RevealHiddenLabel)
+            {
+                if (!BotInput.IsHeld(System.Windows.Forms.Keys.Menu))
+                {
+                    if (target.Nav?.IsNavigating == true) target.Nav.Stop(gc);
+                    BotInput.HoldKey(System.Windows.Forms.Keys.Menu);
+                    Status = "Revealing filtered item label with Alt";
+                    return InteractionResult.InProgress;
+                }
+                BotInput.RefreshHeldKey(System.Windows.Forms.Keys.Menu);
+            }
 
             // Stop navigation before clicking — if the player is walking, clicks miss because
             // the camera/label positions are shifting every frame. This is critical for items
@@ -363,7 +381,7 @@ namespace AutoExile.Systems
                     ? desc.ClientRect
                     : null;
             };
-            var sent = BotInput.ClickLabelVerified(gc, labelRect, worldEntity, rectProvider);
+            var sent = BotInput.ClickLabelVerified(gc, labelRect, worldEntity, rectProvider, target.RevealHiddenLabel);
             if (!sent)
             {
                 Status = "Gate blocked";
@@ -406,7 +424,7 @@ namespace AutoExile.Systems
             // Use hover-verified click: moves cursor to random position within entity bounds,
             // waits for settle, checks Targetable.isTargeted before clicking. Retries at different
             // positions if something else is on top (player, ground label, etc.).
-            var sent = BotInput.ClickEntity(gc, entity);
+            var sent = BotInput.ClickEntity(gc, entity, target.RequireVerified);
             if (!sent)
             {
                 if (!BotInput.CanAct)
@@ -696,6 +714,8 @@ namespace AutoExile.Systems
         public InteractionTargetType TargetType;
         public EntityState InitialState;
         public bool RequireProximity;
+        public bool RequireVerified;
+        public bool RevealHiddenLabel;
         public float InteractRange;
         public NavigationSystem? Nav;
         public InteractionPhase Phase;

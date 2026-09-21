@@ -4,7 +4,10 @@ obj/
 
 AutoExile.Replay/
 USER BRANCH/
-Docs/
+Docs/*
+!Docs/AwakeningBossRush-Design.ja.md
+!Docs/Awakening-Operations.ja.md
+AwakeningData/
 
 
 # Logs

@@ -49,7 +49,7 @@
     </Reference>
   </ItemGroup>
 
-  <Target Name="SyncToTempPlugin" AfterTargets="Build">
+  <Target Name="SyncToTempPlugin" AfterTargets="Build" Condition="'$(SkipPluginDeploy)' != 'true'">
     <PropertyGroup>
       <TempPluginDir>$(MSBuildProjectDirectory)\..\..\Temp\AutoExile</TempPluginDir>
     </PropertyGroup>

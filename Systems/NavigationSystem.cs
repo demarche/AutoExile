@@ -582,7 +582,8 @@ namespace AutoExile.Systems
             if ((DateTime.Now - _lastBlinkTime).TotalMilliseconds < BlinkCooldownMs)
                 return;
 
-            var gapCrosser = MovementSkills.FirstOrDefault(m => m.CanCrossTerrain && m.IsReady);
+            var gapCrosser = MovementSkills.FirstOrDefault(m => m.CanCrossTerrain && m.IsReady &&
+                (DateTime.Now - m.LastUsedAt).TotalMilliseconds >= m.MinCastIntervalMs);
             if (gapCrosser == null)
                 return;
 
@@ -594,6 +595,7 @@ namespace AutoExile.Systems
                     return; // gate closed
 
                 _lastBlinkTime = DateTime.Now;
+                gapCrosser.LastUsedAt = _lastBlinkTime;
                 _dashActive = true;
                 _dashStartTime = DateTime.Now;
 

@@ -479,7 +479,7 @@ tr:hover td { background:var(--surface2); }
       </div>
       <div class="controls">
         <select id="modeSelect" class="mode-select">
-          <option>Idle</option><option>Wave Farming</option><option>Simulacrum</option>
+          <option>Idle</option><option>Wave Farming</option><option>Awakening Boss Rush</option><option>Simulacrum</option>
           <option>Blight</option><option value="Heist">Heist (WIP)</option><option>Labyrinth</option>
           <option>Follower</option><option>Boss</option>
         </select>
@@ -1603,6 +1603,7 @@ const TOWER_TYPES = ['chilling','fireball','empowering','seismic','minion','shoc
 // Mode-to-settings mapping for the Active Mode tab
 const MODE_SETTINGS = {
   'Wave Farming': { sections: ['farming'], mechanics: ['interactables','ultimatum','harvest','wishes','essence','ritual','eldritchAltar'] },
+  'Awakening Boss Rush': { sections: ['awakening'], mechanics: [] },
   Simulacrum:  { sections: ['simulacrum'], mechanics: [] },
   Blight:      { sections: ['blight'], mechanics: [] },
   Heist:       { sections: ['heist'], mechanics: [] },

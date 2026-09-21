@@ -1075,6 +1075,22 @@ namespace AutoExile.Systems
         /// This mirrors the proven AutoPOE behavior of selecting a live "Move"
         /// binding instead of trusting a stale profile key.
         /// </summary>
+        public string? MovementBindingConflict(GameController gc, Keys key)
+        {
+            var barIds = gc.IngameState?.ServerData?.SkillBarIds;
+            var skills = gc.Player?.GetComponent<Actor>()?.ActorSkills;
+            if (barIds == null || skills == null) return null;
+            for (int slot = 0; slot < Math.Min(8, barIds.Count); slot++)
+            {
+                if (KeyForSlot(slot) != key) continue;
+                var skill = skills.FirstOrDefault(s => s.Id == barIds[slot]);
+                if (skill != null && !string.Equals(skill.Name, "Move", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(skill.InternalName, "move", StringComparison.OrdinalIgnoreCase))
+                    return skill.Name ?? skill.InternalName;
+            }
+            return null;
+        }
+
         private Keys? DetectMoveOnlyKey(GameController gc)
         {
             var barIds = gc.IngameState?.ServerData?.SkillBarIds;
