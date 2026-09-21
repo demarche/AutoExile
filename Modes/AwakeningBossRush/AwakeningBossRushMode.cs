@@ -390,7 +390,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             _inspectionStatus = "";
             _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
-            _mapRestockAttempted = false; _mapRestockStarted = false; _marketTried = false; _marketStarted = false; _mapBossSkipped = false;
+            _mapBankRunDone = false; _mapBankLogged = false;
+            _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false;
             _defensiveClear = false;
             _lootDefenseActive = false; _lootDefenseSuppressedUntil = DateTime.MinValue;
             _uniqueEvidence.Clear();
@@ -1201,6 +1202,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             if (Run.ActivationRequested) { Finish(ctx, AttemptOutcome.OperationalFailure, "activation_indeterminate_do_not_reactivate"); return; }
             // Open the Atlas ourselves through the "Map Device" label: the device module clicks a random point of the
             // device model, which can land on the previous map's portals around it (unexpected_map_before_activation).
+            if (ctx.Game.IngameState.IngameUi.Atlas?.IsVisible != true && (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible == true || ctx.Game.IngameState.IngameUi.InventoryPanel?.IsVisible == true))
+            { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
             if (ctx.Game.IngameState.IngameUi.Atlas?.IsVisible != true) { OpenAtlasFromDevice(ctx); Status = "Opening the Atlas via the Map Device label"; return; }
             var node = ctx.Game.Files.AtlasNodes.EntriesList.FirstOrDefault(n => n.Area != null && Regex.IsMatch(n.Area.Id + " " + n.Area.RawName, @"\bDunes?\b|MapWorldsDunes", RegexOptions.IgnoreCase));
             if (node?.Area == null) { Finish(ctx, AttemptOutcome.OperationalFailure, "Dunes_atlas_node_not_found"); return; }
@@ -1268,6 +1271,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (result == MapDeviceResult.Failed) Finish(ctx, AttemptOutcome.OperationalFailure, "map_device:" + Status);
     }
     private bool _mapRestockAttempted, _mapRestockStarted, _mapBossSkipped;
+    private static bool _mapStashDumped;
+    private int _mapRestockTabIndex;
+    private static readonly string[] MapRestockTabs = { "Tmp", "MAP" };
     private void RestockMap(BotContext ctx)
     {
         if ((DateTime.UtcNow - _phaseAt).TotalSeconds > 60)
@@ -1279,7 +1285,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true)
             { TryClickStashLabel(ctx); return; }
             ctx.Stash.ApplyIncubators = false;
-            _mapRestockStarted = ctx.Stash.Start(withdrawTabName: "Tmp", withdrawFragmentPath: "Metadata/Items/Maps/MapKeyTier16",
+            _mapRestockStarted = ctx.Stash.Start(withdrawTabName: MapRestockTabs[Math.Min(_mapRestockTabIndex, MapRestockTabs.Length - 1)], withdrawFragmentPath: "Metadata/Items/Maps/MapKeyTier16",
                 withdrawCount: 1, itemFilter: _ => false,
                 withdrawItemFilter: e => AwakeningMapPolicy.Rejections(AwakeningGameReader.ReadMap(ctx.Game, e, "Dunes")).Count == 0);
             return;
@@ -1303,10 +1309,28 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                         total = all?.Count, sample = all?.Take(8).Select(i => i.Item?.Path).ToArray(), count = maps?.Length, maps, tabs });
                 }
                 catch (Exception ex) { _log.Event(Run, "map.restock_candidates", new { error = ex.Message }); }
+                // One-time calibration of the map stash tab: dump its UI (tier buttons) and reflected members.
+                if (_mapRestockTabIndex > 0 && !_mapStashDumped)
+                {
+                    _mapStashDumped = true;
+                    try
+                    {
+                        var vs = ctx.Game.IngameState.IngameUi.StashElement?.VisibleStash;
+                        var file = AwakeningUiInspector.Dump(ctx.Game, _directory, "mapstashtab", null, 14, false);
+                        var members = vs?.GetType().GetProperties().Where(p => p.GetIndexParameters().Length == 0).Select(p =>
+                        { string v; try { var o = p.GetValue(vs); v = o is System.Collections.ICollection c ? "count=" + c.Count : o?.ToString() ?? "null"; } catch (Exception e2) { v = "err:" + e2.GetType().Name; } return p.Name + ":" + p.PropertyType.Name + "=" + (v.Length > 80 ? v[..80] : v); }).ToArray();
+                        var methods = vs?.GetType().GetMethods().Where(m => m.DeclaringType == vs.GetType()).Select(m => m.Name + "(" + string.Join(",", m.GetParameters().Select(p => p.ParameterType.Name)) + ")").ToArray();
+                        _log.Event(Run, "map.stash_calibration", new { file, type = vs?.GetType().FullName, members, methods });
+                    }
+                    catch (Exception ex) { _log.Event(Run, "map.stash_calibration", new { error = ex.Message }); }
+                }
             }
             else if ((DateTime.UtcNow - _restockEmptySince).TotalSeconds > 4)
             {
                 ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
+                // StashieV2 files maps into the "MAP" (map stash) tab: try it after "Tmp" before buying.
+                if (_mapRestockTabIndex < MapRestockTabs.Length - 1)
+                { _mapRestockTabIndex++; _mapRestockStarted = false; _restockEmptySince = DateTime.MinValue; _phaseAt = DateTime.UtcNow; return; }
                 if (ctx.Settings.Awakening.Economy.AutoBuyMaps.Value && !_marketTried)
                 { _marketTried = true; _marketStarted = false; SetPhase(AwakeningPhase.MarketBuy, "no_T16_in_Tmp_buy_from_market"); return; }
                 Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:no_acceptable_T16_in_Tmp"); return;
@@ -2115,7 +2139,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         CancelInput(ctx); SetPhase(AwakeningPhase.ExternalStash, "stash_visible");
     }
-    private bool _mapBankStarted, _mapBankDone;
+    private bool _mapBankStarted, _mapBankDone, _mapBankRunDone, _mapBankLogged;
     private bool IsBankableMap(BotContext ctx, Entity? item)
     {
         try
@@ -2129,12 +2153,18 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     {
         if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true)
         {
-            if (_mapBankStarted && !_externalIssued) { SetPhase(AwakeningPhase.OpenStash, "reopen_stash_after_map_bank"); return; }
+            // StashSystem closes the stash after its store batch; bank at most once per run, then reopen for F3.
+            if (_mapBankStarted && !_externalIssued) { _mapBankRunDone = true; ctx.Stash.Cancel(ctx.Game, ctx.Navigation); SetPhase(AwakeningPhase.OpenStash, "reopen_stash_after_map_bank"); return; }
             Status = "Stash closed during external operation"; return;
         }
         // Map banking: StashieV2 sends maps to the MAP (map stash) tab, which RestockMap cannot read. Acceptable T16
         // maps (dropped or bought in bulk) are first stored in "Tmp" so the next map opens without a market trip.
-        if (!_externalIssued && !_mapBankDone && ctx.Settings.Awakening.Economy.BankMapsInTmp.Value)
+        if (_mapBankRunDone && !_mapBankLogged)
+        {
+            _mapBankLogged = true;
+            _log.Event(Run, "map.bank_after_reopen", new { stillInInventory = StashSystem.GetInventorySlotItems(ctx.Game)?.Count(i => IsBankableMap(ctx, i.Item)) ?? -1 });
+        }
+        if (!_externalIssued && !_mapBankDone && !_mapBankRunDone && ctx.Settings.Awakening.Economy.BankMapsInTmp.Value)
         {
             if (!_mapBankStarted)
             {
@@ -2148,7 +2178,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             }
             var banked = ctx.Stash.Tick(ctx.Game, ctx.Navigation); Status = "Banking maps in Tmp: " + ctx.Stash.Status;
             if (banked is StashResult.InProgress or StashResult.None) { _phaseAt = DateTime.UtcNow; return; }
-            ctx.Stash.Cancel(ctx.Game, ctx.Navigation); _mapBankDone = true;
+            ctx.Stash.Cancel(ctx.Game, ctx.Navigation); _mapBankDone = true; _mapBankRunDone = true;
             _log.Event(Run, "map.bank_done", new { result = banked.ToString(), ctx.Stash.Status });
             return;
         }

@@ -227,8 +227,11 @@ public sealed class AwakeningExchange
         else
         {
             // Listing: rivals sell the same item for chaos at Give/Get chaos each; undercut the lowest by a flat amount.
-            if (rivals.Count == 0) { Fail("no_competing_listing"); return; }
-            var ask = rivals.Min(b => (double)b.Give / b.Get);
+            // 2026-09-22: Maven's Chisel of Avarice had bids at 141c but no chaos asks, so it was never listed.
+            // With no rival ask, list 20% above the best bid instead of skipping.
+            if (rivals.Count == 0 && counter.Count == 0) { Fail("no_competing_listing"); return; }
+            var ask = rivals.Count > 0 ? rivals.Min(b => (double)b.Give / b.Get)
+                : Math.Floor(counter.Max(b => (double)b.Get / b.Give) * 1.2) + request.UndercutChaos;
             var unit = Math.Floor(ask - request.UndercutChaos);
             if (unit < 1) { Fail("undercut_below_1c"); return; }
             if (counter.Count > 0 && counter.Max(b => (double)b.Get / b.Give) >= unit) { Fail("would_fill_at_bid_use_sell"); return; }
