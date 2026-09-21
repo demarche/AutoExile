@@ -937,8 +937,10 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     private void OpenAtlasFromDevice(BotContext ctx)
     {
+        // 2026-09-21 23:00: a chat box left open by a failed "/hideout" swallowed every device click for minutes.
+        if (AwakeningGameReader.ChatOpen(ctx.Game)) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); Status = "Closing the chat box"; return; }
         ctx.Interaction.Tick(ctx.Game);
-        if (ctx.Interaction.IsBusy) return;
+        if (ctx.Interaction.IsBusy && _deviceTries < 3) return;
         var device = ctx.Game.EntityListWrapper.OnlyValidEntities.FirstOrDefault(e => e.IsTargetable &&
             e.Path.Contains("MappingDevice", StringComparison.OrdinalIgnoreCase));
         if (device == null) { Status = "Map device not found"; return; }
@@ -950,10 +952,17 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         _deviceTries++;
         if (_deviceTries > 3 && _deviceTries % 2 == 0)
         {
+            // Click the "Map Device" world label (like the stash label) — the model point can land on the old portals around it.
             ctx.Interaction.Cancel(ctx.Game);
             var w = ctx.Game.Window.GetWindowRectangle();
-            if (BotInput.CanAct && BotInput.Click(new Vector2(w.X + point.X, w.Y + point.Y)))
-                _log.Event(Run, "prepare.device_direct_click", new { tries = _deviceTries, point.X, point.Y });
+            var label = ctx.Game.IngameState.IngameUi.ItemsOnGroundLabelElement.LabelsOnGround?
+                .FirstOrDefault(l => l?.ItemOnGround?.Path?.Contains("MappingDevice", StringComparison.OrdinalIgnoreCase) == true &&
+                    l.Label?.IsVisible == true && BotInput.IsRectOnScreen(l.Label.GetClientRect()));
+            var target = label != null ? new Vector2(w.X + label.Label.GetClientRect().Center.X, w.Y + label.Label.GetClientRect().Center.Y)
+                : new Vector2(w.X + point.X, w.Y + point.Y);
+            if (BotInput.CanAct && BotInput.Click(target))
+                _log.Event(Run, "prepare.device_direct_click", new { tries = _deviceTries, byLabel = label != null, target.X, target.Y });
+            else _deviceTries--; // retry the direct click on the next tick
             return;
         }
         ctx.Interaction.InteractWithEntity(device, ctx.Navigation, false, requireVerified: true);

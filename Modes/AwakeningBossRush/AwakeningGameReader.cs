@@ -32,6 +32,12 @@ public static class AwakeningGameReader
     private static string ChoiceName(object choice) => Property(Property(choice, "Option"), "Name")?.ToString() ?? "";
     private static string Translation(object? value) => value is string text ? text : value is IEnumerable lines
         ? string.Join("\n", lines.Cast<object>().Select(x => x?.ToString())) : value?.ToString() ?? "";
+    /// <summary>True while the chat input box is open (keys then type into chat instead of acting as hotkeys).</summary>
+    public static bool ChatOpen(GameController gc)
+    {
+        try { return (Property(Property(gc.IngameState.IngameUi, "ChatPanel"), "ChatInputElement") as Element)?.IsVisible == true; }
+        catch { return false; }
+    }
     public static bool? StashieBusy()
     {
         try { return Core.ParallelRunner.FindByName("Stashie_DropItemsToStash") != null || Core.ParallelRunner.FindByName("Drop To Stash") != null; }
