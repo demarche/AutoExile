@@ -108,7 +108,7 @@ public sealed class AwakeningExchange
         _actionAt = DateTime.UtcNow; Status = "interacting with Faustus";
     }
 
-    // Finished orders show "Order Completed"; their slots still holding items (bought items / unspent currency) are collected by ctrl-click.
+    // Finished orders show "Order Completed"; their slots still holding items (bought items / unspent currency) are collected by hover + Ctrl+right-click.
     private static List<(Element Slot, string Count)> FinishedSlots(Element panel)
     {
         var result = new List<(Element, string)>();
@@ -131,7 +131,7 @@ public sealed class AwakeningExchange
         var slots = FinishedSlots(panel);
         if (slots.Count == 0) return false;
         var (slot, count) = slots[0];
-        if (BotInput.CtrlClick(Abs(gc, slot.GetClientRect().Center))) { _actionAt = DateTime.UtcNow; _collectClicks++; _log("exchange.collect_click", new { count, rect = slot.GetClientRect().ToString() }); }
+        if (BotInput.CtrlRightClick(Abs(gc, slot.GetClientRect().Center))) { _actionAt = DateTime.UtcNow; _collectClicks++; _log("exchange.collect_click", new { count, rect = slot.GetClientRect().ToString() }); }
         Status = "collecting a finished order"; return true;
     }
 

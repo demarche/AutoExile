@@ -1780,6 +1780,44 @@ namespace AutoExile.Systems
             }
         }
 
+        /// <summary>Ctrl+right-click (e.g. collecting a finished Currency Exchange order). Suspends continuous movement.</summary>
+        public static bool CtrlRightClick(Vector2 absPos)
+        {
+            if (TryCaptureReplay("CtrlRightClick", absPos)) return true;
+            if (!CanAct) { LogAction("CtrlRightClick", absPos, null, false); return false; }
+            if (!ClampToWindow(ref absPos)) { LogAction("CtrlRightClick", absPos, null, false); return false; }
+            SuspendMovement();
+            ReleaseAllKeys();
+            var moveMs = EstimateMoveMs(absPos);
+            var settle = RandSettle();
+            var hold = RandHold();
+            NextActionAt = DateTime.Now.AddMilliseconds(hold + moveMs + settle + hold + ActionCooldownMs);
+            _ = RunClickSequence("ctrl-right", () => DoCtrlRightClick(absPos, settle, hold));
+            LogAction("CtrlRightClick", absPos, null, true);
+            return true;
+        }
+
+        private static async Task DoCtrlRightClick(Vector2 absPos, int settleMs, int holdMs)
+        {
+            var rightDown = false;
+            try
+            {
+                // Hover first, then hold Ctrl and right-click on the slot.
+                await MoveCursorTo(absPos).ConfigureAwait(false);
+                await Task.Delay(settleMs, _clickToken.Value).ConfigureAwait(false);
+                await SendDelay().ConfigureAwait(false);
+                SendKeyDown(Keys.ControlKey, "ctrl");
+                await Task.Delay(holdMs, _clickToken.Value).ConfigureAwait(false);
+                SendRightDown("ctrl-right-click"); rightDown = true;
+                await Task.Delay(holdMs, _clickToken.Value).ConfigureAwait(false);
+            }
+            finally
+            {
+                if (rightDown) SendRightUp("ctrl-right-click-cleanup");
+                SendKeyUp(Keys.ControlKey, "ctrl-cleanup");
+            }
+        }
+
         /// <summary>Ctrl+left-click (stash transfers). Suspends continuous movement.</summary>
         public static bool CtrlClick(Vector2 absPos)
         {
