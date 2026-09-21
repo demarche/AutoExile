@@ -36,6 +36,8 @@ public sealed class AwakeningEconomySettings
     public ToggleNode AutoBuyMaps { get; set; } = new(false);
     [Menu("Maps to buy per restock")]
     public RangeNode<int> MapBuyCount { get; set; } = new(20, 1, 100);
+    [Menu("Bank maps in Tmp", "Before F3, store acceptable T16 maps (dropped or bought) in the Tmp tab so the next map does not need a market trip.")]
+    public ToggleNode BankMapsInTmp { get; set; } = new(true);
     [Menu("Max price per map (chaos)")]
     public RangeNode<float> MapMaxUnitChaos { get; set; } = new(50, 1, 1000);
     [Menu("Seller follow-up: max over first price (chaos)", "Buy more maps from the same seller tab if within this much of the first price.")]

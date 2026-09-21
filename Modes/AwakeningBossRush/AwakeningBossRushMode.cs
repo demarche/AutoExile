@@ -94,7 +94,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // Safety: degen ground, Exarch daemons, known dangerous boss effects and "Bearer" monsters are never stood in;
     // a burst of damage or standing in a hazard triggers an escape (movement skill such as Frostblink when ready).
     private readonly Queue<(DateTime At, float Pool)> _poolHistory = new();
-    private DateTime _escapeUntil = DateTime.MinValue, _lastBlinkAt = DateTime.MinValue;
+    private DateTime _escapeUntil = DateTime.MinValue, _lastBlinkAt = DateTime.MinValue, _lastKiteAt = DateTime.MinValue;
+    private int _runKites;
     private readonly HashSet<string> _hazardKinds = new();
     private static readonly Regex DangerAnimation = new(@"Sirus/desolation|Maven/gravity_well|Shaper/vortex|Elder/decay|Exarch/searing_rune|Exarch/flame_wall|/slam/buildup|/explosion/buildup",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -679,7 +680,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private void SetPhase(AwakeningPhase phase, string reason)
     {
         var previous = Run.Phase; Run.Phase = phase; _phaseAt = DateTime.UtcNow;
-        _quietAt = DateTime.MinValue; _externalIssued = false; _stableEmpty = 0;
+        _quietAt = DateTime.MinValue; _externalIssued = false; _stableEmpty = 0; _mapBankStarted = false; _mapBankDone = false;
         Status = reason; Decision = phase.ToString();
         _log.Event(Run, "phase.changed", new { previous, phase, reason }); Supervisor.Save();
         if (Supervisor.StorageError.Length > 0 && _ctx != null) { _ctx.Settings.Running.Value = false; BotInput.Cancel(); }
@@ -1334,7 +1335,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // (35 grids) are fought on the way, and a pack that takes no damage is walked past instead of chased.
         var dropSite = KnownDropSite();
         var pushing = dropSite.HasValue && Vector2.Distance(ctx.Game.Player.GridPosNum, dropSite.Value) > 45;
-        var clearRadius = pushing ? 35f : 90f;
+        // 2026-09-21: 300 s scouts were mostly "clearing nearby enemies" for packs up to 90 grid away. Bosses (not packs)
+        // pay; only packs that can reach us (50 grid) are fought, the kite/escape layer handles the rest.
+        var clearRadius = pushing ? 35f : 50f;
         // Stragglers that take no damage (captured beasts at 1 HP, immune crystals...) are ignored for the rest of the map.
         var enemies = ctx.Game.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster &&
             e.IsAlive && e.IsHostile && e.IsTargetable && !_scoutIgnored.Contains(e.Id) &&
@@ -1491,7 +1494,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }).ToList();
         if (now < _escapeUntil && (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding))
         { TravelSustain(ctx); Status = "Escaping danger"; return true; }
-        if (inside.Count == 0 && !burst) return false;
+        // 2026-09-21 death.context: the deaths were melee packs (Void Skulker / Carnage Chieftain / Seething Brine)
+        // standing 4–15 grid from the Spark character, not ground. Kite before the burst: 4+ living enemies within 12
+        // grid (or a rare/unique within 8) → step away, at most every 2.5 s.
+        var crowdNow = gc.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster && e.IsAlive && e.IsHostile && e.IsTargetable)
+            .Select(e => (e, d: Vector2.Distance(player, e.GridPosNum))).ToList();
+        var crowded = crowdNow.Count(x => x.d < 12) >= 4 || crowdNow.Any(x => x.d < 8 && x.e.Rarity is MonsterRarity.Rare or MonsterRarity.Unique);
+        var kite = crowded && !burst && inside.Count == 0 && (now - _lastKiteAt).TotalSeconds >= 2.5 && Run.Phase is not AwakeningPhase.MapBoss;
+        if (inside.Count == 0 && !burst && !kite) return false;
+        if (kite) _lastKiteAt = now;
         var away = Vector2.Zero;
         foreach (var h in inside)
         {
@@ -1500,7 +1511,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         var threats = gc.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster && e.IsAlive && e.IsHostile &&
             Vector2.Distance(player, e.GridPosNum) < 40).Select(e => e.GridPosNum).ToList();
-        if (burst && threats.Count > 0)
+        if ((burst || kite) && threats.Count > 0)
         {
             var centroid = new Vector2(threats.Average(p => p.X), threats.Average(p => p.Y));
             var d = player - centroid;
@@ -1521,6 +1532,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             }
         if (!best.HasValue) return false;
         var blinked = (burst || inside.Count > 0) && TryEscapeBlink(ctx, best.Value);
+        if (kite) { _escapeUntil = now.AddSeconds(0.8); ctx.Navigation.Stop(gc); _destination = null; Navigate(ctx, best.Value); _runKites++;
+            Status = "Kiting away from a close pack"; return true; }
         ctx.Interaction.Cancel(gc); if (_lootId != 0) _lootInterrupted = true;
         ctx.Navigation.Stop(gc); _destination = null;
         Navigate(ctx, best.Value);
@@ -2053,9 +2066,43 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         CancelInput(ctx); SetPhase(AwakeningPhase.ExternalStash, "stash_visible");
     }
+    private bool _mapBankStarted, _mapBankDone;
+    private bool IsBankableMap(BotContext ctx, Entity? item)
+    {
+        try
+        {
+            if (item?.Path?.Contains("MapKeyTier16") != true) return false;
+            return AwakeningMapPolicy.Rejections(AwakeningGameReader.ReadMap(ctx.Game, item, "Dunes")).Count == 0;
+        }
+        catch { return false; }
+    }
     private void ExternalStash(BotContext ctx)
     {
-        if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true) { Status = "Stash closed during external operation"; return; }
+        if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true)
+        {
+            if (_mapBankStarted && !_externalIssued) { SetPhase(AwakeningPhase.OpenStash, "reopen_stash_after_map_bank"); return; }
+            Status = "Stash closed during external operation"; return;
+        }
+        // Map banking: StashieV2 sends maps to the MAP (map stash) tab, which RestockMap cannot read. Acceptable T16
+        // maps (dropped or bought in bulk) are first stored in "Tmp" so the next map opens without a market trip.
+        if (!_externalIssued && !_mapBankDone && ctx.Settings.Awakening.Economy.BankMapsInTmp.Value)
+        {
+            if (!_mapBankStarted)
+            {
+                var bankable = StashSystem.GetInventorySlotItems(ctx.Game)?.Count(i => IsBankableMap(ctx, i.Item)) ?? 0;
+                if (bankable == 0) { _mapBankDone = true; return; }
+                ctx.Stash.ApplyIncubators = false;
+                _mapBankStarted = ctx.Stash.Start(storeTabName: "Tmp", itemFilter: i => IsBankableMap(ctx, i.Item));
+                if (_mapBankStarted) _log.Event(Run, "map.bank_started", new { bankable });
+                else _mapBankDone = true;
+                return;
+            }
+            var banked = ctx.Stash.Tick(ctx.Game, ctx.Navigation); Status = "Banking maps in Tmp: " + ctx.Stash.Status;
+            if (banked is StashResult.InProgress or StashResult.None) { _phaseAt = DateTime.UtcNow; return; }
+            ctx.Stash.Cancel(ctx.Game, ctx.Navigation); _mapBankDone = true;
+            _log.Event(Run, "map.bank_done", new { result = banked.ToString(), ctx.Stash.Status });
+            return;
+        }
         if (!_externalIssued)
         {
             if (AwakeningGameReader.StashieBusy() != false || !BotInput.CanAct || !BotInput.PressKey(Keys.F3)) return;
