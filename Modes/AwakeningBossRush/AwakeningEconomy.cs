@@ -66,7 +66,9 @@ public sealed class AwakeningLedger
     public int Maps { get; private set; }
     public double OperatingSeconds { get; private set; }
     public string Error { get; private set; } = "";
-    public double? ChaosPerHour => OperatingSeconds > 60 ? (LootValue + Realized - Invest) * 3600 / OperatingSeconds : null;
+    // Loot is valued (poe.ninja) when it is picked up; selling it later only converts it to Chaos, so Realized is
+    // reported separately and NOT added again (13:50: 576c of Chisel sales had doubled the hourly rate to 5556c/h).
+    public double? ChaosPerHour => OperatingSeconds > 60 ? (LootValue - Invest) * 3600 / OperatingSeconds : null;
 
     public AwakeningLedger(string directory)
     {

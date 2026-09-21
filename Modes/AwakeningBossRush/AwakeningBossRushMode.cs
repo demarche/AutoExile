@@ -1123,6 +1123,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private ExchangeRequest? _exchangeLastRequest() => _exchange.Request;
     private void Index(BotContext ctx)
     {
+        // After a Faustus restock the stash is closed ("Stash closed — index scan aborted" stopped the loop): open it first.
+        if (!_indexStarted && ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true)
+        {
+            if (ctx.Game.IngameState.IngameUi.CurrencyExchangePanel?.IsVisible == true) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
+            TryClickStashLabel(ctx); Status = "Opening the stash for the index"; return;
+        }
         if (!_indexStarted) { ctx.StashIndex.Start(ctx.Settings.Awakening.SupplyTab.Value, includeFragmentSections: true); _indexStarted = true; }
         ctx.StashIndex.Tick(ctx.Game); Status = ctx.StashIndex.Status;
         if (!ctx.StashIndex.IsComplete)
