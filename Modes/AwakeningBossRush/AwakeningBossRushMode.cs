@@ -89,6 +89,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private DateTime _unblockUntil = DateTime.MinValue;
     private readonly HashSet<long> _scoutIgnored = new();
     private readonly Dictionary<long, int> _scoutStalls = new();
+    private Vector2 _stallPos; private int _stallCount;
     private readonly Dictionary<long, DateTime> _pushIgnoredUntil = new();
     private bool _dropSiteReached;
     // Safety: degen ground, Exarch daemons, known dangerous boss effects and "Bearer" monsters are never stood in;
@@ -537,6 +538,18 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 {
                     _log.Event(Run, "navigation.stalled", new { pos.X, pos.Y, destination = _destination, ctx.Navigation.LastRecoveryAction });
                     Run.InputFault = true;
+                    // 2026-09-21 13:25: the scout stayed stuck at one spot for 70 s (stall → repath → stall). From the 2nd stall
+                    // at the same spot, jump with the movement skill (Frostblink can cross terrain) toward the destination,
+                    // rotating the direction on each further stall.
+                    _stallCount = Vector2.Distance(pos, _stallPos) < 15 ? _stallCount + 1 : 1; _stallPos = pos;
+                    if (_stallCount >= 2)
+                    {
+                        var baseDir = _destination.HasValue && Vector2.Distance(_destination.Value, pos) > 1 ? Vector2.Normalize(_destination.Value - pos) : new Vector2(1, 0);
+                        var angle = MathF.Atan2(baseDir.Y, baseDir.X) + (_stallCount - 2) * MathF.PI / 3 * ((_stallCount % 2 == 0) ? 1 : -1);
+                        var jump = pos + new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * 25;
+                        var blinked = TryEscapeBlink(ctx, jump);
+                        _log.Event(Run, "navigation.stall_blink", new { stalls = _stallCount, blinked, x = jump.X, y = jump.Y });
+                    }
                     ctx.Navigation.Stop(gc);
                     if (_destination.HasValue) ctx.Exploration.MarkRegionFailed(_destination.Value);
                     _lastProgress = now; _destination = null;
@@ -867,6 +880,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (!_deviceStockChecked)
         {
             var atlas = ctx.Game.IngameState.IngameUi.Atlas;
+            if (atlas?.IsVisible == true) _deviceTries = 0;
             if (atlas?.IsVisible != true)
             {
                 if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible == true || ctx.Game.IngameState.IngameUi.InventoryPanel?.IsVisible == true)
@@ -929,9 +943,20 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             e.Path.Contains("MappingDevice", StringComparison.OrdinalIgnoreCase));
         if (device == null) { Status = "Map device not found"; return; }
         if (!NearDevice(ctx)) return;
-        ctx.Interaction.InteractWithEntity(device, ctx.Navigation, false, requireVerified: true);
         var render = device.GetComponent<Render>();
         var point = ctx.Game.IngameState.Camera.WorldToScreen(render?.InteractCenterNum ?? device.BoundsCenterPosNum);
+        // 2026-09-21: the verified interaction sometimes never leaves its "cursor-move" stage (device on screen, clicked
+        // 30+ times, Atlas never opened). From the 4th try, click the device point directly like a UI click.
+        _deviceTries++;
+        if (_deviceTries > 3 && _deviceTries % 2 == 0)
+        {
+            ctx.Interaction.Cancel(ctx.Game);
+            var w = ctx.Game.Window.GetWindowRectangle();
+            if (BotInput.CanAct && BotInput.Click(new Vector2(w.X + point.X, w.Y + point.Y)))
+                _log.Event(Run, "prepare.device_direct_click", new { tries = _deviceTries, point.X, point.Y });
+            return;
+        }
+        ctx.Interaction.InteractWithEntity(device, ctx.Navigation, false, requireVerified: true);
         _log.Event(Run, "prepare.device_interaction", new { device.Id, device.Path, point.X, point.Y, anchor = "interaction" });
     }
     // After /hideout (market purchase) the character spawns at the hideout entrance, out of click range of the device.
@@ -973,6 +998,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         return false;
     }
     private bool _walkingToDevice;
+    private int _deviceTries;
     private static string? InventoryMaterialPath(BotContext ctx, string name)
     {
         try
