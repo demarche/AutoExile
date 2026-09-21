@@ -951,7 +951,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var point = ctx.Game.IngameState.Camera.WorldToScreen(render?.InteractCenterNum ?? device.BoundsCenterPosNum);
         // 2026-09-21: the verified interaction sometimes never leaves its "cursor-move" stage (device on screen, clicked
         // 30+ times, Atlas never opened). From the 4th try, click the device point directly like a UI click.
+        // 2026-09-22 17:40: a label click was followed on the very next tick by a model interaction (before the Atlas had
+        // time to open); the model click landed on the old map's portal. Space the attempts and use the model only
+        // when no "Map Device" label is visible.
+        if ((DateTime.UtcNow - _deviceClickAt).TotalSeconds < 1.5) return;
+        var deviceLabel = ctx.Game.IngameState.IngameUi.ItemsOnGroundLabelElement.LabelsOnGround?
+            .FirstOrDefault(l => l?.ItemOnGround?.Path?.Contains("MappingDevice", StringComparison.OrdinalIgnoreCase) == true &&
+                l.Label?.IsVisible == true && BotInput.IsRectOnScreen(l.Label.GetClientRect()));
         _deviceTries++;
+        if (deviceLabel != null && _deviceTries % 2 == 0) _deviceTries++;
         // The label is tried first: the device model is surrounded by the old map's portals, and a model click that
         // lands on one entered that map (unexpected_map_before_activation 13:10, 14:08).
         if (_deviceTries % 2 == 1)
@@ -965,10 +973,14 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             var target = label != null ? new Vector2(w.X + label.Label.GetClientRect().Center.X, w.Y + label.Label.GetClientRect().Center.Y)
                 : new Vector2(w.X + point.X, w.Y + point.Y);
             if (BotInput.CanAct && BotInput.Click(target))
+            {
+                _deviceClickAt = DateTime.UtcNow;
                 _log.Event(Run, "prepare.device_direct_click", new { tries = _deviceTries, byLabel = label != null, target.X, target.Y });
+            }
             else _deviceTries--; // retry the direct click on the next tick
             return;
         }
+        _deviceClickAt = DateTime.UtcNow;
         ctx.Interaction.InteractWithEntity(device, ctx.Navigation, false, requireVerified: true);
         _log.Event(Run, "prepare.device_interaction", new { device.Id, device.Path, point.X, point.Y, anchor = "interaction" });
     }
@@ -1012,6 +1024,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     private bool _walkingToDevice;
     private int _deviceTries, _strayMapRecoveries;
+    private DateTime _deviceClickAt, _hideoutSince;
     private static string? InventoryMaterialPath(BotContext ctx, string name)
     {
         try
@@ -1044,8 +1057,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             if (need <= 0) continue;
             var category = name.StartsWith("Horned") ? NinjaPriceCategory.Scarab : NinjaPriceCategory.Fragment;
             var ninja = ctx.NinjaPrice.GetPrice(name, category).MinChaosValue;
-            // Safety cap: never pay more than 1.5x the poe.ninja price (or 300c when unknown).
-            _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.BuyAtAsk, name, "Chaos Orb", need, ninja > 0 ? ninja * 1.5 : 300));
+            // Safety cap: never pay more than 1.5x the poe.ninja price (+1c slack for sub-chaos fragments; 300c when unknown).
+            // 2026-09-22: Sacrifice at Dusk at 0.20c vs a 0.17c cap stopped the loop.
+            _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.BuyAtAsk, name, "Chaos Orb", need, ninja > 0 ? Math.Max(ninja * 1.5, ninja + 1) : 300));
         }
         _log.Event(Run, "restock.planned", _restockQueue.ToArray());
         CancelInput(ctx);
@@ -2071,6 +2085,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             Run.ReturnedToHideout = true;
             if (Run.RecoveryRequired)
             {
+                // 2026-09-22 17:40: the next attempt's portal baseline was read 0.2 s after arrival, before the hideout's
+                // portal entities loaded ("priorPortalIds": []), so the old portals then stopped the loop as unrecognized.
+                if (_hideoutSince == DateTime.MinValue) _hideoutSince = DateTime.UtcNow;
+                if ((DateTime.UtcNow - _hideoutSince).TotalSeconds < 2.5) { Status = "Waiting for the hideout to load"; return; }
+                _hideoutSince = DateTime.MinValue;
                 Run.RecoveryRequired = false; ctx.Settings.Running.Value = false; _lastRunning = false;
                 SetPhase(AwakeningPhase.AwaitingReview, "failed_attempt_returned_to_hideout");
                 _log.Event(Run, "attempt.recovery_complete", new { Run.Outcome }); WriteEvidence(ctx);
