@@ -30,6 +30,7 @@ public sealed class AwakeningMarketBuyer
     private readonly Action<string, object> _log;
     private readonly Queue<Keys> _keys = new();
     private DateTime _keyAt;
+    private int _chatRetries;
     private static readonly Keys[] HideoutKeys = { Keys.Escape, Keys.None, Keys.Return, Keys.None, Keys.OemQuestion, Keys.H, Keys.I, Keys.D, Keys.E, Keys.O, Keys.U, Keys.T, Keys.Return };
     private MarketMapRequest? _request;
     private readonly HashSet<string> _skippedSellers = new();
@@ -75,6 +76,14 @@ public sealed class AwakeningMarketBuyer
             // Keys.None = pause 700 ms (the chat box needs a moment to open before "/" is typed, otherwise "/" opens
             // the market and the letters act as hotkeys, e.g. hideout edit mode).
             if (_keys.Peek() == Keys.None) { if ((DateTime.UtcNow - _keyAt).TotalMilliseconds >= 700) { _keys.Dequeue(); _keyAt = DateTime.UtcNow; } return; }
+            // "/hideout" is only typed into an open chat box; otherwise "/" opens the market and the letters are hotkeys.
+            if (_keys.Peek() == Keys.OemQuestion && _chatRetries < 2 && !AwakeningGameReader.ChatOpen(ctx.Game))
+            {
+                if ((DateTime.UtcNow - _keyAt).TotalMilliseconds < 700) return;
+                _chatRetries++; _log("market.chat_not_open", new { retries = _chatRetries });
+                if (BotInput.CanAct && BotInput.PressKey(Keys.Return)) _keyAt = DateTime.UtcNow;
+                return;
+            }
             if (BotInput.CanAct && BotInput.PressKey(_keys.Peek())) { _keys.Dequeue(); _keyAt = DateTime.UtcNow; }
             return;
         }
@@ -250,6 +259,7 @@ public sealed class AwakeningMarketBuyer
         _research = research;
         _leaveHash = AreaHash(gc);
         _log("market.go_home", new { reason, bought = Bought, spent = Spent, research, leaveHash = _leaveHash, homeHash = _homeHash });
+        _chatRetries = 0;
         foreach (var k in HideoutKeys) _keys.Enqueue(k);
         Set(Step.Home, "returning with /hideout (" + reason + ")");
     }
@@ -263,9 +273,11 @@ public sealed class AwakeningMarketBuyer
     {
         if (!IsHome(gc))
         {
+            if (AreaHash(gc) == _homeHash && SellerGrid(gc) != null && (DateTime.UtcNow - _actionAt).TotalSeconds > 2 && _keys.Count == 0)
+            { _keys.Enqueue(Keys.Escape); _actionAt = DateTime.UtcNow; Status = "Market: closing the seller window at home"; return; }
             // Retry the chat command once if the first one was eaten (e.g. by a still-open window).
             if ((DateTime.UtcNow - _stepAt).TotalSeconds > 20 && (DateTime.UtcNow - _actionAt).TotalSeconds > 15)
-            { foreach (var k in HideoutKeys) _keys.Enqueue(k); _actionAt = DateTime.UtcNow; }
+            { _chatRetries = 0; foreach (var k in HideoutKeys) _keys.Enqueue(k); _actionAt = DateTime.UtcNow; }
             return;
         }
         if (_research) { _research = false; Set(Step.OpenMarket, "next seller"); return; }
@@ -286,12 +298,18 @@ public sealed class AwakeningMarketBuyer
         // 2026-09-21: a seller whose hideout is also "Luxurious Hideout" left the bot waiting 60 s at home. After
         // "/hideout" the area simply has to change from the one we left and still be a hideout.
         if (_step == Step.Home && _leaveHash != 0 && hash != _leaveHash && SellerGrid(gc) == null) return true;
+        // 2026-09-22 18:09: the seller window opened without a travel (still in our hideout); "/hideout" then never
+        // changed the area and the bot waited forever. Never having left home counts as home.
+        if (_step == Step.Home && _leaveHash == _homeHash && hash == _homeHash && SellerGrid(gc) == null && (DateTime.UtcNow - _stepAt).TotalSeconds > 3) return true;
         return _sellerHash == 0 ? hash == _homeHash || area.Name == _homeArea : hash != _sellerHash && (area.Name == _homeArea || hash == _homeHash);
     }
 
     // ── UI helpers ───────────────────────────────────────────────────
     /// <summary>True while the market or its results pane is still open (the caller closes it with Escape before using the map device).</summary>
     public static bool MarketOpen(GameController gc) => MarketRoot(gc) != null || ResultsPane(gc) != null;
+    /// <summary>Market search, results or a seller's "Select Items To Buy" window is visible.</summary>
+    public static bool AnyWindowOpen(GameController gc) =>
+        MarketOpen(gc) || Roots(gc).Any(r => Text(Child(r, 3)) == "Select Items To Buy");
     private static Element? MarketRoot(GameController gc) =>
         Roots(gc).FirstOrDefault(r => Text(Child(r, 1)) == "The Market");
     // The results pane stays in the tree after it is closed, so its visibility (child 0) must be checked.

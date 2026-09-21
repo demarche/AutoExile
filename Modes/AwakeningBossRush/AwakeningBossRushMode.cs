@@ -392,7 +392,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             _inspectionStatus = "";
             _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
-            _mapBankRunDone = false; _mapBankLogged = false;
+            _mapBankRunDone = false; _mapBankLogged = false; _mapTierStep = 0; _chaosStoreClicks = 0;
             _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false;
             _defensiveClear = false;
             _lootDefenseActive = false; _lootDefenseSuppressedUntil = DateTime.MinValue;
@@ -823,6 +823,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     {
         if (ctx.Game.Area?.CurrentArea?.IsHideout != true) { Status = "Waiting for hideout"; return; }
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && !_listingChecked && PlanListings(ctx)) return;
+        if (!Run.ActivationRequested && !Run.ActivationConfirmed && PlanDivineConversion(ctx)) return;
         var moveConflict = ctx.Combat.MovementBindingConflict(ctx.Game, ctx.Navigation.MoveKey);
         if (moveConflict != null)
         {
@@ -1019,7 +1020,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             }
             catch { }
         }
-        if (device == null || onScreen || device.DistancePlayer <= 40) { if (device != null && _walkingToDevice) { _walkingToDevice = false; ctx.Navigation.Stop(ctx.Game); } return true; }
+        // 2026-09-22 18:18: after the market's "/hideout" the device label was on screen but 80 label clicks from the
+        // entrance never opened the Atlas. After 6 failed clicks, walk (move key, no clicks on portals) to the device.
+        if (device == null || device.DistancePlayer <= (_deviceTries > 6 ? 25 : 40) || (onScreen && _deviceTries <= 6)) { if (device != null && _walkingToDevice) { _walkingToDevice = false; ctx.Navigation.Stop(ctx.Game); } return true; }
         if (!_walkingToDevice) _log.Event(Run, "hideout.walk_to_device", new { distance = device.DistancePlayer });
         _walkingToDevice = true; _phaseAt = DateTime.UtcNow;
         Navigate(ctx, device.GridPosNum); Status = $"Walking to the map device ({device.DistancePlayer:0})";
@@ -1070,6 +1073,58 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     // Held Chaos below the threshold: list Chisels/Writ at (lowest competing ask - undercut) once per session each.
     // The orders fill later; the items leave the stash, so they are never listed twice.
+    // 2026-09-22 (user): the Currency tab holds at most 5000 Chaos and the overflow filled the inventory. Above
+    // 4000 Chaos, convert all but ~1000 (enough for Scarabs, Sacrifices and maps) into Divine Orbs with a Faustus
+    // buy order at the best competing Chaos-for-Divine price (no premium: it may fill slowly, but at the best rate).
+    private const int DivineConvertAbove = 4000, DivineKeepChaos = 1000;
+    private DateTime _divineOrderAt = DateTime.MinValue;
+    private bool _divineDiagLogged, _stashChaosFull;
+    private bool PlanDivineConversion(BotContext ctx)
+    {
+        if (!ctx.Settings.Awakening.Economy.AutoRestock.Value) return false;
+        if ((DateTime.UtcNow - _divineOrderAt).TotalMinutes < 30) return false;
+        var chaos = AwakeningExchange.CountHeld(ctx.Game, "Chaos Orb");
+        if (!_divineDiagLogged) { _divineDiagLogged = true; _log.Event(Run, "divine.check", new { chaos, stashChaosFull = _stashChaosFull, where = AwakeningExchange.HeldBreakdown(ctx.Game, "Chaos Orb") }); }
+        // The Currency tab is not always in the server inventories; a failed Ctrl+right-click store proves it is full.
+        if (_stashChaosFull) chaos = Math.Max(chaos, 5000 + AwakeningExchange.CountInMainInventory(ctx.Game, "Chaos Orb"));
+        if (chaos <= DivineConvertAbove) return false;
+        _divineOrderAt = DateTime.UtcNow; _stashChaosFull = false;
+        var ninja = ctx.NinjaPrice.GetPrice("Divine Orb", NinjaPriceCategory.Currency).MinChaosValue;
+        var unitGuess = ninja > 0 ? ninja : 200;
+        var divines = (int)Math.Floor((chaos - DivineKeepChaos) / unitGuess);
+        if (divines < 1) return false;
+        _restockQueue.Clear();
+        // UndercutChaos 0: match the best competing bid instead of outbidding it. Cap: never above 1.1x poe.ninja.
+        _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.BuyAtBid, "Divine Orb", "Chaos Orb", divines, ninja > 0 ? ninja * 1.1 : 0, 0));
+        _log.Event(Run, "divine.planned", new { chaos, keep = DivineKeepChaos, divines, ninja });
+        _restockBackToPrepare = true; CancelInput(ctx);
+        SetPhase(AwakeningPhase.Restock, "convert_chaos_to_divine");
+        return true;
+    }
+    // Chaos collected from Faustus lands in the inventory; with the stash open, Ctrl+right-click on a Chaos stack
+    // moves every Chaos Orb in the inventory into the stash (user-verified).
+    private DateTime _chaosStoreAt; private int _chaosStoreClicks;
+    private bool StoreInventoryChaos(BotContext ctx)
+    {
+        if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true) return false;
+        if (_chaosStoreClicks >= 3 || (DateTime.UtcNow - _chaosStoreAt).TotalSeconds < 1.5) return false;
+        try
+        {
+            var chaos = StashSystem.GetInventorySlotItems(ctx.Game)?.FirstOrDefault(i => i.Item?.Path == "Metadata/Items/Currency/CurrencyRerollRare");
+            if (chaos == null) { _chaosStoreClicks = 0; return false; }
+            // Chaos still in the inventory after two store clicks: the Currency tab is full (5000 cap).
+            if (_chaosStoreClicks >= 2 && !_stashChaosFull) { _stashChaosFull = true; _log.Event(Run, "chaos.stash_full", new { inventory = AwakeningExchange.CountInMainInventory(ctx.Game, "Chaos Orb") }); }
+            if (!BotInput.CanAct) return true;
+            var w = ctx.Game.Window.GetWindowRectangle(); var rc = chaos.GetClientRect();
+            if (BotInput.CtrlRightClick(new Vector2(w.X + rc.Center.X, w.Y + rc.Center.Y)))
+            {
+                _chaosStoreAt = DateTime.UtcNow; _chaosStoreClicks++;
+                _log.Event(Run, "chaos.stored", new { held = AwakeningExchange.CountHeld(ctx.Game, "Chaos Orb"), click = _chaosStoreClicks });
+            }
+            return true;
+        }
+        catch { return false; }
+    }
     private bool PlanListings(BotContext ctx)
     {
         _listingChecked = true;
@@ -1116,7 +1171,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 }
                 else if (economy.StopWhenOutOfChaos.Value) { Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:restock_failed:" + _exchange.FailReason); return; }
             }
-            if (_exchange.Succeeded && done.Kind == ExchangeKind.BuyAtBid)
+            if (_exchange.Succeeded && done.Kind == ExchangeKind.BuyAtBid && done.WantName == "Divine Orb")
+                _log.Event(Run, "divine.order_placed", new { done.Quantity, unit = _exchange.UnitChaos });
+            else if (_exchange.Succeeded && done.Kind == ExchangeKind.BuyAtBid)
             {
                 _bidPending[done.WantName] = DateTime.UtcNow;
                 _ledger.Price(done.WantName, _exchange.UnitChaos, "faustus_bid");
@@ -1178,6 +1235,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             if (ctx.Game.IngameState.IngameUi.CurrencyExchangePanel?.IsVisible == true) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
             TryClickStashLabel(ctx); Status = "Opening the stash for the index"; return;
         }
+        if (!_indexStarted && StoreInventoryChaos(ctx)) return;
         if (!_indexStarted) { ctx.StashIndex.Start(ctx.Settings.Awakening.SupplyTab.Value, includeFragmentSections: true); _indexStarted = true; }
         ctx.StashIndex.Tick(ctx.Game); Status = ctx.StashIndex.Status;
         if (!ctx.StashIndex.IsComplete)
@@ -1196,7 +1254,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 || (ctx.Game.Files.BaseItemTypes.Translate(e.ItemPath)?.BaseName?.Equals(name, StringComparison.OrdinalIgnoreCase) == true)).ToList();
             if (matches.Count == 0)
             {
-                _log.Event(Run, "materials.unresolved", entries.Select(x => new { x.ItemPath, x.BaseName, x.TabName }));
+                if (_bidWaitStart == DateTime.MinValue) _log.Event(Run, "materials.unresolved", entries.Select(x => new { x.ItemPath, x.BaseName, x.TabName }));
                 if (ctx.Settings.Awakening.Economy.AutoRestock.Value && !_restockTried) { PlanRestock(ctx); return; }
                 // A buy order is open for a missing material: idle in the Hideout, then revisit Faustus (which collects
                 // filled orders) every 3 minutes, for up to 2 hours.
@@ -1322,6 +1380,19 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private static bool _mapStashDumped;
     private int _mapRestockTabIndex;
     private static readonly string[] MapRestockTabs = { "Tmp", "MAP" };
+    // A stored T16 map is used only when it is as good as a market purchase (IIQ >= the market minimum): the
+    // Awakening bosses' drops scale with quantity, and a 115% IIQ map costs only ~10c.
+    private bool UsableStashMap(BotContext ctx, Entity? e)
+    {
+        try
+        {
+            if (e == null) return false;
+            var m = AwakeningGameReader.ReadMap(ctx.Game, e, "Dunes");
+            return AwakeningMapPolicy.Rejections(m).Count == 0 && m.Quantity >= ctx.Settings.Awakening.Economy.MapMinQuantity.Value;
+        }
+        catch { return false; }
+    }
+    private int _mapTierStep; private DateTime _mapTierClickAt, _mapStashSkipUntil;
     private void RestockMap(BotContext ctx)
     {
         if ((DateTime.UtcNow - _phaseAt).TotalSeconds > 60)
@@ -1335,13 +1406,37 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             ctx.Stash.ApplyIncubators = false;
             _mapRestockStarted = ctx.Stash.Start(withdrawTabName: MapRestockTabs[Math.Min(_mapRestockTabIndex, MapRestockTabs.Length - 1)], withdrawFragmentPath: "Metadata/Items/Maps/MapKeyTier16",
                 withdrawCount: 1, itemFilter: _ => false,
-                withdrawItemFilter: e => AwakeningMapPolicy.Rejections(AwakeningGameReader.ReadMap(ctx.Game, e, "Dunes")).Count == 0);
+                withdrawItemFilter: e => UsableStashMap(ctx, e));
             return;
         }
         var result = ctx.Stash.Tick(ctx.Game, ctx.Navigation); Status = "Tmp: " + ctx.Stash.Status;
         // The tab is open and holds no acceptable map: that is "supplies exhausted", not a 30 s input timeout.
         if (ctx.Stash.Status.StartsWith("Waiting for 'Metadata/Items/Maps/MapKeyTier16'", StringComparison.Ordinal))
         {
+            // Map stash tab ("MAP"): select tier 16 (second button row, 7th) and then its map entry so the T16 maps
+            // become visible items for the withdrawal. Layout calibrated from ui-mapstashtab-20260922-030938.
+            if (_mapRestockTabIndex > 0 && _mapTierStep < 2)
+            {
+                _restockEmptySince = DateTime.MinValue;
+                if ((DateTime.UtcNow - _mapTierClickAt).TotalSeconds < 1.2 || !BotInput.CanAct) return;
+                try
+                {
+                    var vs = ctx.Game.IngameState.IngameUi.StashElement?.VisibleStash as Element;
+                    Element? target = _mapTierStep == 0 ? vs?.GetChildAtIndex(1)?.GetChildAtIndex(6)
+                        : vs?.GetChildAtIndex(2)?.GetChildAtIndex(0)?.GetChildAtIndex(0)?.GetChildAtIndex(0);
+                    _mapTierClickAt = DateTime.UtcNow;
+                    if (target == null || !target.IsVisible) { _log.Event(Run, "map.stash_select_missing", new { step = _mapTierStep }); _mapTierStep = 2; return; }
+                    var w = ctx.Game.Window.GetWindowRectangle(); var rc = target.GetClientRect();
+                    if (BotInput.Click(new Vector2(w.X + rc.Center.X, w.Y + rc.Center.Y)))
+                    {
+                        string label = ""; try { label = string.Join("|", new[] { target.Text ?? "" }.Concat(target.Children.Select(c => c?.Text ?? ""))); } catch { }
+                        _log.Event(Run, "map.stash_select", new { step = _mapTierStep, rect = rc.ToString(), label });
+                        _mapTierStep++;
+                    }
+                }
+                catch (Exception ex) { _log.Event(Run, "map.stash_select_missing", new { error = ex.Message }); _mapTierStep = 2; }
+                return;
+            }
             if (_restockEmptySince == DateTime.MinValue)
             {
                 _restockEmptySince = DateTime.UtcNow;
@@ -1377,8 +1472,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             {
                 ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
                 // StashieV2 files maps into the "MAP" (map stash) tab: try it after "Tmp" before buying.
-                if (_mapRestockTabIndex < MapRestockTabs.Length - 1)
-                { _mapRestockTabIndex++; _mapRestockStarted = false; _restockEmptySince = DateTime.MinValue; _phaseAt = DateTime.UtcNow; return; }
+                if (_mapRestockTabIndex > 0) _mapStashSkipUntil = DateTime.UtcNow.AddMinutes(45);
+                if (_mapRestockTabIndex < MapRestockTabs.Length - 1 && DateTime.UtcNow >= _mapStashSkipUntil)
+                { _mapTierStep = 0; _mapRestockTabIndex++; _mapRestockStarted = false; _restockEmptySince = DateTime.MinValue; _phaseAt = DateTime.UtcNow; return; }
                 if (ctx.Settings.Awakening.Economy.AutoBuyMaps.Value && !_marketTried)
                 { _marketTried = true; _marketStarted = false; SetPhase(AwakeningPhase.MarketBuy, "no_T16_in_Tmp_buy_from_market"); return; }
                 Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:no_acceptable_T16_in_Tmp"); return;
@@ -2137,7 +2233,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     // 2026-09-22 17:51: a restock that stopped on the price cap left the Faustus exchange panel open after a host
     // restart; 60 s of stash-label clicks and move clicks were swallowed by it. Close such panels first.
-    private DateTime _blockerEscapeAt;
+    private DateTime _blockerEscapeAt; private int _blockerEscapes;
     private bool CloseBlockingPanels(BotContext ctx)
     {
         string? blocker = null;
@@ -2145,12 +2241,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             var ui = ctx.Game.IngameState.IngameUi;
             if (ui.CurrencyExchangePanel?.IsVisible == true) blocker = "currency_exchange";
+            else if (Run.Phase != AwakeningPhase.MarketBuy && AwakeningMarketBuyer.AnyWindowOpen(ctx.Game)) blocker = "market";
             else if (AwakeningGameReader.ChatOpen(ctx.Game)) blocker = "chat";
         }
         catch { }
-        if (blocker == null) return false;
+        if (blocker == null) { _blockerEscapes = 0; return false; }
+        // A misread would make Escape open the game menu: give up after 6 presses in a row.
+        if (_blockerEscapes >= 6) return false;
         if ((DateTime.UtcNow - _blockerEscapeAt).TotalSeconds >= 1 && BotInput.CanAct && BotInput.PressKey(Keys.Escape))
-        { _blockerEscapeAt = DateTime.UtcNow; _log.Event(Run, "ui.blocker_closed", new { blocker }); }
+        { _blockerEscapeAt = DateTime.UtcNow; _blockerEscapes++; _log.Event(Run, "ui.blocker_closed", new { blocker }); }
         Status = "Closing " + blocker + " panel";
         return true;
     }
@@ -2218,7 +2317,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         try
         {
             if (item?.Path?.Contains("MapKeyTier16") != true) return false;
-            return AwakeningMapPolicy.Rejections(AwakeningGameReader.ReadMap(ctx.Game, item, "Dunes")).Count == 0;
+            return UsableStashMap(ctx, item);
         }
         catch { return false; }
     }
@@ -2232,6 +2331,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         // Map banking: StashieV2 sends maps to the MAP (map stash) tab, which RestockMap cannot read. Acceptable T16
         // maps (dropped or bought in bulk) are first stored in "Tmp" so the next map opens without a market trip.
+        if (!_externalIssued && StoreInventoryChaos(ctx)) return;
         if (_mapBankRunDone && !_mapBankLogged)
         {
             _mapBankLogged = true;

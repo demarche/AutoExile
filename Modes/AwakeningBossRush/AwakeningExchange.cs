@@ -349,6 +349,46 @@ public sealed class AwakeningExchange
     }
 
     /// <summary>Chaos (or any base item) held in inventory and stash, from the server-side inventories.</summary>
+    /// <summary>Per server inventory (type/slot) count of an item, for diagnosing where currency is visible.</summary>
+    public static List<object> HeldBreakdown(GameController gc, string baseName)
+    {
+        var rows = new List<object>();
+        try
+        {
+            foreach (var holder in gc.IngameState.Data.ServerData.PlayerInventories)
+            {
+                var inv = holder?.Inventory;
+                if (inv == null) continue;
+                long n = 0;
+                foreach (var item in inv.Items)
+                {
+                    if (item == null) continue;
+                    if (!string.Equals(gc.Files.BaseItemTypes.Translate(item.Path)?.BaseName, baseName, StringComparison.OrdinalIgnoreCase)) continue;
+                    n += item.GetComponent<Stack>()?.Size ?? 1;
+                }
+                if (n > 0) rows.Add(new { type = inv.InventType.ToString(), slot = inv.InventSlot.ToString(), n });
+            }
+        }
+        catch (Exception ex) { rows.Add(new { error = ex.Message }); }
+        return rows;
+    }
+    public static int CountInMainInventory(GameController gc, string baseName)
+    {
+        long total = 0;
+        try
+        {
+            foreach (var holder in gc.IngameState.Data.ServerData.PlayerInventories)
+            {
+                var inv = holder?.Inventory;
+                if (inv == null || inv.InventType != InventoryTypeE.MainInventory) continue;
+                foreach (var item in inv.Items)
+                    if (item != null && string.Equals(gc.Files.BaseItemTypes.Translate(item.Path)?.BaseName, baseName, StringComparison.OrdinalIgnoreCase))
+                        total += item.GetComponent<Stack>()?.Size ?? 1;
+            }
+        }
+        catch { }
+        return (int)Math.Min(total, int.MaxValue);
+    }
     public static int CountHeld(GameController gc, string baseName)
     {
         long total = 0;
