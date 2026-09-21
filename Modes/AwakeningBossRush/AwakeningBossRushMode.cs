@@ -941,6 +941,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     {
         // 2026-09-21 23:00: a chat box left open by a failed "/hideout" swallowed every device click for minutes.
         if (AwakeningGameReader.ChatOpen(ctx.Game)) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); Status = "Closing the chat box"; return; }
+        if (CloseBlockingPanels(ctx)) return;
         ctx.Interaction.Tick(ctx.Game);
         if (ctx.Interaction.IsBusy) return;
         var device = ctx.Game.EntityListWrapper.OnlyValidEntities.FirstOrDefault(e => e.IsTargetable &&
@@ -2101,8 +2102,28 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (!_externalIssued && BotInput.CanAct && BotInput.PressKey(Keys.F2))
         { _externalIssued = true; _log.Event(Run, "external.F2", new { plugin = "QuickPortal" }); }
     }
+    // 2026-09-22 17:51: a restock that stopped on the price cap left the Faustus exchange panel open after a host
+    // restart; 60 s of stash-label clicks and move clicks were swallowed by it. Close such panels first.
+    private DateTime _blockerEscapeAt;
+    private bool CloseBlockingPanels(BotContext ctx)
+    {
+        string? blocker = null;
+        try
+        {
+            var ui = ctx.Game.IngameState.IngameUi;
+            if (ui.CurrencyExchangePanel?.IsVisible == true) blocker = "currency_exchange";
+            else if (AwakeningGameReader.ChatOpen(ctx.Game)) blocker = "chat";
+        }
+        catch { }
+        if (blocker == null) return false;
+        if ((DateTime.UtcNow - _blockerEscapeAt).TotalSeconds >= 1 && BotInput.CanAct && BotInput.PressKey(Keys.Escape))
+        { _blockerEscapeAt = DateTime.UtcNow; _log.Event(Run, "ui.blocker_closed", new { blocker }); }
+        Status = "Closing " + blocker + " panel";
+        return true;
+    }
     private bool TryClickStashLabel(BotContext ctx)
     {
+        if (CloseBlockingPanels(ctx)) return true;
         var label = ctx.Game.IngameState.IngameUi.ItemsOnGroundLabelElement.LabelsOnGround?
             .FirstOrDefault(l => l?.ItemOnGround?.Type == EntityType.Stash && l.ItemOnGround.Path == "Metadata/MiscellaneousObjects/Stash" &&
                 l.Label?.IsVisible == true && BotInput.IsRectOnScreen(l.Label.GetClientRect()));
