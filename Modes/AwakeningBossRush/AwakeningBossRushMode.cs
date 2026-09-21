@@ -88,6 +88,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private readonly Dictionary<long, int> _unblockAttempts = new();
     private DateTime _unblockUntil = DateTime.MinValue;
     private readonly HashSet<long> _scoutIgnored = new();
+    private readonly Dictionary<long, int> _scoutStalls = new();
     private readonly Dictionary<long, DateTime> _pushIgnoredUntil = new();
     private bool _dropSiteReached;
     // Safety: degen ground, Exarch daemons, known dangerous boss effects and "Bearer" monsters are never stood in;
@@ -394,7 +395,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _scoutRepositionUntil = DateTime.MinValue;
             _deviceMaterialPaths.Clear();
             _materialIndex = 0; _withdrawing = false; _indexStarted = false; _lootId = 0;
-            _lootAttempts.Clear(); _unblockAttempts.Clear(); _scoutIgnored.Clear(); _lootSkipped.Clear(); _lootInterrupted = false; _enRouteLoot = false; _pushIgnoredUntil.Clear(); _dropSiteReached = false; _restockTried = false; _listingChecked = false; _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
+            _lootAttempts.Clear(); _unblockAttempts.Clear(); _scoutIgnored.Clear(); _scoutStalls.Clear(); _lootSkipped.Clear(); _lootInterrupted = false; _enRouteLoot = false; _pushIgnoredUntil.Clear(); _dropSiteReached = false; _restockTried = false; _listingChecked = false; _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
             _lastClock = Stopwatch.GetTimestamp(); _phaseAt = DateTime.UtcNow; _lastPosition = ctx.Game.Player.GridPosNum;
             _lastProgress = DateTime.UtcNow; _damage.Reset(DateTime.UtcNow);
             Run.BuildConfiguration = AwakeningJson.Serialize(AutoExile.WebServer.SettingsApi.SerializeFlat(ctx.Settings)
@@ -1248,7 +1249,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                     var stash = ctx.Game.IngameState.IngameUi.StashElement;
                     var maps = stash?.VisibleStash?.VisibleInventoryItems?.Where(i => i.Item?.Path?.Contains("MapKey") == true)
                         .Select(i => { var m = AwakeningGameReader.ReadMap(ctx.Game, i.Item, "Dunes"); return new { m.Name, m.Tier, reject = AwakeningMapPolicy.Rejections(m) }; }).ToArray();
-                    _log.Event(Run, "map.restock_candidates", new { tab = stash?.IndexVisibleStash, count = maps?.Length, maps });
+                    var tabs = ctx.Game.IngameState.ServerData.PlayerStashTabs?.Select(t => new { t.Name, type = t.TabType.ToString(), t.VisibleIndex }).ToArray();
+                    _log.Event(Run, "map.restock_candidates", new { tab = stash?.IndexVisibleStash, count = maps?.Length, maps, tabs });
                 }
                 catch (Exception ex) { _log.Event(Run, "map.restock_candidates", new { error = ex.Message }); }
             }
@@ -1364,6 +1366,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                     return;
                 }
                 var closest = enemies.OrderBy(e => Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum)).First();
+                // 2026-09-21: one undamageable rare kept the scout "clearing (1)" for 40+ s. After two repositions
+                // without any HP progress it is walked past for the rest of the map (bosses are what pays).
+                var stalls = _scoutStalls[closest.Id] = _scoutStalls.GetValueOrDefault(closest.Id) + 1;
+                if (stalls > 2 && closest.Rarity != MonsterRarity.Unique)
+                {
+                    foreach (var e in enemies.Where(e => _scoutStalls.GetValueOrDefault(e.Id) > 2 || e.Rarity != MonsterRarity.Unique)) _scoutIgnored.Add(e.Id);
+                    _log.Event(Run, "scout.ignore_stubborn", new { closest.Id, closest.RenderName, closest.Path, stalls, rarity = closest.Rarity.ToString(), nearby = enemies.Count });
+                    _defensiveClear = false; ctx.Combat.Suspend(); return;
+                }
                 var delta = ctx.Game.Player.GridPosNum - closest.GridPosNum;
                 var destination = closest.GridPosNum + (delta.Length() > 1 ? Vector2.Normalize(delta) * 12 : new Vector2(12, 0));
                 if (ctx.Combat.TryGetOptimalRangedPosition(ctx, out var optimal) && Vector2.Distance(optimal, ctx.Game.Player.GridPosNum) > 8)
@@ -1433,7 +1444,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                     else if (IsBearer(e)) kind = "bearer_effect:" + e.Path;
                     if (kind == null) continue;
                     var size = e.GetComponent<Positioned>()?.Size ?? 10;
-                    list.Add((e.GridPosNum, Math.Clamp((float)size, 8f, 40f), kind));
+                    list.Add((e.GridPosNum, Math.Clamp((float)size, 8f, kind.StartsWith("ground:", StringComparison.Ordinal) ? 22f : 40f), kind));
                 }
             if (gc.EntityListWrapper.ValidEntitiesByType.TryGetValue(EntityType.Daemon, out var daemons))
                 foreach (var e in daemons)
@@ -1467,9 +1478,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // Ground degen and Bearers: keep a wider margin so the character steps away before standing in them.
         // While picking up loot with a healthy pool (>= 70 %), brief contact with degen ground is accepted (it is damage over time).
         var healthy = max > 0 && pool / max >= 0.7f;
+        // 2026-09-21 13:17: maps with "patches of ... ground" put radius-40 FillGroundEffects everywhere and the scout
+        // escaped every 1–2 s with 0 % pool loss. Ground only counts when it is actually hurting (>= 5 % in 1.2 s) or the pool is low.
+        var hurting = max > 0 && ((peak - pool) / max >= 0.05f || pool / max < 0.5f);
         var inside = hazards.Where(h =>
         {
             var ground = h.Kind.StartsWith("ground:", StringComparison.Ordinal);
+            if (ground && !hurting) return false;
             if (ground && Run.Phase == AwakeningPhase.Loot && healthy) return false;
             var margin = ground || h.Kind.StartsWith("bearer", StringComparison.Ordinal) ? 6 : 3;
             return Vector2.Distance(player, h.Pos) < h.Radius + margin;
@@ -1594,7 +1609,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     {
         if (_navExact || (Run.Phase == AwakeningPhase.Loot && _lootId != 0)) return target;
         List<(Vector2 Pos, float Radius, string Kind)> hazards;
-        try { hazards = Hazards(ctx).Where(h => h.Kind.StartsWith("ground:", StringComparison.Ordinal) || h.Kind.StartsWith("bearer", StringComparison.Ordinal)).ToList(); }
+        try { hazards = Hazards(ctx).Where(h => h.Kind.StartsWith("bearer", StringComparison.Ordinal) || h.Kind == "exarch_daemon").ToList(); }
         catch { return target; }
         if (hazards.Count == 0) return target;
         for (var pass = 0; pass < 3; pass++)
