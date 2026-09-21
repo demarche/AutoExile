@@ -29,6 +29,8 @@ public sealed class AwakeningMarketBuyer
     private DateTime _stepAt, _startedAt, _actionAt, _clickAt;
     private readonly Action<string, object> _log;
     private readonly Queue<Keys> _keys = new();
+    private DateTime _keyAt;
+    private static readonly Keys[] HideoutKeys = { Keys.Escape, Keys.None, Keys.Return, Keys.None, Keys.OemQuestion, Keys.H, Keys.I, Keys.D, Keys.E, Keys.O, Keys.U, Keys.T, Keys.Return };
     private MarketMapRequest? _request;
     private readonly HashSet<string> _skippedSellers = new();
     private string _seller = "", _homeArea = "";
@@ -68,7 +70,14 @@ public sealed class AwakeningMarketBuyer
         { _log("market.travel_failed", new { seller = _seller }); _skippedSellers.Add(_seller); Set(Step.Search, "travel failed, next seller"); return; }
         var limit = _step switch { Step.Arrive or Step.Home => 60, Step.Buy => 180, _ => 25 };
         if ((DateTime.UtcNow - _stepAt).TotalSeconds > limit) { GoHomeOrFail(gc, "step_timeout:" + _step); return; }
-        if (_keys.Count > 0) { if (BotInput.CanAct && BotInput.PressKey(_keys.Peek())) _keys.Dequeue(); return; }
+        if (_keys.Count > 0)
+        {
+            // Keys.None = pause 700 ms (the chat box needs a moment to open before "/" is typed, otherwise "/" opens
+            // the market and the letters act as hotkeys, e.g. hideout edit mode).
+            if (_keys.Peek() == Keys.None) { if ((DateTime.UtcNow - _keyAt).TotalMilliseconds >= 700) { _keys.Dequeue(); _keyAt = DateTime.UtcNow; } return; }
+            if (BotInput.CanAct && BotInput.PressKey(_keys.Peek())) { _keys.Dequeue(); _keyAt = DateTime.UtcNow; }
+            return;
+        }
         if (gc.IsLoading || (DateTime.UtcNow - _actionAt).TotalMilliseconds < 400 || !BotInput.CanAct) return;
         switch (_step)
         {
@@ -240,7 +249,7 @@ public sealed class AwakeningMarketBuyer
     {
         _research = research;
         _log("market.go_home", new { reason, bought = Bought, spent = Spent, research });
-        foreach (var k in new[] { Keys.Escape, Keys.Return, Keys.OemQuestion, Keys.H, Keys.I, Keys.D, Keys.E, Keys.O, Keys.U, Keys.T, Keys.Return }) _keys.Enqueue(k);
+        foreach (var k in HideoutKeys) _keys.Enqueue(k);
         Set(Step.Home, "returning with /hideout (" + reason + ")");
     }
     private void GoHomeOrFail(GameController gc, string reason)
@@ -255,7 +264,7 @@ public sealed class AwakeningMarketBuyer
         {
             // Retry the chat command once if the first one was eaten (e.g. by a still-open window).
             if ((DateTime.UtcNow - _stepAt).TotalSeconds > 20 && (DateTime.UtcNow - _actionAt).TotalSeconds > 15)
-            { foreach (var k in new[] { Keys.Escape, Keys.Return, Keys.OemQuestion, Keys.H, Keys.I, Keys.D, Keys.E, Keys.O, Keys.U, Keys.T, Keys.Return }) _keys.Enqueue(k); _actionAt = DateTime.UtcNow; }
+            { foreach (var k in HideoutKeys) _keys.Enqueue(k); _actionAt = DateTime.UtcNow; }
             return;
         }
         if (_research) { _research = false; Set(Step.OpenMarket, "next seller"); return; }

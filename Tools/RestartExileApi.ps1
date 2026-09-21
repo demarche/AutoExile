@@ -60,7 +60,12 @@ $oldPid = $null; $oldMvid = $null
 if ($before -and $before.awakening) {
     $oldPid = $before.awakening.hostProcessId; $oldMvid = $before.awakening.loadedMvid
     Write-Host "Running host: pid=$oldPid mvid=$oldMvid mode=$($before.mode) phase=$($before.awakening.phase) bot_running=$($before.running)"
-    if ($before.running -and -not $Force) { Finish 1 'Refused: the bot is running. Send awakening.stop_after_map and wait for the Hideout stop (or pass -Force).' }
+    # A frozen host (game lost the foreground, plugin tick stalled > 60 s) cannot process stop commands: restart it anyway
+    # so Focus-Game brings the game back to the front.
+    $stale = $false
+    try { $obs = [DateTime]::Parse($before.awakening.observedUtc).ToUniversalTime(); $stale = ((Get-Date).ToUniversalTime() - $obs).TotalSeconds -gt 60 } catch { }
+    if ($stale) { Write-Host "Host tick stalled since $($before.awakening.observedUtc): restarting despite running=true." }
+    if ($before.running -and -not $Force -and -not $stale) { Finish 1 'Refused: the bot is running. Send awakening.stop_after_map and wait for the Hideout stop (or pass -Force).' }
 } else { Write-Host 'Control API not reachable (host not running or plugin not loaded).' }
 
 $started = Get-Date

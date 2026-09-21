@@ -173,7 +173,41 @@ namespace AutoExile.WebServer
 
         public void Dispose() => Stop();
 
-        public void UpdateStatus(BotStatusSnapshot status) => _currentStatus = status;
+        public void UpdateStatus(BotStatusSnapshot status) { _currentStatus = status; _statusUpdatedUtc = DateTime.UtcNow; }
+        private DateTime _statusUpdatedUtc = DateTime.UtcNow, _lastFocusAttemptUtc = DateTime.MinValue;
+
+        // ── Foreground watchdog ──
+        // Plugin ticks run only while Path of Exile is the foreground window. When something steals the focus during
+        // unattended farming the bot freezes silently; the HTTP thread keeps running, so it brings the game back.
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+        public static string FocusGame()
+        {
+            try
+            {
+                var game = System.Diagnostics.Process.GetProcesses()
+                    .FirstOrDefault(p => p.ProcessName.StartsWith("PathOfExile", StringComparison.OrdinalIgnoreCase) && p.MainWindowHandle != IntPtr.Zero);
+                if (game == null) return "game window not found";
+                if (GetForegroundWindow() == game.MainWindowHandle) return "already foreground";
+                keybd_event(0x12, 0, 0, UIntPtr.Zero);            // Alt down lets this process move the foreground
+                if (IsIconic(game.MainWindowHandle)) ShowWindow(game.MainWindowHandle, 9);
+                var ok = SetForegroundWindow(game.MainWindowHandle);
+                keybd_event(0x12, 0, 2, UIntPtr.Zero);            // Alt up
+                return "focused:" + ok;
+            }
+            catch (Exception ex) { return "error:" + ex.Message; }
+        }
+        private void ForegroundWatchdog()
+        {
+            if (Settings?.Running?.Value != true) return;
+            var now = DateTime.UtcNow;
+            if ((now - _statusUpdatedUtc).TotalSeconds < 20 || (now - _lastFocusAttemptUtc).TotalSeconds < 30) return;
+            _lastFocusAttemptUtc = now;
+            _log($"[Watchdog] no plugin tick for {(now - _statusUpdatedUtc).TotalSeconds:F0}s while running: {FocusGame()}");
+        }
 
         public bool TryDequeueCommand(out WebCommand command) =>
             _commandQueue.TryDequeue(out command!);
@@ -515,6 +549,7 @@ namespace AutoExile.WebServer
                 try
                 {
                     await Task.Delay(500, ct);
+                    ForegroundWatchdog();
 
                     List<WebSocket> clients;
                     lock (_wsLock) { clients = _wsClients.ToList(); }
@@ -570,6 +605,14 @@ namespace AutoExile.WebServer
                 var started = StartHostRestart(out var detail);
                 if (!started) resp.StatusCode = 500;
                 await ServeJson(resp, new { ok = started, action = cmd.Action, detail });
+                return;
+            }
+
+            if (cmd.Action == "host.focus_game")
+            {
+                if (!IPAddress.IsLoopback(req.RemoteEndPoint.Address))
+                { resp.StatusCode = 403; await ServeJson(resp, new { error = "host.focus_game is loopback-only" }); return; }
+                await ServeJson(resp, new { ok = true, action = cmd.Action, detail = FocusGame() });
                 return;
             }
 
