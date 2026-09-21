@@ -10,7 +10,7 @@ using AutoExile.Systems;
 
 namespace AutoExile.Modes.AwakeningBossRush;
 
-public enum ExchangeKind { BuyAtAsk, SellAtBid, ListAtAskMinus, Quote }
+public enum ExchangeKind { BuyAtAsk, SellAtBid, ListAtAskMinus, Quote, BuyAtBid }
 
 /// <summary>One order through Faustus' Currency Exchange. Want/Have follow the in-game panel.</summary>
 public sealed record ExchangeRequest(ExchangeKind Kind, string WantName, string HaveName, int Quantity, double MaxUnitChaos = 0, double UndercutChaos = 1);
@@ -215,6 +215,17 @@ public sealed class AwakeningExchange
             want = request.Quantity; have = (long)Math.Ceiling(request.Quantity * (double)rh / rw);
             if (have <= 0) { Fail("bad_amounts"); return; }
         }
+        else if (request.Kind == ExchangeKind.BuyAtBid)
+        {
+            // 2026-09-22: Horned Scarab asks jumped to 178c (cap 162c) while bids sat at 110-120c. Place a buy order
+            // one chaos above the best competing bid; it fills later and is collected on the next Faustus visit.
+            // Rivals here are other buyers: Get = chaos they give, Give = items they want → chaos per item = Get/Give.
+            if (rivals.Count == 0) { Fail("no_competing_bid"); return; }
+            var bestBid = rivals.Max(b => (double)b.Get / b.Give);
+            var unit = Math.Floor(bestBid) + request.UndercutChaos;
+            if (counter.Count > 0) unit = Math.Min(unit, Math.Ceiling(counter.Min(b => (double)b.Give / b.Get)));
+            want = request.Quantity; have = (long)Math.Ceiling(unit * request.Quantity);
+        }
         else if (request.Kind == ExchangeKind.SellAtBid)
         {
             // Bids (we want chaos, have the item): chaos per item = Get/Give; take the best one.
@@ -239,9 +250,9 @@ public sealed class AwakeningExchange
         }
         if (want <= 0 || have <= 0 || want > int.MaxValue || have > int.MaxValue) { Fail("bad_amounts"); return; }
         _orderWant = (int)want; _orderHave = (int)have;
-        var chaosPerItem = request.Kind == ExchangeKind.BuyAtAsk ? (double)have / want : (double)want / have;
+        var chaosPerItem = request.Kind is ExchangeKind.BuyAtAsk or ExchangeKind.BuyAtBid ? (double)have / want : (double)want / have;
         UnitChaos = chaosPerItem;
-        if (request.MaxUnitChaos > 0 && request.Kind == ExchangeKind.BuyAtAsk && chaosPerItem > request.MaxUnitChaos)
+        if (request.MaxUnitChaos > 0 && request.Kind is ExchangeKind.BuyAtAsk or ExchangeKind.BuyAtBid && chaosPerItem > request.MaxUnitChaos)
         { Fail($"price_above_cap:{chaosPerItem:F2}>{request.MaxUnitChaos:F2}"); return; }
         _log("exchange.order_planned", new { request, want, have, chaosPerItem });
         _fillAttempts = 0; Set(Step.FillWant, $"typing I Want {want}");
@@ -287,8 +298,8 @@ public sealed class AwakeningExchange
 
     private void TickAwait(GameController gc, Element panel)
     {
-        if (_request!.Kind == ExchangeKind.ListAtAskMinus)
-        { if ((DateTime.UtcNow - _stepAt).TotalSeconds > 2) Set(Step.Done, "listed (fills later)"); return; }
+        if (_request!.Kind is ExchangeKind.ListAtAskMinus or ExchangeKind.BuyAtBid)
+        { if ((DateTime.UtcNow - _stepAt).TotalSeconds > 2) Set(Step.Done, "order placed (fills later)"); return; }
         if (FinishedSlots(panel).Count == 0) { Status = "waiting for the order to fill"; return; }
         FilledWant = _orderWant; PaidHave = _orderHave;
         _collectClicks = 0; Set(Step.CollectResult, "collecting");

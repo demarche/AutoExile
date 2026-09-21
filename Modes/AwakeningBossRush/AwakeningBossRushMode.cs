@@ -169,6 +169,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
 
     private bool _manualContinuous;
     private bool _stopAfterMap, _ledgerStarted, _restockTried, _listingChecked, _restockBackToPrepare;
+    private readonly Dictionary<string, DateTime> _bidPending = new();
+    private DateTime _bidWaitStart;
     private readonly HashSet<string> _listedThisSession = new();
     private DateTime _restockEmptySince = DateTime.MinValue;
 
@@ -1100,8 +1102,27 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             if (!_exchange.Succeeded && done.Kind == ExchangeKind.ListAtAskMinus) _log.Event(Run, "listing.skipped", new { done.HaveName, _exchange.FailReason });
             if (!_exchange.Succeeded && done.Kind == ExchangeKind.BuyAtAsk)
             {
-                if (_exchange.FailReason.StartsWith("price_above_cap")) { Finish(ctx, AttemptOutcome.OperationalFailure, "restock_price_above_cap:" + done.WantName); return; }
-                if (economy.StopWhenOutOfChaos.Value) { Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:restock_failed:" + _exchange.FailReason); return; }
+                if (_exchange.FailReason.StartsWith("price_above_cap"))
+                {
+                    // Asks above the cap: place (once) a buy order just above the best bid and wait for it to fill.
+                    if (!_bidPending.ContainsKey(done.WantName))
+                    {
+                        _log.Event(Run, "restock.bid_instead", new { done.WantName, done.Quantity, cap = done.MaxUnitChaos, _exchange.FailReason });
+                        var rest = _restockQueue.ToArray(); _restockQueue.Clear();
+                        _restockQueue.Enqueue(done with { Kind = ExchangeKind.BuyAtBid });
+                        foreach (var q in rest) _restockQueue.Enqueue(q);
+                    }
+                    else _log.Event(Run, "restock.bid_already_pending", new { done.WantName, since = _bidPending[done.WantName] });
+                }
+                else if (economy.StopWhenOutOfChaos.Value) { Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:restock_failed:" + _exchange.FailReason); return; }
+            }
+            if (_exchange.Succeeded && done.Kind == ExchangeKind.BuyAtBid)
+            {
+                _bidPending[done.WantName] = DateTime.UtcNow;
+                _ledger.Price(done.WantName, _exchange.UnitChaos, "faustus_bid");
+                // The chaos is committed when the order is placed; count it as invested now (it fills later).
+                _ledger.Purchase(done.WantName, done.Quantity, _exchange.UnitChaos, "faustus_bid");
+                _log.Event(Run, "restock.bid_placed", new { done.WantName, done.Quantity, unit = _exchange.UnitChaos });
             }
         }
         if (_restockQueue.Count == 0)
@@ -1112,7 +1133,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             SetPhase(AwakeningPhase.IndexStash, "restock_complete_reindex"); return;
         }
         var next = _restockQueue.Peek();
-        if (next.Kind == ExchangeKind.BuyAtAsk)
+        if (next.Kind is ExchangeKind.BuyAtAsk or ExchangeKind.BuyAtBid)
         {
             var chaos = AwakeningExchange.CountHeld(ctx.Game, "Chaos Orb");
             var estimate = next.MaxUnitChaos / 1.5 * next.Quantity;
@@ -1177,11 +1198,23 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             {
                 _log.Event(Run, "materials.unresolved", entries.Select(x => new { x.ItemPath, x.BaseName, x.TabName }));
                 if (ctx.Settings.Awakening.Economy.AutoRestock.Value && !_restockTried) { PlanRestock(ctx); return; }
+                // A buy order is open for a missing material: idle in the Hideout, then revisit Faustus (which collects
+                // filled orders) every 3 minutes, for up to 2 hours.
+                if (ctx.Settings.Awakening.Economy.AutoRestock.Value && _bidPending.TryGetValue(name, out var bidAt) && (DateTime.UtcNow - bidAt).TotalHours < 2)
+                {
+                    if (_bidWaitStart == DateTime.MinValue) { _bidWaitStart = DateTime.UtcNow; _log.Event(Run, "restock.waiting_for_bid", new { name, bidAt }); }
+                    _phaseAt = DateTime.UtcNow;
+                    if ((DateTime.UtcNow - _bidWaitStart).TotalSeconds < 180) { Status = $"Waiting for the {name} buy order to fill ({(DateTime.UtcNow - _bidWaitStart).TotalSeconds:0}s)"; return; }
+                    _bidWaitStart = DateTime.MinValue; _restockTried = false; _indexStarted = false; ctx.StashIndex.Reset();
+                    if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible == true && BotInput.CanAct) BotInput.PressKey(Keys.Escape);
+                    return;
+                }
                 Finish(ctx, AttemptOutcome.OperationalFailure, "material_not_found:" + name); return;
             }
             materials.Add(new(name, matches[0].ItemPath));
         }
-        Run.Recipe = materials; _materialIndex = 0;
+        Run.Recipe = materials; _materialIndex = 0; _bidWaitStart = DateTime.MinValue;
+        foreach (var m in materials) _bidPending.Remove(m.Name);
         _log.Event(Run, "recipe.resolved", materials); SetPhase(AwakeningPhase.Withdraw, "withdraw_exact_recipe");
     }
     private void Withdraw(BotContext ctx)
