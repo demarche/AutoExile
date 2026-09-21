@@ -53,10 +53,22 @@ public sealed class AwakeningSupervisor
             // Cloud sync and file scanners can briefly deny replacement on Windows.
             // Only retry the already flushed replacement, never the command or its game action.
             // At most 85 ms of backoff; persistent failures still disarm before input starts.
-            int[] delaysMs = [10, 25, 50];
+            // 2026-09-22 23:23: OneDrive held the 1.3 MB checkpoint longer than 85 ms ("Access to the path is denied")
+            // and the loop stopped after a death. Back off up to ~1.5 s, then fall back to overwriting in place.
+            int[] delaysMs = [10, 25, 50, 100, 200, 400, 700];
             for (int retry = 0; ; retry++)
             {
                 try { _replaceCheckpoint(temp, _file); break; }
+                catch (Exception ex) when (retry >= delaysMs.Length &&
+                    (ex is UnauthorizedAccessException || ex is IOException && (ex.HResult & 0xffff) is 32 or 33))
+                {
+                    operation = "overwrite checkpoint";
+                    File.Copy(temp, _file, true);
+                    try { File.Delete(temp); } catch { }
+                    PersistenceRetries++;
+                    LastPersistenceWarning = "replace checkpoint failed; overwrote in place: " + ex.Message;
+                    break;
+                }
                 catch (Exception ex) when (retry < delaysMs.Length &&
                     (ex is UnauthorizedAccessException || ex is IOException && (ex.HResult & 0xffff) is 32 or 33))
                 {
