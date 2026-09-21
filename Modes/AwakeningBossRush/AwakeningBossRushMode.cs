@@ -387,7 +387,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             _inspectionStatus = "";
             _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
-            _mapRestockAttempted = false; _mapRestockStarted = false; _marketTried = false; _marketStarted = false;
+            _mapRestockAttempted = false; _mapRestockStarted = false; _marketTried = false; _marketStarted = false; _mapBossSkipped = false;
             _defensiveClear = false;
             _lootDefenseActive = false; _lootDefenseSuppressedUntil = DateTime.MinValue;
             _uniqueEvidence.Clear();
@@ -847,6 +847,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             Supervisor.Save();
         }
         if (Run.ActivationRequested) { Finish(ctx, AttemptOutcome.OperationalFailure, "activation_indeterminate_do_not_reactivate"); return; }
+        // stop_after_map must also hold when the previous map ended in deaths (the death path re-enters Prepare, not Finish(Success)).
+        if (_manualContinuous && _stopAfterMap) { _stopAfterMap = false; Finish(ctx, AttemptOutcome.OperationalFailure, "stop_after_map_before_new_map"); return; }
         if (StrictMapRecipe.Portals(ctx.Game).Any(p => !Run.PriorPortalIds.Contains(p.Id)))
         { Finish(ctx, AttemptOutcome.OperationalFailure, "unrecognized_portal_set_before_activation"); return; }
         if (!ctx.Settings.Awakening.ModCatalogValidated.Value) { WriteEvidence(ctx); Finish(ctx, AttemptOutcome.OperationalFailure, "preflight: validate 17 NG rules using map evidence"); return; }
@@ -923,12 +925,39 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (ctx.Interaction.IsBusy) return;
         var device = ctx.Game.EntityListWrapper.OnlyValidEntities.FirstOrDefault(e => e.IsTargetable &&
             e.Path.Contains("MappingDevice", StringComparison.OrdinalIgnoreCase));
-        if (device == null) return;
+        if (device == null) { Status = "Map device not found"; return; }
+        if (!NearDevice(ctx)) return;
         ctx.Interaction.InteractWithEntity(device, ctx.Navigation, false, requireVerified: true);
         var render = device.GetComponent<Render>();
         var point = ctx.Game.IngameState.Camera.WorldToScreen(render?.InteractCenterNum ?? device.BoundsCenterPosNum);
         _log.Event(Run, "prepare.device_interaction", new { device.Id, device.Path, point.X, point.Y, anchor = "interaction" });
     }
+    // After /hideout (market purchase) the character spawns at the hideout entrance, out of click range of the device.
+    // 2026-09-21: typing "/hideout" when the chat did not open sent the letters as hotkeys and left the hideout in
+    // edit mode ("Editing"), where clicking the map device selects the decoration instead of opening the Atlas.
+    private DateTime _editCheckAt;
+    private bool ExitHideoutEditing(BotContext ctx)
+    {
+        if ((DateTime.UtcNow - _editCheckAt).TotalSeconds < 2) return false;
+        _editCheckAt = DateTime.UtcNow;
+        var editing = AwakeningUiInspector.FindByText(ctx.Game.IngameState.IngameUi, "Editing");
+        if (editing == null || !BotInput.CanAct) return false;
+        var rect = editing.GetClientRect(); var w = ctx.Game.Window.GetWindowRectangle();
+        if (BotInput.Click(new Vector2(w.X + rect.Center.X, w.Y + rect.Center.Y)))
+        { _log.Event(Run, "hideout.exit_edit_mode", new { rect = rect.ToString() }); Status = "Leaving hideout edit mode"; }
+        return true;
+    }
+    private bool NearDevice(BotContext ctx)
+    {
+        if (ExitHideoutEditing(ctx)) return false;
+        var device = ctx.Game.EntityListWrapper.OnlyValidEntities.FirstOrDefault(e => e.Path.Contains("MappingDevice", StringComparison.OrdinalIgnoreCase));
+        if (device == null || device.DistancePlayer <= 40) { if (device != null && _walkingToDevice) { _walkingToDevice = false; ctx.Navigation.Stop(ctx.Game); } return true; }
+        if (!_walkingToDevice) _log.Event(Run, "hideout.walk_to_device", new { distance = device.DistancePlayer });
+        _walkingToDevice = true; _phaseAt = DateTime.UtcNow;
+        Navigate(ctx, device.GridPosNum); Status = $"Walking to the map device ({device.DistancePlayer:0})";
+        return false;
+    }
+    private bool _walkingToDevice;
     private static string? InventoryMaterialPath(BotContext ctx, string name)
     {
         try
@@ -1108,6 +1137,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     {
         if (!ctx.MapDevice.IsBusy)
         {
+            if (!NearDevice(ctx)) return;
             if (Run.ActivationConfirmed) { SetPhase(AwakeningPhase.EnterPortal, "enter_activated_map"); return; }
             if (Run.ActivationRequested) { Finish(ctx, AttemptOutcome.OperationalFailure, "activation_indeterminate_do_not_reactivate"); return; }
             var node = ctx.Game.Files.AtlasNodes.EntriesList.FirstOrDefault(n => n.Area != null && Regex.IsMatch(n.Area.Id + " " + n.Area.RawName, @"\bDunes?\b|MapWorldsDunes", RegexOptions.IgnoreCase));
@@ -1175,7 +1205,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         if (result == MapDeviceResult.Failed) Finish(ctx, AttemptOutcome.OperationalFailure, "map_device:" + Status);
     }
-    private bool _mapRestockAttempted, _mapRestockStarted;
+    private bool _mapRestockAttempted, _mapRestockStarted, _mapBossSkipped;
     private void RestockMap(BotContext ctx)
     {
         if ((DateTime.UtcNow - _phaseAt).TotalSeconds > 60)
@@ -1232,6 +1262,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _market.Start(ctx.Game, MarketRequest(ctx, ctx.Settings.Awakening.Economy.MapBuyCount.Value)); _marketStarted = true; return;
         }
         if (_market.Busy) { _market.Tick(ctx); Status = _market.Status; return; }
+        // The market / results pane stays open after a purchase and blocks the map device click.
+        if (AwakeningMarketBuyer.MarketOpen(ctx.Game)) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); Status = "Closing the market"; return; }
         RecordMarketResult("auto");
         _log.Event(Run, "market.restock_done", new { ok = _market.Succeeded, bought = _market.Bought, spent = _market.Spent, reason = _market.FailReason });
         if (_market.Succeeded) { _mapRestockAttempted = false; SetPhase(AwakeningPhase.OpenMap, "market_maps_bought"); return; }
@@ -1798,7 +1830,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding) ctx.Navigation.Stop(ctx.Game);
         UpdateInvitation(ctx, Run.ActivationConfirmed);
         if (Run.Invitation == InvitationDecision.Unknown) { Finish(ctx, AttemptOutcome.OperationalFailure, "invitation_state_unknown"); return; }
-        if (Run.Invitation == InvitationDecision.Yes && !Run.MapBossKilled) { _damage.Reset(DateTime.UtcNow); SetPhase(AwakeningPhase.MapBoss, "Exarch_invitation_due"); return; }
+        // 2026-09-21: the map boss (Exarch invitation) killed the character 4 times in a row on one map and burned the portals.
+        // After 2 deaths on this map the invitation is given up: bank the pinnacle loot and leave instead.
+        if (Run.Invitation == InvitationDecision.Yes && !Run.MapBossKilled && Run.Deaths >= 2)
+        {
+            if (!_mapBossSkipped) { _mapBossSkipped = true; _log.Event(Run, "mapboss.skipped", new { Run.Deaths, reason = "deaths_on_this_map" }); }
+        }
+        else if (Run.Invitation == InvitationDecision.Yes && !Run.MapBossKilled) { _damage.Reset(DateTime.UtcNow); SetPhase(AwakeningPhase.MapBoss, "Exarch_invitation_due"); return; }
         if (Run.Invitation == InvitationDecision.Yes && Run.MapBossKilled && !Run.InvitationLooted) { Finish(ctx, AttemptOutcome.OperationalFailure, "invitation_drop_not_confirmed"); return; }
         if (!AwakeningBossTracker.AllTrackedDead(Run)) { SetPhase(AwakeningPhase.Scout, "encounter_requires_recheck"); return; }
         if (!AwakeningBossTracker.Complete(Run, DateTime.UtcNow, out var basis))

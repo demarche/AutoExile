@@ -34,7 +34,7 @@ public sealed class AwakeningMarketBuyer
     private string _seller = "", _homeArea = "";
     private long _homeHash, _sellerHash;
     private double _firstPrice;
-    private int _gridCountBefore = -1, _pendingIndex = -1, _failedClicks, _searches;
+    private int _gridCountBefore = -1, _pendingIndex = -1, _failedClicks, _searches, _mapsBefore;
     private double _pendingPrice;
     private string _pendingName = "";
 
@@ -63,6 +63,9 @@ public sealed class AwakeningMarketBuyer
         if (!Busy || _request == null) return;
         var gc = ctx.Game;
         if ((DateTime.UtcNow - _startedAt).TotalMinutes > 15) { GoHomeOrFail(gc, "overall_timeout:" + _step); return; }
+        // A travel click that never leaves the hideout (seller offline / listing gone): try the next seller.
+        if (_step == Step.Arrive && _sellerHash == 0 && AreaHash(gc) == _homeHash && (DateTime.UtcNow - _stepAt).TotalSeconds > 20 && _searches < 6)
+        { _log("market.travel_failed", new { seller = _seller }); _skippedSellers.Add(_seller); Set(Step.Search, "travel failed, next seller"); return; }
         var limit = _step switch { Step.Arrive or Step.Home => 60, Step.Buy => 180, _ => 25 };
         if ((DateTime.UtcNow - _stepAt).TotalSeconds > limit) { GoHomeOrFail(gc, "step_timeout:" + _step); return; }
         if (_keys.Count > 0) { if (BotInput.CanAct && BotInput.PressKey(_keys.Peek())) _keys.Dequeue(); return; }
@@ -172,8 +175,8 @@ public sealed class AwakeningMarketBuyer
         var items = grid.Children.Where(x => x != null && x.IsVisible).ToList();
         if (_pendingIndex >= 0)
         {
-            // Verify the previous Ctrl+click: the grid loses one element when the purchase went through.
-            if (items.Count < _gridCountBefore)
+            // Verify the previous Ctrl+click by our own inventory (another buyer can empty a slot of the seller's grid at the same time).
+            if (MapsInInventory(gc) > _mapsBefore)
             {
                 Bought++; Spent += _pendingPrice; _failedClicks = 0;
                 var mods = _pendingName.Split('\n');
@@ -196,7 +199,7 @@ public sealed class AwakeningMarketBuyer
         {
             var check = CheckSellerItem(gc, items[i], r, cap);
             if (check.Reject != null) continue;
-            _gridCountBefore = items.Count; _pendingIndex = i; _pendingPrice = check.Price; _pendingName = string.Join("\n", check.Mods);
+            _gridCountBefore = items.Count; _pendingIndex = i; _mapsBefore = MapsInInventory(gc); _pendingPrice = check.Price; _pendingName = string.Join("\n", check.Mods);
             if (BotInput.CtrlClick(Abs(gc, items[i].GetClientRect().Center))) { _actionAt = _clickAt = DateTime.UtcNow; Status = $"Market: Ctrl+click {check.Price:0.#}c ({Bought}/{r.Count})"; }
             else _pendingIndex = -1;
             return;
@@ -273,6 +276,8 @@ public sealed class AwakeningMarketBuyer
     }
 
     // ── UI helpers ───────────────────────────────────────────────────
+    /// <summary>True while the market or its results pane is still open (the caller closes it with Escape before using the map device).</summary>
+    public static bool MarketOpen(GameController gc) => MarketRoot(gc) != null || ResultsPane(gc) != null;
     private static Element? MarketRoot(GameController gc) =>
         Roots(gc).FirstOrDefault(r => Text(Child(r, 1)) == "The Market");
     // The results pane stays in the tree after it is closed, so its visibility (child 0) must be checked.
@@ -299,6 +304,7 @@ public sealed class AwakeningMarketBuyer
         try { var items = StashSystem.GetInventorySlotItems(gc); return 60 - (items?.Sum(i => Math.Max(1, i.SizeX * i.SizeY)) ?? 0); }
         catch { return 60; }
     }
+    private static int MapsInInventory(GameController gc) { try { return StashSystem.CountInventoryItems(gc, "Metadata/Items/Maps/MapKeyTier16"); } catch { return 0; } }
     private static long AreaHash(GameController gc) { try { return (long)gc.IngameState.Data.CurrentAreaHash; } catch { return 0; } }
     private void Set(Step step, string status) { _step = step; _stepAt = DateTime.UtcNow; Status = "Market: " + status; }
     private void Fail(string reason) { FailReason = reason; _log("market.failed", new { reason, step = _step.ToString(), bought = Bought }); _step = Step.Failed; Status = "Market failed: " + reason; }
