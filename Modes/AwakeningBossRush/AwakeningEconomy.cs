@@ -111,26 +111,69 @@ public sealed class AwakeningLedger
     }
 }
 
-/// <summary>Dumps visible UI element trees so new panels (Faustus exchange, market) can be calibrated without screenshots.</summary>
+/// <summary>Dumps visible UI element trees and drives single UI actions so new panels (Faustus exchange, market) can be calibrated without screenshots.</summary>
 public static class AwakeningUiInspector
 {
-    public static string Dump(GameController gc, string directory, string label, int maxDepth = 9)
+    public static string Dump(GameController gc, string directory, string label, string? rootPath = null, int maxDepth = 9)
     {
         var root = gc.IngameState.IngameUi;
         var nodes = new List<object>();
-        var children = root.Children;
-        for (var i = 0; i < children.Count; i++)
+        if (!string.IsNullOrWhiteSpace(rootPath))
         {
-            var child = children[i];
-            if (child?.IsVisible != true) continue;
-            nodes.Add(Node(child, i.ToString(), 0, maxDepth));
+            var start = FindByPath(root, rootPath);
+            if (start != null) nodes.Add(Node(start, rootPath, 0, maxDepth));
+        }
+        else
+        {
+            var children = root.Children;
+            for (var i = 0; i < children.Count; i++)
+            {
+                var child = children[i];
+                if (child?.IsVisible != true) continue;
+                nodes.Add(Node(child, i.ToString(), 0, maxDepth));
+            }
         }
         object? exchange = null;
-        try { var panel = gc.IngameState.IngameUi.CurrencyExchangePanel; if (panel?.IsVisible == true) exchange = Node(panel, "CurrencyExchangePanel", 0, maxDepth + 3); } catch { }
+        try { var panel = gc.IngameState.IngameUi.CurrencyExchangePanel; if (rootPath == null && panel?.IsVisible == true) exchange = Node(panel, "CurrencyExchangePanel", 0, maxDepth + 3); } catch { }
         var file = Path.Combine(directory, $"ui-{label}-{DateTime.Now:yyyyMMdd-HHmmss}.json");
         File.WriteAllText(file, JsonSerializer.Serialize(new { utc = DateTime.UtcNow, label, window = gc.Window.GetWindowRectangle().ToString(), visibleRoots = nodes, exchange },
             new JsonSerializerOptions { WriteIndented = false }));
         return file;
+    }
+    /// <summary>"50,2,3" = IngameUi child 50 → child 2 → child 3.</summary>
+    public static Element? FindByPath(Element root, string path)
+    {
+        Element? e = root;
+        foreach (var part in path.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (e == null || !int.TryParse(part, out var i)) return null;
+            try { e = e.GetChildAtIndex(i); } catch { return null; }
+        }
+        return e;
+    }
+    /// <summary>First visible element whose text equals (or, with a trailing *, starts with) the given text.</summary>
+    public static Element? FindByText(Element root, string text, string? underPath = null)
+    {
+        var start = underPath != null ? FindByPath(root, underPath) : root;
+        if (start == null) return null;
+        var prefix = text.EndsWith('*'); var needle = prefix ? text[..^1] : text;
+        var stack = new Stack<(Element, int)>(); stack.Push((start, 0));
+        while (stack.Count > 0)
+        {
+            var (e, d) = stack.Pop();
+            IList<Element>? kids = null;
+            try { kids = e.Children; } catch { }
+            if (kids == null || d > 14) continue;
+            for (var i = kids.Count - 1; i >= 0; i--)
+            {
+                var k = kids[i];
+                if (k == null || !k.IsVisible) continue;
+                string t = ""; try { t = k.Text ?? ""; } catch { }
+                if (prefix ? t.Trim().StartsWith(needle, StringComparison.OrdinalIgnoreCase) : t.Trim().Equals(needle, StringComparison.OrdinalIgnoreCase)) return k;
+                stack.Push((k, d + 1));
+            }
+        }
+        return null;
     }
     private static object Node(Element e, string path, int depth, int maxDepth)
     {
@@ -143,7 +186,7 @@ public static class AwakeningUiInspector
             try
             {
                 var list = e.Children;
-                for (var i = 0; i < list.Count && i < 120; i++)
+                for (var i = 0; i < list.Count && i < 150; i++)
                     if (list[i] != null && list[i].IsVisible) kids.Add(Node(list[i], path + "," + i, depth + 1, maxDepth));
             }
             catch { }

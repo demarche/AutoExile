@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
+using ExileCore.PoEMemory;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
@@ -26,6 +27,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private readonly AwakeningLedger _ledger;
     private readonly AwakeningExchange _exchange;
     private bool _exchangeManual;
+    private readonly Queue<Keys> _uiKeys = new();
+    private static Element? ResolveUi(BotContext ctx, string spec)
+    {
+        var root = ctx.Game.IngameState.IngameUi;
+        var at = spec.IndexOf('@'); string? under = at > 0 ? spec[(at + 1)..] : null; if (at > 0) spec = spec[..at];
+        if (spec.StartsWith("path:")) return AwakeningUiInspector.FindByPath(root, spec[5..]);
+        if (spec.StartsWith("text:")) return AwakeningUiInspector.FindByText(root, spec[5..], under);
+        return null;
+    }
     private readonly Queue<ExchangeRequest> _restockQueue = new();
     private ExchangeRequest? _restockCurrent;
     private int _restockSales;
@@ -199,8 +209,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (action == "inspect_ui")
         {
             // Read-only: dumps the visible UI trees (e.g. an open Faustus exchange or market) for calibration.
-            var label = Regex.Replace(string.IsNullOrWhiteSpace(review) ? "manual" : review, @"[^A-Za-z0-9_-]", "");
-            var file = AwakeningUiInspector.Dump(ctx.Game, _directory, label);
+            // value = "label" or "label|rootPath|depth"
+            var parts = (review ?? "").Split('|');
+            var label = Regex.Replace(string.IsNullOrWhiteSpace(parts[0]) ? "manual" : parts[0], @"[^A-Za-z0-9_-]", "");
+            var depth = parts.Length > 2 && int.TryParse(parts[2], out var dd) ? dd : 9;
+            var file = AwakeningUiInspector.Dump(ctx.Game, _directory, label, parts.Length > 1 && parts[1].Length > 0 ? parts[1] : null, depth);
             _log.Event(Run, "ui.inspected", new { file });
             return Supervisor.RecordCommand(id, "inspected:" + Path.GetFileName(file));
         }
@@ -223,6 +236,38 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             return Supervisor.RecordCommand(id, "exchange_started:" + request.Kind);
         }
         if (action == "exchange_cancel") { _exchange.Cancel(); _exchangeManual = false; return Supervisor.RecordCommand(id, "exchange_cancelled"); }
+        if (action is "ui_click" or "ui_type" or "ui_key")
+        {
+            // Calibration helpers (bot stopped): value "path:50,2,3" or "text:Search" [+ "@underPath"], then "|right|ctrl" or "|<text to type>".
+            if (ctx.Settings.Running.Value || HasActiveAttempt) return "rejected: stop the loop first";
+            var parts = (review ?? "").Split('|');
+            if (action == "ui_key")
+            {
+                foreach (var k in parts[0].Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                    if (Enum.TryParse<Keys>(k, true, out var key)) _uiKeys.Enqueue(key); else return "rejected: unknown key " + k;
+                return Supervisor.RecordCommand(id, "keys_queued:" + _uiKeys.Count);
+            }
+            var target = ResolveUi(ctx, parts[0]);
+            if (target == null) return Supervisor.RecordCommand(id, "not_found:" + parts[0]);
+            var rect = target.GetClientRect(); var w = ctx.Game.Window.GetWindowRectangle();
+            var abs = new Vector2(w.X + rect.Center.X, w.Y + rect.Center.Y);
+            if (action == "ui_click")
+            {
+                var right = parts.Contains("right"); var ctrl = parts.Contains("ctrl");
+                var ok = ctrl ? (right ? BotInput.CtrlRightClick(abs) : BotInput.CtrlClick(abs)) : right ? BotInput.RightClick(abs) : BotInput.Click(abs);
+                return Supervisor.RecordCommand(id, (ok ? "clicked:" : "click_blocked:") + rect);
+            }
+            if (!BotInput.Click(abs)) return Supervisor.RecordCommand(id, "click_blocked");
+            for (var i = 0; i < 30; i++) _uiKeys.Enqueue(Keys.Back);
+            foreach (var ch in (parts.Length > 1 ? parts[1] : "").ToUpperInvariant())
+            {
+                if (char.IsLetterOrDigit(ch)) _uiKeys.Enqueue((Keys)ch);
+                else if (ch == ' ') _uiKeys.Enqueue(Keys.Space);
+                else if (ch == '.') _uiKeys.Enqueue(Keys.OemPeriod);
+                else if (ch == '-') _uiKeys.Enqueue(Keys.OemMinus);
+            }
+            return Supervisor.RecordCommand(id, "typing_queued:" + _uiKeys.Count + ":" + rect);
+        }
         if (action == "economy_reset") { _ledger.ResetSession(); return Supervisor.RecordCommand(id, "economy_reset"); }
         if (action == "fresh")
         {
@@ -355,6 +400,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         _ctx = ctx;
         _observedUtc = DateTime.UtcNow;
         if (_shutdownRequested) { ctx.Settings.Running.Value = false; return; }
+        if (_uiKeys.Count > 0 && BotInput.CanAct && BotInput.PressKey(_uiKeys.Peek())) _uiKeys.Dequeue();
         if (_exchangeManual)
         {
             if (_exchange.Busy) { _exchange.Tick(ctx); Status = _exchange.Status; }
