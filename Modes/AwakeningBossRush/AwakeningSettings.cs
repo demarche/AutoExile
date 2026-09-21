@@ -6,14 +6,18 @@ namespace AutoExile.Modes.AwakeningBossRush;
 [Submenu]
 public sealed class AwakeningSettings
 {
-    [Menu("Allow manual Insert start", "From Hideout, Insert starts continuous farming. Verified success and stash completion start the next map. Insert, missing supplies or an operational failure stop the loop. No Codex code review is claimed.")]
+    [Menu("Allow manual Insert start", "From Hideout, Insert starts continuous farming. Verified success and stash completion start the next map. Death also returns to the Hideout and continues (see Continue after death). Insert, missing supplies or an operational failure stop the loop. No Codex code review is claimed.")]
     public ToggleNode AllowManualStart { get; set; } = new(false);
+    [Menu("Continue after death", "During Insert continuous farming, a death returns to the Hideout, stashes, and retries the remaining portals or opens a new map until materials run out. Off = stop after a death.")]
+    public ToggleNode ContinueAfterDeath { get; set; } = new(true);
+    [Menu("Loot defense radius (grids)", "While looting, only enemies closer than this interrupt pickup. Farther enemies never pull the bot away from the drops.")]
+    public RangeNode<int> LootDefenseRadius { get; set; } = new(30, 10, 60);
     [Menu("Calibrated Atlas node offset")]
     public RangeNode<int> AtlasNodeOffset { get; set; } = new(2, -10, 10);
     [Menu("Calibrated Exarch choice index", "-1 uses the typed option name. Set only after observing the actual device icons.")]
     public RangeNode<int> ExarchChoiceIndex { get; set; } = new(-1, -1, 2);
     [Menu("Minimum extra loot (chaos/stack)")]
-    public RangeNode<float> MinStackChaos { get; set; } = new(5, 0, 1000);
+    public RangeNode<float> MinStackChaos { get; set; } = new(1, 0, 1000);
     [Menu("Attempt timeout (seconds)")]
     public RangeNode<int> TimeoutSeconds { get; set; } = new(300, 30, 300);
     [Menu("Map purchase cost (chaos)", "0 = unknown; prevents misleading net profit estimates.")]

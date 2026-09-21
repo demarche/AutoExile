@@ -562,8 +562,38 @@ namespace AutoExile.WebServer
                 return;
             }
 
+            if (cmd.Action == "host.restart")
+            {
+                // Handled on the HTTP thread: works even when game ticks are paused. Loopback only.
+                if (!IPAddress.IsLoopback(req.RemoteEndPoint.Address))
+                { resp.StatusCode = 403; await ServeJson(resp, new { error = "host.restart is loopback-only" }); return; }
+                var started = StartHostRestart(out var detail);
+                if (!started) resp.StatusCode = 500;
+                await ServeJson(resp, new { ok = started, action = cmd.Action, detail });
+                return;
+            }
+
             _commandQueue.Enqueue(cmd);
             await ServeJson(resp, new { ok = true, action = cmd.Action });
+        }
+
+        // Spawns Tools/RestartExileApi.ps1 detached: it kills Loader.exe (this process), restarts it and verifies the
+        // recompiled AutoExile build via /api/status. The result is written to Tools/RestartExileApi.last.txt.
+        private static bool StartHostRestart(out string detail)
+        {
+            try
+            {
+                var root = Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory;
+                var script = Path.Combine(root, "Plugins", "Source", "AutoExile", "Tools", "RestartExileApi.ps1");
+                if (!File.Exists(script)) { detail = "script not found: " + script; return false; }
+                var psi = new System.Diagnostics.ProcessStartInfo("powershell.exe",
+                    $"-NoProfile -ExecutionPolicy Bypass -WindowStyle Minimized -File \"{script}\" -NoPause")
+                { UseShellExecute = true, WorkingDirectory = root, WindowStyle = System.Diagnostics.ProcessWindowStyle.Minimized };
+                var process = System.Diagnostics.Process.Start(psi);
+                detail = "restart script started pid=" + process?.Id;
+                return process != null;
+            }
+            catch (Exception ex) { detail = ex.Message; return false; }
         }
 
         private async Task HandleGetSettings(SimpleHttpResponse resp)

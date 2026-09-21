@@ -36,3 +36,4 @@ deploy.bat
 Thumbs.db
 Desktop.ini
 .DS_Store
+Tools/RestartExileApi.last.txt

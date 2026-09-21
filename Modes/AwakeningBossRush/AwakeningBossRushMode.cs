@@ -54,8 +54,32 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private int _reportedPersistenceRetries;
     private bool _shutdownRequested;
     private bool _deviceStockChecked;
+    private DateTime _deviceStockFirstRead = DateTime.MinValue, _priceWaitSince = DateTime.MinValue;
     private bool _defensiveClear;
     private readonly SparkProgressTracker _scoutDamage = new();
+    // Loot defense: hold position and Spark only enemies that are actually close to the drops.
+    private readonly SparkProgressTracker _lootDefenseDamage = new();
+    private bool _lootDefenseActive;
+    private DateTime _areaMismatchSince = DateTime.MinValue;
+    private readonly Dictionary<long, int> _unblockAttempts = new();
+    private DateTime _unblockUntil = DateTime.MinValue;
+    private readonly HashSet<long> _scoutIgnored = new();
+    private readonly Dictionary<long, DateTime> _pushIgnoredUntil = new();
+    private bool _dropSiteReached;
+    // Safety: degen ground, Exarch daemons, known dangerous boss effects and "Bearer" monsters are never stood in;
+    // a burst of damage or standing in a hazard triggers an escape (movement skill such as Frostblink when ready).
+    private readonly Queue<(DateTime At, float Pool)> _poolHistory = new();
+    private DateTime _escapeUntil = DateTime.MinValue, _lastBlinkAt = DateTime.MinValue;
+    private readonly HashSet<string> _hazardKinds = new();
+    private static readonly Regex DangerAnimation = new(@"Sirus/desolation|Maven/gravity_well|Shaper/vortex|Elder/decay|Exarch/searing_rune|Exarch/flame_wall|/slam/buildup|/explosion/buildup",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    public const float BearerAvoidRadius = 30, BurstFraction = 0.35f;
+    // Skipped drops are only skipped for this entry: a re-entry (new camera, no HUD overlap) retries them.
+    private readonly HashSet<long> _lootSkipped = new();
+    private bool _lootInterrupted, _enRouteLoot;
+    private DateTime _enRouteScanAt = DateTime.MinValue;
+    public const double EnRouteMinChaos = 10, EnRouteRadius = 60;
+    private DateTime _lootDefenseStarted, _lootDefenseSuppressedUntil;
     private DateTime _scoutRepositionUntil;
     private DateTime _scoutPositionSince;
     private DateTime _bossPositionSince;
@@ -101,7 +125,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // Called on the frame thread: background HTTP serialization must never enumerate live collections.
     public JsonElement Snapshot() => JsonSerializer.SerializeToElement(new { hostProcessId = Environment.ProcessId, hostExecutable = Environment.ProcessPath,
         shutdownRequested = _shutdownRequested, generation = Supervisor.Generation, loadedMvid = Supervisor.Mvid, armed = Supervisor.State.Armed,
-        phase = Run.Phase.ToString(), Status, Decision, manualContinuous = _manualContinuous, run = Run, lastCommand = Supervisor.LastCommand,
+        phase = Run.Phase.ToString(), Status, Decision, manualContinuous = _manualContinuous, stopAfterMap = _stopAfterMap, run = Run, lastCommand = Supervisor.LastCommand,
         phaseStartedUtc = _phaseAt,
         inspecting = _inspecting, inspectionStatus = _inspectionStatus,
         commandRequestId = _commandRequestId, commandResult = _commandResult, observedUtc = _observedUtc,
@@ -112,6 +136,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private void RefreshAnalysis() => _risks = AwakeningModRiskAnalyzer.Analyze(Supervisor.State.History.Append(Run)).Take(30).ToArray();
 
     private bool _manualContinuous;
+    private bool _stopAfterMap;
+    private DateTime _restockEmptySince = DateTime.MinValue;
 
     public void ManualStart(BotContext ctx, string source = "user_insert")
     {
@@ -135,7 +161,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (armed.StartsWith("rejected:")) { Status = armed; return; }
         var begun = Send("begin");
         if (begun.StartsWith("rejected:")) { Status = begun; return; }
-        _manualContinuous = true;
+        _manualContinuous = true; _stopAfterMap = false;
         _log.Event(Run, "attempt.manual_started", new { source, oneAttempt = false });
     }
     public string Command(BotContext ctx, string action, string id, string generation, string review, string mvid)
@@ -220,6 +246,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             Finish(ctx, AttemptOutcome.Timeout, "external_300_second_deadline");
             return Supervisor.RecordCommand(id, "timeout_recorded");
         }
+        if (action == "stop_after_map")
+        {
+            // Graceful stop: never abandon a map whose materials are already spent. The loop finishes the current
+            // map (loot, return, stash) and stops in the Hideout before opening the next one.
+            if (!_manualContinuous) return Supervisor.RecordCommand(id, "not_running");
+            _stopAfterMap = true;
+            _log.Event(Run, "manual_loop.stop_requested", new { Run.Phase, Run.ActivationRequested, Run.ActivationConfirmed });
+            return Supervisor.RecordCommand(id, "stop_after_map_armed");
+        }
         if (action == "return")
         {
             if (Run.Outcome == AttemptOutcome.None || ctx.Settings.Running.Value) return "rejected: return requires stopped terminal attempt";
@@ -233,14 +268,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (result.EndsWith(":begun", StringComparison.Ordinal))
         {
             _inspectionStatus = "";
-            _deviceStockChecked = false;
+            _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
             _mapRestockAttempted = false; _mapRestockStarted = false;
             _defensiveClear = false;
+            _lootDefenseActive = false; _lootDefenseSuppressedUntil = DateTime.MinValue;
             _uniqueEvidence.Clear();
             _scoutRepositionUntil = DateTime.MinValue;
             _deviceMaterialPaths.Clear();
             _materialIndex = 0; _withdrawing = false; _indexStarted = false; _lootId = 0;
-            _lootAttempts.Clear(); _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
+            _lootAttempts.Clear(); _unblockAttempts.Clear(); _scoutIgnored.Clear(); _lootSkipped.Clear(); _lootInterrupted = false; _enRouteLoot = false; _pushIgnoredUntil.Clear(); _dropSiteReached = false; _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
             _lastClock = Stopwatch.GetTimestamp(); _phaseAt = DateTime.UtcNow; _lastPosition = ctx.Game.Player.GridPosNum;
             _lastProgress = DateTime.UtcNow; _damage.Reset(DateTime.UtcNow);
             Run.BuildConfiguration = AwakeningJson.Serialize(AutoExile.WebServer.SettingsApi.SerializeFlat(ctx.Settings)
@@ -302,8 +338,18 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             { Finish(ctx, AttemptOutcome.OperationalFailure, "unexpected_map_before_activation"); return; }
             if (!inMap && Run.EnteredUtc.HasValue && Run.Outcome == AttemptOutcome.None && Run.Phase is AwakeningPhase.Scout or AwakeningPhase.Fight or AwakeningPhase.Loot or AwakeningPhase.MapBoss)
             { Finish(ctx, AttemptOutcome.OperationalFailure, "left_map_before_objective_complete"); return; }
-            if (inMap && Run.Instance != 0 && Run.Instance != (long)gc.IngameState.Data.CurrentAreaHash && Run.Outcome == AttemptOutcome.None)
-            { Finish(ctx, AttemptOutcome.OperationalFailure, "unexpected_area_change"); return; }
+            // CurrentAreaHash flips to the Hideout before Area.CurrentArea does, so a return portal briefly looks like
+            // "in a map with a different instance". Only a mismatch that persists (and never while returning) is real.
+            bool areaMismatch = inMap && Run.Instance != 0 && Run.Instance != (long)gc.IngameState.Data.CurrentAreaHash && Run.Outcome == AttemptOutcome.None;
+            if (!areaMismatch || Run.Phase is AwakeningPhase.Return or AwakeningPhase.OpenStash or AwakeningPhase.ExternalStash)
+                _areaMismatchSince = DateTime.MinValue;
+            else
+            {
+                if (_areaMismatchSince == DateTime.MinValue) _areaMismatchSince = now;
+                if ((now - _areaMismatchSince).TotalSeconds >= 2)
+                { _areaMismatchSince = DateTime.MinValue; Finish(ctx, AttemptOutcome.OperationalFailure, "unexpected_area_change"); }
+                return;
+            }
             if (inMap && Run.Outcome == AttemptOutcome.None && !Run.EnteredUtc.HasValue && Run.ActivationConfirmed)
             {
                 var hash = (long)(gc.IngameState.Data.CurrentAreaHash);
@@ -331,7 +377,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 AwakeningBossTracker.Observe(Run, samples, now);
                 if (Run.Phase != AwakeningPhase.MapBoss) _damage.Observe(samples.Select(s => new MonsterHealthSample(s.Id, s.Health)), now);
                 ObserveMapBoss(ctx);
-                if (Run.BossesCompleted && !AwakeningBossTracker.Complete(Run))
+                if (Run.BossesCompleted && !AwakeningBossTracker.AllTrackedDead(Run))
                 {
                     Run.BossesCompleted = false;
                     if (Run.Outcome == AttemptOutcome.None && Run.Phase is AwakeningPhase.Loot or AwakeningPhase.MapBoss)
@@ -403,7 +449,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 && Run.Phase is AwakeningPhase.Prepare or AwakeningPhase.Withdraw or AwakeningPhase.OpenMap or AwakeningPhase.EnterPortal or AwakeningPhase.OpenStash or AwakeningPhase.ExternalStash or AwakeningPhase.Return or AwakeningPhase.IndexStash)
             {
                 if (Run.RecoveryRequired)
-                { Run.RecoveryRequired = false; ctx.Settings.Running.Value = false; CancelInput(ctx); SetPhase(AwakeningPhase.AwaitingReview, "return_failed_after_terminal_attempt"); }
+                { Run.RecoveryRequired = false; ctx.Settings.Running.Value = false; CancelInput(ctx); StopContinuousLoop("return_failed_after_terminal_attempt"); SetPhase(AwakeningPhase.AwaitingReview, "return_failed_after_terminal_attempt"); }
                 else Finish(ctx, AttemptOutcome.OperationalFailure, "phase_timeout:" + Run.Phase + ":" + Status);
                 return;
             }
@@ -415,10 +461,10 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 case AwakeningPhase.OpenMap: OpenMap(ctx); break;
                 case AwakeningPhase.RestockMap: RestockMap(ctx); break;
                 case AwakeningPhase.EnterPortal: EnterPortal(ctx); break;
-                case AwakeningPhase.Scout: Scout(ctx); break;
-                case AwakeningPhase.Fight: Fight(ctx, false); break;
-                case AwakeningPhase.Loot: Loot(ctx); break;
-                case AwakeningPhase.MapBoss: Fight(ctx, true); break;
+                case AwakeningPhase.Scout: if (!SafetyTick(ctx)) Scout(ctx); break;
+                case AwakeningPhase.Fight: if (!SafetyTick(ctx)) Fight(ctx, false); break;
+                case AwakeningPhase.Loot: if (!SafetyTick(ctx)) Loot(ctx); break;
+                case AwakeningPhase.MapBoss: if (!SafetyTick(ctx)) Fight(ctx, true); break;
                 case AwakeningPhase.Return: Return(ctx); break;
                 case AwakeningPhase.OpenStash: OpenStash(ctx); break;
                 case AwakeningPhase.ExternalStash: ExternalStash(ctx); break;
@@ -427,7 +473,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         catch (Exception ex)
         {
             if (Run.RecoveryRequired)
-            { Run.RecoveryRequired = false; ctx.Settings.Running.Value = false; CancelInput(ctx); SetPhase(AwakeningPhase.AwaitingReview, "recovery_exception:" + ex.Message); }
+            { Run.RecoveryRequired = false; ctx.Settings.Running.Value = false; CancelInput(ctx); StopContinuousLoop("recovery_exception:" + ex.Message); SetPhase(AwakeningPhase.AwaitingReview, "recovery_exception:" + ex.Message); }
             else Finish(ctx, AttemptOutcome.OperationalFailure, "exception:" + ex);
         }
     }
@@ -517,6 +563,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         _log.Event(Run, "attempt.ended", new { outcome, reason, Run.ReturnedToHideout, Run.StashCompleted, Run.BossesCompleted,
             Run.RevenueChaos, Run.RevenueKnown, Run.CostChaos, Run.CostKnown, Run.OperatingSeconds, Run.PhaseSeconds, Run.Deaths, Run.UnresolvedLoot });
         WriteEvidence(ctx);
+        if (_manualContinuous && _stopAfterMap && outcome == AttemptOutcome.Success)
+        { _stopAfterMap = false; StopContinuousLoop("stop_after_map"); return; }
         if (_manualContinuous && outcome == AttemptOutcome.Success && Run.ReturnedToHideout && Run.StashCompleted &&
             Supervisor.StorageError.Length == 0 && ctx.Game.Area?.CurrentArea?.IsHideout == true)
         {
@@ -535,13 +583,59 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             }
             Status = ack;
         }
-        if (_manualContinuous) _log.Event(Run, "manual_loop.stopped", new { outcome, reason, Status });
-        _manualContinuous = false;
+        // A death is not a reason to stop the Insert loop: recover to the Hideout (below), then
+        // Return() re-enters via ContinueAfterDeath() until the supplies are gone.
+        if (_manualContinuous && outcome is (AttemptOutcome.Death or AttemptOutcome.Timeout) && ctx.Settings.Awakening.ContinueAfterDeath.Value && Supervisor.StorageError.Length == 0)
+            _log.Event(Run, "manual_loop.death_recovery", new { reason, Run.Deaths, Run.Instance, Run.RevenueChaos });
+        else StopContinuousLoop(outcome + ":" + reason);
         if (Supervisor.StorageError.Length == 0 && ((outcome is AttemptOutcome.Death or AttemptOutcome.Timeout) || reason is "unexpected_map_before_activation" or "wrong_instance_on_reentry") && ctx.Game.Area?.CurrentArea?.IsHideout != true)
         {
             Run.RecoveryRequired = true; SetPhase(AwakeningPhase.Return, "recover_after_" + outcome);
             ctx.Settings.Running.Value = true; _lastRunning = true;
         }
+    }
+    // Cleared maps leave portals labelled "Complete". The label text is only used to skip them when it is readable.
+    private static bool PortalLooksComplete(BotContext ctx, Entity portal)
+    {
+        try
+        {
+            var label = ctx.Game.IngameState.IngameUi.ItemsOnGroundLabelElement.LabelsOnGround?.FirstOrDefault(l => l?.ItemOnGround?.Id == portal.Id);
+            var text = label?.Label?.Text;
+            return !string.IsNullOrEmpty(text) && Regex.IsMatch(text, @"Complete|Cleared", RegexOptions.IgnoreCase);
+        }
+        catch { return false; }
+    }
+    private void StopContinuousLoop(string reason)
+    {
+        if (!_manualContinuous) return;
+        _manualContinuous = false;
+        _log.Event(Run, "manual_loop.stopped", new { reason, Run.Outcome, Status });
+    }
+    /// <summary>
+    /// Runs once the state machine has confirmed a death recovery reached the Hideout. Retries the
+    /// remaining portals of the same map or opens a new one; supplies or an operational fault end the loop.
+    /// </summary>
+    private void ContinueAfterDeath(BotContext ctx)
+    {
+        if (!_manualContinuous) return;
+        if (Run.Outcome is not (AttemptOutcome.Death or AttemptOutcome.Timeout) || !ctx.Settings.Awakening.ContinueAfterDeath.Value || Supervisor.StorageError.Length > 0 ||
+            ctx.Game.Area?.CurrentArea?.IsHideout != true)
+        { StopContinuousLoop("death_continue_not_allowed"); return; }
+        string Send(string action, string review = "") => Command(ctx, action, Guid.NewGuid().ToString("N"), Supervisor.Generation, review, Supervisor.Mvid);
+        var ack = Send("review", AwakeningJson.Serialize(new {
+            observations = $"{Run.Outcome} (deaths {Run.Deaths}) in {Run.Area} instance {Run.Instance}; returned to the Hideout and confirmed by the state machine",
+            diagnosis = "User-authorized continuous farming keeps going after a death until supplies run out; no Codex diagnosis performed",
+            changes = "None", validation = "Recovery to Hideout confirmed; retry or new map is decided from the portal state",
+            nextAction = "retry_existing_portal or new_map until supplies are exhausted" }));
+        if (!ack.StartsWith("rejected:") && !Supervisor.State.Armed) ack = Send("arm");
+        if (!ack.StartsWith("rejected:")) ack = Send("begin");
+        if (ack.StartsWith("rejected:"))
+        {
+            Status = ack;
+            StopContinuousLoop("death_continue_rejected:" + ack);
+            return;
+        }
+        _log.Event(Run, "manual_loop.continued", new { reason = "previous_attempt_death", Run.AttemptId, Run.Deaths, Run.Instance });
     }
     private void Prepare(BotContext ctx)
     {
@@ -560,9 +654,28 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             var portals = StrictMapRecipe.Portals(ctx.Game).Where(x => Run.PortalIds.Contains(x.Id)).ToList();
             if (portals.Count > 0) { SetPhase(AwakeningPhase.EnterPortal, "retry_existing_map"); return; }
-            if ((DateTime.UtcNow - _phaseAt).TotalSeconds < 5) { Status = "Confirming exhausted portals"; return; }
-            // Unrelated existing portals are never overwritten or entered.
-            if (StrictMapRecipe.Portals(ctx.Game).Count > 0) { Finish(ctx, AttemptOutcome.OperationalFailure, "unrecognized_portal_set"); return; }
+            // Portal entities stream in after the Hideout loads; after a death recovery allow a little longer
+            // so a slow load is never mistaken for exhausted portals (which would spend a fresh set of materials).
+            if ((DateTime.UtcNow - _phaseAt).TotalSeconds < (Run.Deaths > 0 ? 8 : 5)) { Status = "Confirming exhausted portals"; return; }
+            var present = StrictMapRecipe.Portals(ctx.Game);
+            if (present.Count > 0)
+            {
+                // Portal entity IDs are regenerated whenever the Hideout is re-entered (F2 after a death, etc.).
+                // A map we already entered (Run.Instance != 0) keeps its portals, so adopt the visible Dunes
+                // portals instead of stopping. The instance hash is still verified on entry (wrong_instance_on_reentry).
+                var candidates = present.Where(p => !PortalLooksComplete(ctx, p)).ToList();
+                if (Run.Instance != 0 && candidates.Count > 0 &&
+                    candidates.All(p => (p.GetComponent<Portal>()?.Area?.Name ?? p.RenderName) == "Dunes"))
+                {
+                    var previous = Run.PortalIds.ToArray();
+                    Run.PortalIds = candidates.Select(p => (long)p.Id).ToList();
+                    Supervisor.Save();
+                    _log.Event(Run, "portals.auto_rebound", new { previous, current = Run.PortalIds, skippedComplete = present.Count - candidates.Count, Run.Instance, Run.Deaths });
+                    SetPhase(AwakeningPhase.EnterPortal, "portals_rebound_after_return"); return;
+                }
+                // Unrelated existing portals are never overwritten or entered.
+                Finish(ctx, AttemptOutcome.OperationalFailure, "unrecognized_portal_set"); return;
+            }
             _log.Event(Run, "run.portals_exhausted");
             var attempt = Run.AttemptId;
             Supervisor.State.Run = new() { AttemptId = attempt, AttemptNumber = 1, Phase = AwakeningPhase.Prepare,
@@ -575,7 +688,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (!ctx.Settings.Awakening.ModCatalogValidated.Value) { WriteEvidence(ctx); Finish(ctx, AttemptOutcome.OperationalFailure, "preflight: validate 17 NG rules using map evidence"); return; }
         if (ctx.Settings.Awakening.ExarchReadyCounter.Value < 0) { WriteEvidence(ctx); Finish(ctx, AttemptOutcome.OperationalFailure, "preflight: calibrate Exarch ready counter"); return; }
         if (!ctx.NinjaPrice.IsLoaded || (DateTime.Now - ctx.NinjaPrice.LastRefreshTime).TotalMinutes > ctx.Settings.Awakening.MaxPriceAgeMinutes.Value)
-        { Status = "Waiting for fresh Allflame prices"; return; }
+        {
+            // poe.ninja takes up to a minute after a host restart; that wait must not trip the 60 s Prepare deadline.
+            if (_priceWaitSince == DateTime.MinValue) _priceWaitSince = DateTime.UtcNow;
+            if ((DateTime.UtcNow - _priceWaitSince).TotalSeconds < 240) _phaseAt = DateTime.UtcNow;
+            Status = "Waiting for fresh Allflame prices"; return;
+        }
+        _priceWaitSince = DateTime.MinValue;
         if (ctx.Game.IngameState.ServerData.League != "Allflame") { Finish(ctx, AttemptOutcome.OperationalFailure, "expected_Allflame_price_league"); return; }
         if (!_deviceStockChecked)
         {
@@ -597,8 +716,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             }
             var slots = StrictMapRecipe.ReadSlots(ctx.Game);
             if (slots == null) { Status = "Waiting for device stock"; return; }
-            _deviceStockChecked = true;
             var materials = MaterialNames.Select(name => slots.FirstOrDefault(item => AwakeningGameReader.Name(ctx.Game, item) == name)).ToArray();
+            // The 5 device slots populate a moment after the panel opens; an early read looks empty.
+            // Keep re-reading for 2.5 s unless every material is already there.
+            if (_deviceStockFirstRead == DateTime.MinValue) _deviceStockFirstRead = DateTime.UtcNow;
+            if (materials.Any(m => m == null) && (DateTime.UtcNow - _deviceStockFirstRead).TotalSeconds < 2.5)
+            { Status = "Reading device slots (" + materials.Count(m => m != null) + "/" + materials.Length + ")"; return; }
+            _deviceStockChecked = true; _deviceStockFirstRead = DateTime.MinValue;
             for (var i = 0; i < materials.Length; i++)
                 if (materials[i] != null) _deviceMaterialPaths[MaterialNames[i]] = materials[i]!.Path;
             _log.Event(Run, "recipe.device_stock", new { found = _deviceMaterialPaths, missing = MaterialNames.Where(n => !_deviceMaterialPaths.ContainsKey(n)).ToArray() });
@@ -641,6 +765,19 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var point = ctx.Game.IngameState.Camera.WorldToScreen(render?.InteractCenterNum ?? device.BoundsCenterPosNum);
         _log.Event(Run, "prepare.device_interaction", new { device.Id, device.Path, point.X, point.Y, anchor = "interaction" });
     }
+    private static string? InventoryMaterialPath(BotContext ctx, string name)
+    {
+        try
+        {
+            var items = AutoExile.Systems.StashSystem.GetInventorySlotItems(ctx.Game);
+            if (items == null) return null;
+            foreach (var slot in items)
+                if (slot.Item?.IsValid == true && AwakeningGameReader.Name(ctx.Game, slot.Item).Equals(name, StringComparison.OrdinalIgnoreCase))
+                    return slot.Item.Path;
+        }
+        catch { }
+        return null;
+    }
     private void Index(BotContext ctx)
     {
         if (!_indexStarted) { ctx.StashIndex.Start(ctx.Settings.Awakening.SupplyTab.Value, includeFragmentSections: true); _indexStarted = true; }
@@ -654,6 +791,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             if (_deviceMaterialPaths.TryGetValue(name, out var loadedPath))
             { materials.Add(new(name, loadedPath)); continue; }
+            // A material left in the inventory (e.g. withdrawn for a map that was then rejected) is used first.
+            var carried = InventoryMaterialPath(ctx, name);
+            if (carried != null) { materials.Add(new(name, carried)); _log.Event(Run, "recipe.inventory_stock", new { name, path = carried }); continue; }
             var matches = entries.Where(e => e.BaseName.Equals(name, StringComparison.OrdinalIgnoreCase)
                 || (ctx.Game.Files.BaseItemTypes.Translate(e.ItemPath)?.BaseName?.Equals(name, StringComparison.OrdinalIgnoreCase) == true)).ToList();
             if (matches.Count == 0) { _log.Event(Run, "materials.unresolved", entries.Select(x => new { x.ItemPath, x.BaseName, x.TabName })); Finish(ctx, AttemptOutcome.OperationalFailure, "material_not_found:" + name); return; }
@@ -771,6 +911,14 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             return;
         }
         var result = ctx.Stash.Tick(ctx.Game, ctx.Navigation); Status = "Tmp: " + ctx.Stash.Status;
+        // The tab is open and holds no acceptable map: that is "supplies exhausted", not a 30 s input timeout.
+        if (ctx.Stash.Status.StartsWith("Waiting for 'Metadata/Items/Maps/MapKeyTier16'", StringComparison.Ordinal))
+        {
+            if (_restockEmptySince == DateTime.MinValue) _restockEmptySince = DateTime.UtcNow;
+            else if ((DateTime.UtcNow - _restockEmptySince).TotalSeconds > 4)
+            { ctx.Stash.Cancel(ctx.Game, ctx.Navigation); Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:no_acceptable_T16_in_Tmp"); return; }
+        }
+        else _restockEmptySince = DateTime.MinValue;
         if (result == StashResult.Failed) { Finish(ctx, AttemptOutcome.OperationalFailure, "Tmp_no_usable_map:" + Status); return; }
         if (result != StashResult.Succeeded) return;
         ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
@@ -784,7 +932,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
         ctx.Interaction.Tick(ctx.Game);
         if (ctx.Interaction.IsBusy) return;
-        var portal = StrictMapRecipe.Portals(ctx.Game).FirstOrDefault(x => Run.PortalIds.Contains(x.Id));
+        var portal = StrictMapRecipe.Portals(ctx.Game).Where(x => Run.PortalIds.Contains(x.Id)).OrderBy(x => x.DistancePlayer).FirstOrDefault();
         if (portal == null) { Status = "Waiting for recorded portal"; return; }
         ctx.Interaction.InteractWithEntity(portal, ctx.Navigation, requireProximity: false, requireVerified: true);
     }
@@ -801,7 +949,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     {
         UpdateInvitation(ctx, Run.ActivationConfirmed);
         var now = DateTime.UtcNow;
-        if (!lootDefense && AwakeningBossTracker.Complete(Run) && Vector2.Distance(ctx.Game.Player.GridPosNum, EncounterCenter()) <= 80)
+        if (!lootDefense && Run.BossesCompleted && AwakeningBossTracker.Complete(Run))
+        { SetPhase(AwakeningPhase.Loot, "roster_search_done"); return; }
+        if (!lootDefense && !Run.BossesCompleted && AwakeningBossTracker.AllTrackedDead(Run) && Vector2.Distance(ctx.Game.Player.GridPosNum, EncounterCenter()) <= 80)
         { CompleteBosses(ctx); return; }
         if (Run.Bosses.Values.Any(b => b.Life == BossLife.Alive && Vector2.Distance(ctx.Game.Player.GridPosNum, new(b.X, b.Y)) < ctx.Settings.Build.CombatRange.Value))
         {
@@ -809,8 +959,16 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             SetPhase(AwakeningPhase.Fight, "boss_priority_over_defensive_clear"); return;
         }
         if (now < _scoutRepositionUntil && (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding)) { TravelSustain(ctx); Status = "Scout repositioning toward stalled pack"; return; }
+        // Known drop site / boss position (e.g. after a death): head straight there. Only enemies close enough to hurt
+        // (35 grids) are fought on the way, and a pack that takes no damage is walked past instead of chased.
+        var dropSite = KnownDropSite();
+        var pushing = dropSite.HasValue && Vector2.Distance(ctx.Game.Player.GridPosNum, dropSite.Value) > 45;
+        var clearRadius = pushing ? 35f : 90f;
+        // Stragglers that take no damage (captured beasts at 1 HP, immune crystals...) are ignored for the rest of the map.
         var enemies = ctx.Game.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster &&
-            e.IsAlive && e.IsHostile && e.IsTargetable && Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum) < 90).ToList();
+            e.IsAlive && e.IsHostile && e.IsTargetable && !_scoutIgnored.Contains(e.Id) &&
+            !(_pushIgnoredUntil.TryGetValue(e.Id, out var until) && until > now) &&
+            (e.GetComponent<Life>()?.CurHP ?? 0) > 1 && Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum) < clearRadius).ToList();
         var nearby = enemies.Count;
         if (nearby > 0)
         {
@@ -820,6 +978,22 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 (double)(e.GetComponent<Life>()?.CurHP ?? 0) + (e.GetComponent<Life>()?.CurES ?? 0))), now);
             if (_scoutDamage.NoProgressSeconds(now) >= ctx.Settings.Awakening.NoDamageSeconds.Value || (now - _scoutPositionSince).TotalSeconds >= 12)
             {
+                if (pushing)
+                {
+                    foreach (var e in enemies) _pushIgnoredUntil[e.Id] = now.AddSeconds(6);
+                    _log.Event(Run, "scout.push_to_drops", new { enemies = enemies.Count, x = dropSite!.Value.X, y = dropSite.Value.Y,
+                        distance = Vector2.Distance(ctx.Game.Player.GridPosNum, dropSite.Value) });
+                    _defensiveClear = false; ctx.Combat.Suspend(); _destination = null;
+                    Navigate(ctx, dropSite.Value); return;
+                }
+                if (enemies.Count <= 2 && !enemies.Any(e => e.Rarity is MonsterRarity.Rare or MonsterRarity.Unique))
+                {
+                    // Chasing one or two harmless stragglers costs more time than it saves: keep exploring.
+                    foreach (var e in enemies) _scoutIgnored.Add(e.Id);
+                    _log.Event(Run, "scout.ignore_stragglers", new { ids = enemies.Select(e => e.Id).ToArray(), names = enemies.Select(e => e.RenderName).ToArray() });
+                    _defensiveClear = false; ctx.Combat.Suspend();
+                    return;
+                }
                 var closest = enemies.OrderBy(e => Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum)).First();
                 var delta = ctx.Game.Player.GridPosNum - closest.GridPosNum;
                 var destination = closest.GridPosNum + (delta.Length() > 1 ? Vector2.Normalize(delta) * 12 : new Vector2(12, 0));
@@ -840,6 +1014,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             return;
         }
         if (_defensiveClear) { _defensiveClear = false; ctx.Combat.Suspend(); _log.Event(Run, "scout.clear_complete"); }
+        if (!lootDefense && EnRouteLootAvailable(ctx))
+        { ctx.Navigation.Stop(ctx.Game); _destination = null; _enRouteLoot = true; SetPhase(AwakeningPhase.Loot, "en_route_valuable_drop"); return; }
         foreach (var missing in Run.Bosses.Values.Where(b => b.Life == BossLife.Missing && Vector2.Distance(ctx.Game.Player.GridPosNum, new(b.X, b.Y)) < 25))
             _missingVisits[missing.Id] = DateTime.UtcNow;
         var target = Run.Bosses.Values.Where(b => b.Life != BossLife.DeadConfirmed &&
@@ -851,12 +1027,153 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             { ctx.Navigation.Stop(ctx.Game); _damage.Reset(DateTime.UtcNow); SetPhase(AwakeningPhase.Fight, "boss_in_range"); return; }
             Navigate(ctx, new(target.X, target.Y)); return;
         }
-        if (AwakeningBossTracker.Complete(Run)) { CompleteBosses(ctx); return; }
+        if (!Run.BossesCompleted && AwakeningBossTracker.AllTrackedDead(Run)) { CompleteBosses(ctx); return; }
         // Tile entities may expose a boss/icon beyond the regular network bubble.
         var hint = ctx.Game.IngameState.Data.TileEntities?.FirstOrDefault(e => e?.Path != null && AwakeningBossTracker.Classify(e.Path, e.RenderName ?? "").HasValue
             && !Run.Visited.Any(p => Vector2.Distance(new(p[0], p[1]), e.GridPosNum) < 25));
         if (hint != null) { Navigate(ctx, hint.GridPosNum); return; }
         Explore(ctx);
+    }
+    private List<(Vector2 Pos, float Radius, string Kind)> Hazards(BotContext ctx)
+    {
+        var list = new List<(Vector2 Pos, float Radius, string Kind)>();
+        var gc = ctx.Game; var player = gc.Player.GridPosNum;
+        try
+        {
+            if (gc.EntityListWrapper.ValidEntitiesByType.TryGetValue(EntityType.Effect, out var effects))
+                foreach (var e in effects)
+                {
+                    if (e?.Path == null || !e.IsHostile || Vector2.Distance(player, e.GridPosNum) > 80) continue;
+                    string? kind = null;
+                    if (e.Path.Contains("ground_effects", StringComparison.OrdinalIgnoreCase)) kind = "ground:" + e.Path.Split('/').Last().Split('@')[0];
+                    else if (e.Path.Contains("ServerEffect", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var animation = e.GetComponent<Animated>()?.BaseAnimatedObjectEntity?.Path;
+                        if (animation != null && DangerAnimation.IsMatch(animation)) kind = "effect:" + animation;
+                    }
+                    else if (e.Path.Contains("Bearer", StringComparison.OrdinalIgnoreCase)) kind = "bearer_effect:" + e.Path;
+                    if (kind == null) continue;
+                    var size = e.GetComponent<Positioned>()?.Size ?? 10;
+                    list.Add((e.GridPosNum, Math.Clamp((float)size, 8f, 40f), kind));
+                }
+            if (gc.EntityListWrapper.ValidEntitiesByType.TryGetValue(EntityType.Daemon, out var daemons))
+                foreach (var e in daemons)
+                    if (e?.Path?.Contains("UberMapExarchDaemon") == true && e.IsHostile && Vector2.Distance(player, e.GridPosNum) < 80)
+                        list.Add((e.GridPosNum, Math.Clamp((float)(e.GetComponent<Positioned>()?.Size ?? 15), 10f, 40f), "exarch_daemon"));
+            foreach (var e in gc.EntityListWrapper.OnlyValidEntities)
+                if (e.Type == EntityType.Monster && e.IsAlive && e.IsHostile && Vector2.Distance(player, e.GridPosNum) < 80 &&
+                    ((e.Path?.Contains("Bearer", StringComparison.OrdinalIgnoreCase) ?? false) || (e.RenderName?.Contains("Bearer", StringComparison.OrdinalIgnoreCase) ?? false)))
+                    list.Add((e.GridPosNum, BearerAvoidRadius, "bearer:" + e.RenderName));
+        }
+        catch { }
+        foreach (var h in list)
+            if (_hazardKinds.Add(h.Kind)) _log.Event(Run, "hazard.observed", new { h.Kind, h.Radius, x = h.Pos.X, y = h.Pos.Y });
+        return list;
+    }
+    // Returns true when this tick was spent getting out of danger.
+    private bool SafetyTick(BotContext ctx)
+    {
+        var gc = ctx.Game; var now = DateTime.UtcNow;
+        if (gc.Player == null || !gc.Player.IsAlive) return false;
+        var player = gc.Player.GridPosNum;
+        var life = gc.Player.GetComponent<Life>();
+        float pool = (life?.CurHP ?? 0) + (life?.CurES ?? 0), max = (life?.MaxHP ?? 0) + (life?.MaxES ?? 0);
+        _poolHistory.Enqueue((now, pool));
+        while (_poolHistory.Count > 0 && (now - _poolHistory.Peek().At).TotalSeconds > 1.2) _poolHistory.Dequeue();
+        var peak = _poolHistory.Max(x => x.Pool);
+        var burst = max > 0 && (peak - pool) / max >= BurstFraction;
+        var hazards = Hazards(ctx);
+        var inside = hazards.Where(h => Vector2.Distance(player, h.Pos) < h.Radius + 3).ToList();
+        if (now < _escapeUntil && (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding))
+        { TravelSustain(ctx); Status = "Escaping danger"; return true; }
+        if (inside.Count == 0 && !burst) return false;
+        var away = Vector2.Zero;
+        foreach (var h in inside)
+        {
+            var d = player - h.Pos;
+            away += d.Length() > 0.5f ? Vector2.Normalize(d) : new Vector2(1, 0);
+        }
+        var threats = gc.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster && e.IsAlive && e.IsHostile &&
+            Vector2.Distance(player, e.GridPosNum) < 40).Select(e => e.GridPosNum).ToList();
+        if (burst && threats.Count > 0)
+        {
+            var centroid = new Vector2(threats.Average(p => p.X), threats.Average(p => p.Y));
+            var d = player - centroid;
+            if (d.Length() > 0.5f) away += Vector2.Normalize(d) * 1.5f;
+        }
+        if (away.Length() < 0.1f) away = new Vector2(1, 0);
+        away = Vector2.Normalize(away);
+        Vector2? best = null; var bestScore = float.MinValue;
+        for (var k = -3; k <= 3; k++)
+            for (var dist = 20; dist <= 40; dist += 10)
+            {
+                var angle = MathF.Atan2(away.Y, away.X) + k * MathF.PI / 8;
+                var walk = ctx.Navigation.FindNearestWalkable(gc, player + new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * dist, 5);
+                if (!walk.HasValue || hazards.Any(h => Vector2.Distance(walk.Value, h.Pos) < h.Radius + 4)) continue;
+                var crowd = threats.Count(t => Vector2.Distance(t, walk.Value) < 20);
+                var score = -Math.Abs(k) * 2 - crowd * 3 + dist * 0.1f;
+                if (score > bestScore) { bestScore = score; best = walk; }
+            }
+        if (!best.HasValue) return false;
+        var blinked = (burst || inside.Count > 0) && TryEscapeBlink(ctx, best.Value);
+        ctx.Interaction.Cancel(gc); if (_lootId != 0) _lootInterrupted = true;
+        ctx.Navigation.Stop(gc); _destination = null;
+        Navigate(ctx, best.Value);
+        _escapeUntil = now.AddSeconds(1.2);
+        _log.Event(Run, "safety.escape", new { burst, poolLostPct = max > 0 ? Math.Round((peak - pool) / max * 100) : 0,
+            hazards = inside.Select(h => h.Kind).Distinct().ToArray(), blinked, x = best.Value.X, y = best.Value.Y, Run.Phase });
+        Status = blinked ? "Escaping danger (movement skill)" : "Escaping danger";
+        return true;
+    }
+    private bool TryEscapeBlink(BotContext ctx, Vector2 target)
+    {
+        if ((DateTime.UtcNow - _lastBlinkAt).TotalMilliseconds < 600) return false;
+        var skill = ctx.Combat.MovementSkills.FirstOrDefault(m => m.IsReady &&
+            (DateTime.Now - m.LastUsedAt).TotalMilliseconds >= m.MinCastIntervalMs);
+        if (skill == null) return false;
+        var screen = AutoExile.Systems.Pathfinding.GridToScreen(ctx.Game, target);
+        var window = ctx.Game.Window.GetWindowRectangle();
+        if (screen.X < 20 || screen.Y < 20 || screen.X > window.Width - 20 || screen.Y > window.Height - 20) return false;
+        if (!BotInput.CursorPressKey(new Vector2(window.X + screen.X, window.Y + screen.Y), skill.Key)) return false;
+        skill.LastUsedAt = DateTime.Now; _lastBlinkAt = DateTime.UtcNow;
+        return true;
+    }
+    private Vector2? KnownDropSite()
+    {
+        if (Run.DropSite is { Length: 2 } site) return new Vector2(site[0], site[1]);
+        var unswept = Run.Bosses.Values.Where(b => b.Life == BossLife.DeadConfirmed && !Run.LootSweptBosses.Contains(b.Id)).ToList();
+        if (unswept.Count > 0) return new Vector2(unswept.Average(b => b.X), unswept.Average(b => b.Y));
+        var pending = Run.Bosses.Values.Where(b => b.Life != BossLife.DeadConfirmed).ToList();
+        if (pending.Count > 0) return new Vector2(pending.Average(b => b.X), pending.Average(b => b.Y));
+        return null;
+    }
+    // Drops worth at least EnRouteMinChaos (or mandatory Maven items) within EnRouteRadius, checked once a second.
+    private bool EnRouteLootAvailable(BotContext ctx)
+    {
+        var now = DateTime.UtcNow;
+        if ((now - _enRouteScanAt).TotalSeconds < 1) return false;
+        _enRouteScanAt = now;
+        var player = ctx.Game.Player.GridPosNum;
+        var threshold = Math.Max(EnRouteMinChaos, ctx.Settings.Awakening.MinStackChaos.Value);
+        foreach (var e in ctx.Entities.WorldItems)
+        {
+            if (Vector2.Distance(player, e.GridPosNum) > EnRouteRadius || Run.LootReceipts.Contains(Run.Instance + ":" + e.Id) || _lootSkipped.Contains(e.Id)) continue;
+            try
+            {
+                var item = e.GetComponent<WorldItem>()?.ItemEntity;
+                if (item?.IsValid != true) continue;
+                var name = AwakeningGameReader.Name(ctx.Game, item);
+                var price = ctx.NinjaPrice.GetPrice(ctx.Game, item);
+                double? value = price.MatchCount > 0 && price.MinChaosValue > 0 ? price.MinChaosValue : null;
+                if (AwakeningLootPolicy.ShouldLoot(name, item.Path, value, threshold))
+                {
+                    _log.Event(Run, "loot.en_route", new { e.Id, name, stackChaos = value, distance = Vector2.Distance(player, e.GridPosNum) });
+                    return true;
+                }
+            }
+            catch { }
+        }
+        return false;
     }
     private void Explore(BotContext ctx)
     {
@@ -890,13 +1207,14 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (!ctx.Settings.Awakening.BossCatalogValidated.Value) { Status = "All seed-roster bosses dead; catalog requires Codex validation"; return; }
         if (Vector2.Distance(ctx.Game.Player.GridPosNum, EncounterCenter()) > 80)
         { Navigate(ctx, EncounterCenter()); Status = "Returning to confirmed boss drops"; return; }
-        Run.BossesCompleted = true; ctx.Combat.Suspend(); ctx.Navigation.Stop(ctx.Game);
+        Run.BossesCompleted = true; _enRouteLoot = false; ctx.Combat.Suspend(); ctx.Navigation.Stop(ctx.Game);
+        if (Run.DropSite == null) { var c = EncounterCenter(); Run.DropSite = [c.X, c.Y]; }
         SetPhase(AwakeningPhase.Loot, "encounter_deaths_confirmed");
     }
     private void Fight(BotContext ctx, bool regular)
     {
         var now = DateTime.UtcNow;
-        if (!regular && AwakeningBossTracker.Complete(Run)) { CompleteBosses(ctx); return; }
+        if (!regular && AwakeningBossTracker.AllTrackedDead(Run)) { CompleteBosses(ctx); return; }
         if (regular)
         {
             if (Run.MapBossKilled) { SetPhase(AwakeningPhase.Loot, "map_boss_dead"); return; }
@@ -934,21 +1252,115 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         ctx.Combat.SuppressPositioning = true; ctx.Combat.SuppressTargetedSkills = false;
         ctx.Combat.Tick(ctx); Status = "Spark: " + closest.RenderName; Decision = "Hold productive Spark";
     }
+    /// <summary>
+    /// Only enemies close to the drops interrupt pickup, and the response is Spark in place.
+    /// The previous 60-grid "chase the pack" defense pulled the bot 170 grids away from a
+    /// pile of Maven's Chisels (2026-09-21 09:51) and got it killed before they were taken.
+    /// Enemies that take no damage for several seconds never hold the loot hostage.
+    /// </summary>
+    private bool LootDefense(BotContext ctx)
+    {
+        var now = DateTime.UtcNow;
+        var player = ctx.Game.Player.GridPosNum;
+        float radius = ctx.Settings.Awakening.LootDefenseRadius.Value;
+        var threats = ctx.Game.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster && e.IsAlive && e.IsHostile &&
+            e.IsTargetable && Vector2.Distance(player, e.GridPosNum) < radius).ToList();
+        if (threats.Count == 0)
+        {
+            if (_lootDefenseActive)
+            {
+                _lootDefenseActive = false; ctx.Combat.Suspend();
+                _log.Event(Run, "loot.defense_clear", new { seconds = (now - _lootDefenseStarted).TotalSeconds });
+            }
+            return false;
+        }
+        if (now < _lootDefenseSuppressedUntil) return false;
+        if (!_lootDefenseActive)
+        {
+            _lootDefenseActive = true; _lootDefenseStarted = now; _lootDefenseDamage.Reset(now);
+            _log.Event(Run, "loot.defense_started", new { threats = threats.Count, radius, x = player.X, y = player.Y });
+        }
+        _lootDefenseDamage.Observe(threats.Select(e => new MonsterHealthSample(e.Id,
+            (double)(e.GetComponent<Life>()?.CurHP ?? 0) + (e.GetComponent<Life>()?.CurES ?? 0))), now);
+        if (_lootDefenseDamage.NoProgressSeconds(now) >= Math.Max(6.0, ctx.Settings.Awakening.NoDamageSeconds.Value) ||
+            (now - _lootDefenseStarted).TotalSeconds >= 15)
+        {
+            _lootDefenseActive = false; _lootDefenseSuppressedUntil = now.AddSeconds(10); ctx.Combat.Suspend();
+            _log.Event(Run, "loot.defense_suppressed", new { threats = threats.Count, noProgressSeconds = _lootDefenseDamage.NoProgressSeconds(now),
+                seconds = (now - _lootDefenseStarted).TotalSeconds });
+            return false;
+        }
+        ctx.Interaction.Cancel(ctx.Game); if (_lootId != 0) _lootInterrupted = true;
+        if (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding) ctx.Navigation.Stop(ctx.Game);
+        ctx.Combat.Profile.Enabled = true;
+        ctx.Combat.Profile.SustainEnemyChannelWithoutTarget = ctx.Combat.HasEnemyChannel;
+        ctx.Combat.SuppressPositioning = true; ctx.Combat.SuppressTargetedSkills = false;
+        ctx.Combat.Tick(ctx);
+        Status = "Loot defense: Spark on " + threats.Count + " enemies within " + radius + " grids"; Decision = "Loot defense (hold position)";
+        return true;
+    }
+    // Walk to a nearby spot that shifts the (blocked) label towards the screen centre. Labels move with the camera,
+    // so the label lands at labelPos + (screen(player) - screen(candidate)).
+    private bool TryUnblockLabel(BotContext ctx, long id)
+    {
+        var attempts = _unblockAttempts.GetValueOrDefault(id);
+        if (attempts >= 3) return false;
+        try
+        {
+            var gc = ctx.Game;
+            var player = gc.Player.GridPosNum;
+            var window = gc.Window.GetWindowRectangle();
+            var centre = new Vector2(window.Width / 2f, window.Height * 0.45f);
+            var playerScreen = AutoExile.Systems.Pathfinding.GridToScreen(gc, player);
+            var world = gc.EntityListWrapper.OnlyValidEntities.FirstOrDefault(e => e.Id == id);
+            var label = gc.IngameState.IngameUi.ItemsOnGroundLabelElement.VisibleGroundItemLabels?.FirstOrDefault(l => l.Entity?.Id == id);
+            Vector2 labelPos;
+            if (label != null) { var r = label.ClientRect; labelPos = new Vector2(r.X + r.Width / 2, r.Y + r.Height / 2); }
+            else if (world != null) labelPos = AutoExile.Systems.Pathfinding.GridToScreen(gc, world.GridPosNum);
+            else return false;
+            Vector2? best = null; var bestScore = float.MaxValue;
+            for (var radius = 10; radius <= 40; radius += 10)
+                for (var k = 0; k < 16; k++)
+                {
+                    var angle = k * MathF.PI / 8;
+                    var walk = ctx.Navigation.FindNearestWalkable(gc, player + new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * radius, 4);
+                    if (!walk.HasValue) continue;
+                    var shifted = labelPos + (playerScreen - AutoExile.Systems.Pathfinding.GridToScreen(gc, walk.Value));
+                    var score = Vector2.Distance(shifted, centre) + Vector2.Distance(walk.Value, player) * 0.5f;
+                    if (score < bestScore) { bestScore = score; best = walk; }
+                }
+            if (!best.HasValue) return false;
+            _unblockAttempts[id] = attempts + 1;
+            _unblockUntil = DateTime.UtcNow.AddSeconds(2.5);
+            ctx.Navigation.Stop(gc); _destination = null;
+            Navigate(ctx, best.Value);
+            _log.Event(Run, "loot.unblock_reposition", new { id, attempt = attempts + 1, labelX = labelPos.X, labelY = labelPos.Y,
+                x = best.Value.X, y = best.Value.Y, labelFound = label != null });
+            return true;
+        }
+        catch { return false; }
+    }
     private void Loot(BotContext ctx)
     {
-        if (ctx.Game.EntityListWrapper.OnlyValidEntities.Any(e => e.Type == EntityType.Monster && e.IsAlive && e.IsHostile && e.IsTargetable &&
-            Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum) < 60))
-        {
-            ctx.Interaction.Cancel(ctx.Game); _lootId = 0;
-            Scout(ctx, lootDefense: true); Status = "Loot defense: " + Status; return;
-        }
+        if (_enRouteLoot && Run.Bosses.Values.Any(b => b.Life == BossLife.Alive && Vector2.Distance(ctx.Game.Player.GridPosNum, new(b.X, b.Y)) < ctx.Settings.Build.CombatRange.Value))
+        { ctx.Interaction.Cancel(ctx.Game); _lootId = 0; _enRouteLoot = false; SetPhase(AwakeningPhase.Scout, "boss_interrupts_en_route_loot"); return; }
+        if (LootDefense(ctx)) return;
         ctx.Combat.Suspend();
+        if (DateTime.UtcNow < _unblockUntil && (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding))
+        { Status = "Moving so the loot label is clear of the HUD"; return; }
         if (ctx.Loot.TickLabelToggle(ctx.Game)) { Status = ctx.Loot.ToggleStatus; return; }
         if (_lootId != 0)
         {
             var inv = AwakeningGameReader.Inventory(ctx.Game);
             var stillOnGround = ctx.Game.EntityListWrapper.OnlyValidEntities.Any(e => e.Id == _lootId && e.Type == EntityType.WorldItem);
-            if (AwakeningLootPolicy.PickupConfirmed(inv, _lootPath, _lootBefore, _lootQuantity, stillOnGround))
+            var confirmed = AwakeningLootPolicy.PickupConfirmed(inv, _lootPath, _lootBefore, _lootQuantity, stillOnGround);
+            if (!confirmed && _lootInterrupted)
+            {
+                // Loot defense cancelled this pickup before it completed: request it again, without counting a failure.
+                _lootInterrupted = false; _lootId = 0; return;
+            }
+            _lootInterrupted = false;
+            if (confirmed)
             {
                 var receipt = Run.Instance + ":" + _lootId;
                 if (!Run.LootReceipts.Contains(receipt))
@@ -967,13 +1379,25 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             {
                 var interactionResult = ctx.Interaction.Tick(ctx.Game);
                 if (interactionResult == InteractionResult.Failed)
+                {
                     _log.Event(Run, "loot.interaction_failed", new { _lootId, _lootName, ctx.Interaction.LastFailReason });
-                if ((DateTime.UtcNow - _lootStarted).TotalSeconds < 12) return;
+                    // A label under the HUD never becomes clickable by waiting: move the camera instead.
+                    if (ctx.Interaction.LastFailReason == "blocked by UI" && TryUnblockLabel(ctx, _lootId))
+                    { ctx.Interaction.Cancel(ctx.Game); _lootId = 0; return; }
+                }
+                // A failed interaction is final; only an in-progress pickup deserves the full 12 seconds.
+                if (interactionResult != InteractionResult.Failed && (DateTime.UtcNow - _lootStarted).TotalSeconds < 12) return;
                 _log.Event(Run, "loot.pickup_timeout", new { _lootId, _lootName, _lootBefore, _lootQuantity, stillOnGround,
                     inventoryCount = inv.Counts.GetValueOrDefault(_lootPath), ctx.Interaction.Status, ctx.Interaction.LastFailReason, ctx.Navigation.LastRecoveryAction,
                     rawInput = BotInput.RecentRawInputDiagnostics });
                 ctx.Interaction.Cancel(ctx.Game); _lootAttempts[_lootId] = _lootAttempts.GetValueOrDefault(_lootId) + 1;
-                if (_lootAttempts[_lootId] >= 3) { Run.UnresolvedLoot.Add(_lootName); Finish(ctx, AttemptOutcome.OperationalFailure, "loot_not_confirmed:" + _lootName); return; }
+                if (_lootAttempts[_lootId] >= 3)
+                {
+                    // Hourly rate: one stubborn item must not end the map. Record it and move on.
+                    _lootSkipped.Add(_lootId); Run.UnresolvedLoot.Add(_lootName);
+                    _log.Event(Run, "loot.skipped", new { _lootId, _lootName, _lootPrice, attempts = _lootAttempts[_lootId] });
+                    _lootId = 0; return;
+                }
                 if (ctx.Settings.Loot.LabelToggleUnstick.Value && BotInput.CanAct)
                 { ctx.Loot.StartLabelToggle(ctx.Game); _log.Event(Run, "loot.label_refresh", new { _lootId }); }
                 _lootId = 0; return;
@@ -983,7 +1407,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         bool unresolved = false;
         foreach (var e in ctx.Entities.WorldItems)
         {
-            if (Run.LootReceipts.Contains(Run.Instance + ":" + e.Id)) continue;
+            if (Run.LootReceipts.Contains(Run.Instance + ":" + e.Id) || _lootSkipped.Contains(e.Id)) continue;
+            if (_enRouteLoot && Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum) > EnRouteRadius) continue;
             try
             {
                 var item = e.GetComponent<WorldItem>()?.ItemEntity;
@@ -991,7 +1416,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 var name = AwakeningGameReader.Name(ctx.Game, item);
                 var price = ctx.NinjaPrice.GetPrice(ctx.Game, item);
                 double? value = price.MatchCount > 0 && price.MinChaosValue > 0 ? price.MinChaosValue : null;
-                var take = AwakeningLootPolicy.ShouldLoot(name, item.Path, value, ctx.Settings.Awakening.MinStackChaos.Value);
+                var take = AwakeningLootPolicy.ShouldLoot(name, item.Path, value, _enRouteLoot ? Math.Max(EnRouteMinChaos, ctx.Settings.Awakening.MinStackChaos.Value) : ctx.Settings.Awakening.MinStackChaos.Value);
                 if (_lootDecisions.Add(e.Id + ":" + value + ":" + take))
                     _log.Event(Run, "loot.valued", new { e.Id, name, item.Path, stack = AwakeningGameReader.Quantity(item), stackChaos = value,
                         price.MatchCount, take, mandatory = AwakeningLootPolicy.Mandatory(name, item.Path), threshold = ctx.Settings.Awakening.MinStackChaos.Value,
@@ -1002,7 +1427,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             catch { unresolved |= AwaitLootMetadata(e.Id); }
         }
         if (Run.Outcome != AttemptOutcome.None) return;
-        var candidate = candidates.OrderBy(x => Vector2.Distance(ctx.Game.Player.GridPosNum, x.World.GridPosNum)).FirstOrDefault();
+        // Value per travel distance: if the run ends mid-pickup, the cheapest drops are the ones left behind.
+        var candidate = candidates.OrderByDescending(x => Math.Max(x.Price, AwakeningLootPolicy.Mandatory(x.Name, x.Item.Path) ? 5.0 : 0.0) /
+            (Vector2.Distance(ctx.Game.Player.GridPosNum, x.World.GridPosNum) + 15)).FirstOrDefault();
         if (candidate.World != null)
         {
             _quietAt = DateTime.MinValue;
@@ -1023,7 +1450,19 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             }
             return;
         }
+        if (_enRouteLoot)
+        {
+            _enRouteLoot = false;
+            SetPhase(AwakeningPhase.Scout, "en_route_loot_done"); return;
+        }
         if (unresolved) { _quietAt = DateTime.MinValue; Status = "Loot memory still hydrating"; return; }
+        if (Run.DropSite is { Length: 2 } drop && !_dropSiteReached)
+        {
+            var site = new Vector2(drop[0], drop[1]);
+            if (Vector2.Distance(ctx.Game.Player.GridPosNum, site) > 40)
+            { Navigate(ctx, site); _quietAt = DateTime.MinValue; Status = "Returning to the pinnacle drop site"; return; }
+            _dropSiteReached = true;
+        }
         if (_quietAt == DateTime.MinValue) _quietAt = DateTime.UtcNow;
         if ((DateTime.UtcNow - _quietAt).TotalSeconds < ctx.Settings.Awakening.LootSettleSeconds.Value) return;
         // After the quiet metadata-complete scan, 60 grids is well inside the entity bubble.
@@ -1046,7 +1485,19 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (Run.Invitation == InvitationDecision.Unknown) { Finish(ctx, AttemptOutcome.OperationalFailure, "invitation_state_unknown"); return; }
         if (Run.Invitation == InvitationDecision.Yes && !Run.MapBossKilled) { _damage.Reset(DateTime.UtcNow); SetPhase(AwakeningPhase.MapBoss, "Exarch_invitation_due"); return; }
         if (Run.Invitation == InvitationDecision.Yes && Run.MapBossKilled && !Run.InvitationLooted) { Finish(ctx, AttemptOutcome.OperationalFailure, "invitation_drop_not_confirmed"); return; }
-        if (!AwakeningBossTracker.Complete(Run)) { SetPhase(AwakeningPhase.Scout, "encounter_requires_recheck"); return; }
+        if (!AwakeningBossTracker.AllTrackedDead(Run)) { SetPhase(AwakeningPhase.Scout, "encounter_requires_recheck"); return; }
+        if (!AwakeningBossTracker.Complete(Run, DateTime.UtcNow, out var basis))
+        {
+            if (AwakeningBossTracker.RosterShort(Run, out var missing))
+            {
+                // The drops of the bosses we found are collected; the rest of the group is still somewhere else.
+                _log.Event(Run, "encounter.roster_short", new { missing, bosses = Run.Bosses.Values.Select(b => b.Member).ToArray() });
+                SetPhase(AwakeningPhase.Scout, "roster_short_search"); return;
+            }
+            Status = "Drops collected; waiting for the encounter to settle (no new boss for " + AwakeningBossTracker.SettleSeconds + "s)"; return;
+        }
+        _log.Event(Run, "encounter.complete", new { basis, bosses = Run.Bosses.Values.Select(b => b.Member).ToArray() });
+        Run.DropSite = null;
         CancelInput(ctx); SetPhase(AwakeningPhase.Return, "loot_complete");
     }
     private void Return(BotContext ctx)
@@ -1059,6 +1510,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 Run.RecoveryRequired = false; ctx.Settings.Running.Value = false; _lastRunning = false;
                 SetPhase(AwakeningPhase.AwaitingReview, "failed_attempt_returned_to_hideout");
                 _log.Event(Run, "attempt.recovery_complete", new { Run.Outcome }); WriteEvidence(ctx);
+                ContinueAfterDeath(ctx);
             }
             else SetPhase(AwakeningPhase.OpenStash, "hideout_confirmed");
             return;

@@ -51,6 +51,9 @@ public sealed class AwakeningRun
     public MapObservation? Map { get; set; }
     public Dictionary<long, TrackedBoss> Bosses { get; set; } = new();
     public List<long> LootSweptBosses { get; set; } = new();
+    public DateTime? LastNewBossUtc { get; set; }
+    // Where the pinnacle drops lie (encounter centre when looting started). Survives deaths so a re-entry goes straight back.
+    public float[]? DropSite { get; set; }
     public List<string> LootReceipts { get; set; } = new();
     public List<string> UnresolvedLoot { get; set; } = new();
     public List<float[]> Visited { get; set; } = new();

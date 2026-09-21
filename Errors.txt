@@ -1,2 +1,2 @@
 Build failed:
-[2026/09/19 0:11:16, C:\Users\iran\OneDrive\ドキュメント\POE\ExileApi-Compiled-master\Plugins\Source\AutoExile\Systems\MapDeviceSystem.cs(378, 33)] CS0136: ローカルまたはパラメーター 'rect' は、その名前が外側のローカルのスコープでローカルやパラメーターの定義に使用されているため、このスコープでは宣言できません
+[2026/09/21 12:42:23, C:\Users\iran\OneDrive\ドキュメント\POE\ExileApi-Compiled-master\Plugins\Source\AutoExile\Modes\AwakeningBossRush\AwakeningBossRushMode.cs(1318, 38)] CS0117: 'AwakeningBossTracker' に 'RosterShort' の定義がありません
