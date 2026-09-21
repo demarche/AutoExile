@@ -741,7 +741,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         // A death is not a reason to stop the Insert loop: recover to the Hideout (below), then
         // Return() re-enters via ContinueAfterDeath() until the supplies are gone.
-        if (_manualContinuous && outcome is (AttemptOutcome.Death or AttemptOutcome.Timeout) && ctx.Settings.Awakening.ContinueAfterDeath.Value && Supervisor.StorageError.Length == 0)
+        var strayMap = reason == "unexpected_map_before_activation" && _strayMapRecoveries++ < 5;
+        if (_manualContinuous && (outcome is (AttemptOutcome.Death or AttemptOutcome.Timeout) || strayMap) && ctx.Settings.Awakening.ContinueAfterDeath.Value && Supervisor.StorageError.Length == 0)
             _log.Event(Run, "manual_loop.death_recovery", new { reason, Run.Deaths, Run.Instance, Run.RevenueChaos });
         else StopContinuousLoop(outcome + ":" + reason);
         if (Supervisor.StorageError.Length == 0 && ((outcome is AttemptOutcome.Death or AttemptOutcome.Timeout) || reason is "unexpected_map_before_activation" or "wrong_instance_on_reentry") && ctx.Game.Area?.CurrentArea?.IsHideout != true)
@@ -796,7 +797,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private void ContinueAfterDeath(BotContext ctx)
     {
         if (!_manualContinuous) return;
-        if (Run.Outcome is not (AttemptOutcome.Death or AttemptOutcome.Timeout) || !ctx.Settings.Awakening.ContinueAfterDeath.Value || Supervisor.StorageError.Length > 0 ||
+        if ((Run.Outcome is not (AttemptOutcome.Death or AttemptOutcome.Timeout) && Run.Reason != "unexpected_map_before_activation") || !ctx.Settings.Awakening.ContinueAfterDeath.Value || Supervisor.StorageError.Length > 0 ||
             ctx.Game.Area?.CurrentArea?.IsHideout != true)
         { StopContinuousLoop("death_continue_not_allowed"); return; }
         string Send(string action, string review = "") => Command(ctx, action, Guid.NewGuid().ToString("N"), Supervisor.Generation, review, Supervisor.Mvid);
@@ -940,7 +941,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // 2026-09-21 23:00: a chat box left open by a failed "/hideout" swallowed every device click for minutes.
         if (AwakeningGameReader.ChatOpen(ctx.Game)) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); Status = "Closing the chat box"; return; }
         ctx.Interaction.Tick(ctx.Game);
-        if (ctx.Interaction.IsBusy && _deviceTries < 3) return;
+        if (ctx.Interaction.IsBusy) return;
         var device = ctx.Game.EntityListWrapper.OnlyValidEntities.FirstOrDefault(e => e.IsTargetable &&
             e.Path.Contains("MappingDevice", StringComparison.OrdinalIgnoreCase));
         if (device == null) { Status = "Map device not found"; return; }
@@ -950,7 +951,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // 2026-09-21: the verified interaction sometimes never leaves its "cursor-move" stage (device on screen, clicked
         // 30+ times, Atlas never opened). From the 4th try, click the device point directly like a UI click.
         _deviceTries++;
-        if (_deviceTries > 3 && _deviceTries % 2 == 0)
+        // The label is tried first: the device model is surrounded by the old map's portals, and a model click that
+        // lands on one entered that map (unexpected_map_before_activation 13:10, 14:08).
+        if (_deviceTries % 2 == 1)
         {
             // Click the "Map Device" world label (like the stash label) — the model point can land on the old portals around it.
             ctx.Interaction.Cancel(ctx.Game);
@@ -1007,7 +1010,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         return false;
     }
     private bool _walkingToDevice;
-    private int _deviceTries;
+    private int _deviceTries, _strayMapRecoveries;
     private static string? InventoryMaterialPath(BotContext ctx, string name)
     {
         try
@@ -1196,6 +1199,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             if (!NearDevice(ctx)) return;
             if (Run.ActivationConfirmed) { SetPhase(AwakeningPhase.EnterPortal, "enter_activated_map"); return; }
             if (Run.ActivationRequested) { Finish(ctx, AttemptOutcome.OperationalFailure, "activation_indeterminate_do_not_reactivate"); return; }
+            // Open the Atlas ourselves through the "Map Device" label: the device module clicks a random point of the
+            // device model, which can land on the previous map's portals around it (unexpected_map_before_activation).
+            if (ctx.Game.IngameState.IngameUi.Atlas?.IsVisible != true) { OpenAtlasFromDevice(ctx); Status = "Opening the Atlas via the Map Device label"; return; }
             var node = ctx.Game.Files.AtlasNodes.EntriesList.FirstOrDefault(n => n.Area != null && Regex.IsMatch(n.Area.Id + " " + n.Area.RawName, @"\bDunes?\b|MapWorldsDunes", RegexOptions.IgnoreCase));
             if (node?.Area == null) { Finish(ctx, AttemptOutcome.OperationalFailure, "Dunes_atlas_node_not_found"); return; }
             bool Allowed(Entity entity)
