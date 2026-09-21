@@ -573,8 +573,48 @@ namespace AutoExile.WebServer
                 return;
             }
 
+            if (cmd.Action == "host.git_commit")
+            {
+                // Commits the AutoExile source tree (Plugins/Source/AutoExile) with the given message. Loopback only.
+                if (!IPAddress.IsLoopback(req.RemoteEndPoint.Address))
+                { resp.StatusCode = 403; await ServeJson(resp, new { error = "host.git_commit is loopback-only" }); return; }
+                var (ok, output) = await Task.Run(() => GitCommit(cmd.Value ?? ""));
+                if (!ok) resp.StatusCode = 500;
+                await ServeJson(resp, new { ok, action = cmd.Action, output });
+                return;
+            }
+
             _commandQueue.Enqueue(cmd);
             await ServeJson(resp, new { ok = true, action = cmd.Action });
+        }
+
+        private static (bool Ok, string Output) GitCommit(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message)) return (false, "empty commit message");
+            var root = Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory;
+            var repo = Path.Combine(root, "Plugins", "Source", "AutoExile");
+            var log = new StringBuilder();
+            (int Code, string Text) Git(params string[] args)
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("git") { WorkingDirectory = repo, UseShellExecute = false,
+                    RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true,
+                    StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8 };
+                foreach (var a in args) psi.ArgumentList.Add(a);
+                using var p = System.Diagnostics.Process.Start(psi)!;
+                var stdout = p.StandardOutput.ReadToEndAsync(); var stderr = p.StandardError.ReadToEndAsync();
+                if (!p.WaitForExit(30000)) { try { p.Kill(true); } catch { } return (-1, "timeout"); }
+                return (p.ExitCode, (stdout.Result + stderr.Result).Trim());
+            }
+            try
+            {
+                var add = Git("add", "-A", "."); log.AppendLine("add: " + add.Text);
+                if (add.Code != 0) return (false, log.ToString());
+                var status = Git("status", "--porcelain"); if (status.Code == 0 && status.Text.Length == 0) return (true, "nothing to commit");
+                var commit = Git("-c", "core.quotepath=false", "commit", "-m", message); log.AppendLine(commit.Text);
+                var head = Git("log", "-1", "--oneline"); log.AppendLine(head.Text);
+                return (commit.Code == 0, log.ToString());
+            }
+            catch (Exception ex) { return (false, log + ex.Message); }
         }
 
         // Spawns Tools/RestartExileApi.ps1 detached: it kills Loader.exe (this process), restarts it and verifies the

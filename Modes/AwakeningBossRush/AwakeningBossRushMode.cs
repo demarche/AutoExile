@@ -23,6 +23,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     public AwakeningSupervisor Supervisor { get; }
     private AwakeningRun Run => Supervisor.Run;
     private readonly AwakeningTelemetry _log;
+    private readonly AwakeningLedger _ledger;
+    private readonly List<object> _runLoot = new();
+    private int _runEscapes;
+    private string _countedRunId = "";
+    private double _countedSeconds;
     private readonly SparkProgressTracker _damage = new();
     private readonly string _directory;
     private BotContext? _ctx;
@@ -96,6 +101,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         _directory = Path.Combine(directory, "AwakeningData");
         Supervisor = new(_directory, typeof(AwakeningBossRushMode).Assembly.ManifestModule.ModuleVersionId.ToString());
         _log = new(_directory, log, Supervisor.Generation);
+        _ledger = new(_directory);
         RefreshAnalysis();
         _log.Event(Run, "plugin.loaded", new { Supervisor.Generation, Supervisor.Mvid, Supervisor.StorageError });
     }
@@ -132,11 +138,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         checkpointError = Supervisor.StorageError, telemetryError = _log.Error, telemetryDropped = _log.Dropped,
         Supervisor.PersistenceRetries, Supervisor.LastPersistenceWarning,
         netChaosPerHour = Run.CostKnown && Run.RevenueKnown && Run.OperatingSeconds > 0 ? (double?)((Run.RevenueChaos - Run.CostChaos) * 3600 / Run.OperatingSeconds) : null,
-        modRisk = _risks }, AwakeningJson.Options);
+        modRisk = _risks, economy = _ledger.Summary() }, AwakeningJson.Options);
     private void RefreshAnalysis() => _risks = AwakeningModRiskAnalyzer.Analyze(Supervisor.State.History.Append(Run)).Take(30).ToArray();
 
     private bool _manualContinuous;
-    private bool _stopAfterMap;
+    private bool _stopAfterMap, _ledgerStarted;
     private DateTime _restockEmptySince = DateTime.MinValue;
 
     public void ManualStart(BotContext ctx, string source = "user_insert")
@@ -162,6 +168,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var begun = Send("begin");
         if (begun.StartsWith("rejected:")) { Status = begun; return; }
         _manualContinuous = true; _stopAfterMap = false;
+        if (source == "user_insert" || !_ledgerStarted) { _ledger.ResetSession(); _ledgerStarted = true; }
         _log.Event(Run, "attempt.manual_started", new { source, oneAttempt = false });
     }
     public string Command(BotContext ctx, string action, string id, string generation, string review, string mvid)
@@ -179,6 +186,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var invalid = Supervisor.ValidateRequest(id, generation);
         if (invalid != null) return invalid;
         if (_shutdownRequested) return "rejected: host shutdown pending";
+        if (action == "inspect_ui")
+        {
+            // Read-only: dumps the visible UI trees (e.g. an open Faustus exchange or market) for calibration.
+            var label = Regex.Replace(string.IsNullOrWhiteSpace(review) ? "manual" : review, @"[^A-Za-z0-9_-]", "");
+            var file = AwakeningUiInspector.Dump(ctx.Game, _directory, label);
+            _log.Event(Run, "ui.inspected", new { file });
+            return Supervisor.RecordCommand(id, "inspected:" + Path.GetFileName(file));
+        }
+        if (action == "economy_reset") { _ledger.ResetSession(); return Supervisor.RecordCommand(id, "economy_reset"); }
         if (action == "fresh")
         {
             if (ctx.Settings.Running.Value || !Run.Reviewed || Run.RecoveryRequired || Run.Outcome == AttemptOutcome.None ||
@@ -563,8 +579,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         _log.Event(Run, "attempt.ended", new { outcome, reason, Run.ReturnedToHideout, Run.StashCompleted, Run.BossesCompleted,
             Run.RevenueChaos, Run.RevenueKnown, Run.CostChaos, Run.CostKnown, Run.OperatingSeconds, Run.PhaseSeconds, Run.Deaths, Run.UnresolvedLoot });
         WriteEvidence(ctx);
+        RecordRun(ctx, outcome, reason);
         if (_manualContinuous && _stopAfterMap && outcome == AttemptOutcome.Success)
         { _stopAfterMap = false; StopContinuousLoop("stop_after_map"); return; }
+        var economy = ctx.Settings.Awakening.Economy;
+        if (_manualContinuous && outcome == AttemptOutcome.Success && economy.LedgerEnabled.Value && economy.StopIfNegativeAfterMaps.Value > 0 &&
+            _ledger.Maps >= economy.StopIfNegativeAfterMaps.Value && _ledger.ChaosPerHour is < 0)
+        { _log.Event(Run, "economy.stop_negative", _ledger.Summary()); StopContinuousLoop("economy_negative_after_" + _ledger.Maps + "_maps"); return; }
         if (_manualContinuous && outcome == AttemptOutcome.Success && Run.ReturnedToHideout && Run.StashCompleted &&
             Supervisor.StorageError.Length == 0 && ctx.Game.Area?.CurrentArea?.IsHideout == true)
         {
@@ -604,6 +625,28 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             return !string.IsNullOrEmpty(text) && Regex.IsMatch(text, @"Complete|Cleared", RegexOptions.IgnoreCase);
         }
         catch { return false; }
+    }
+    // One line per attempt in runs.jsonl: the map's mods next to deaths, time and revenue, for "which mod kills/slows us" analysis.
+    private void RecordRun(BotContext ctx, AttemptOutcome outcome, string reason)
+    {
+        try
+        {
+            // Every attempt's time counts; a map is counted once it succeeds (deaths retry the same map).
+            // Run.OperatingSeconds accumulates across the retries of one map; only the new part is added.
+            if (_countedRunId != Run.RunId) { _countedRunId = Run.RunId; _countedSeconds = 0; }
+            _ledger.AddTime(Run.OperatingSeconds - _countedSeconds, outcome == AttemptOutcome.Success);
+            _countedSeconds = Run.OperatingSeconds;
+            _ledger.Run(new
+            {
+                utc = DateTime.UtcNow, Run.RunId, Run.AttemptId, Run.AttemptNumber, Run.Instance, outcome = outcome.ToString(), reason,
+                mapName = Run.Map?.Name, quantity = Run.Map?.Quantity, mods = Run.Map?.Mods.Select(m => new { m.Id, m.Text }).ToArray(),
+                group = Run.Bosses.Values.Select(b => b.Group).Distinct().ToArray(), bosses = Run.Bosses.Values.Select(b => new { b.Member, life = b.Life.ToString() }).ToArray(),
+                Run.Deaths, Run.OperatingSeconds, Run.ElapsedSeconds, Run.PhaseSeconds, revenue = Run.RevenueChaos, cost = Run.CostChaos,
+                loot = _runLoot.ToArray(), escapes = _runEscapes, hazards = _hazardKinds.ToArray(), Run.UnresolvedLoot
+            });
+        }
+        catch { }
+        _runLoot.Clear(); _runEscapes = 0;
     }
     private void StopContinuousLoop(string reason)
     {
@@ -865,7 +908,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                         var price = ctx.NinjaPrice.GetPrice(material.Name, category).MinChaosValue;
                         if (price <= 0) Run.CostKnown = false;
                         Run.CostChaos += price;
+                        if (ctx.Settings.Awakening.Economy.LedgerEnabled.Value)
+                        { _ledger.Price(material.Name, price, "poe.ninja"); _ledger.AddInvest(material.Name, material.Count, price, "consumed_at_market_price"); }
                     }
+                    if (ctx.Settings.Awakening.Economy.LedgerEnabled.Value && ctx.Settings.Awakening.MapCostChaos.Value > 0)
+                        _ledger.AddInvest("Map (Tier 16)", 1, ctx.Settings.Awakening.MapCostChaos.Value, "consumed_setting_price");
                     _log.Event(Run, "activation.requested", new { Run.Map, Run.Recipe, Run.CostChaos, Run.CostKnown, device = AwakeningGameReader.DeviceEvidence(ctx.Game) });
                     return Supervisor.Save();
                 },
@@ -1120,6 +1167,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         ctx.Navigation.Stop(gc); _destination = null;
         Navigate(ctx, best.Value);
         _escapeUntil = now.AddSeconds(1.2);
+        _runEscapes++;
         _log.Event(Run, "safety.escape", new { burst, poolLostPct = max > 0 ? Math.Round((peak - pool) / max * 100) : 0,
             hazards = inside.Select(h => h.Kind).Distinct().ToArray(), blinked, x = best.Value.X, y = best.Value.Y, Run.Phase });
         Status = blinked ? "Escaping danger (movement skill)" : "Escaping danger";
@@ -1370,6 +1418,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                     Run.UnresolvedLoot.Remove(_lootName);
                     if (_lootName.Contains("Incandescent Invitation", StringComparison.OrdinalIgnoreCase)) Run.InvitationLooted = true;
                     _log.Event(Run, "loot.confirmed", new { _lootId, _lootName, _lootPath, quantity = _lootQuantity, chaos = _lootPrice });
+                    _runLoot.Add(new { name = _lootName, quantity = _lootQuantity, chaos = _lootPrice, phase = _enRouteLoot ? "en_route" : "boss" });
+                    if (ctx.Settings.Awakening.Economy.LedgerEnabled.Value) _ledger.AddLoot(_lootName, _lootQuantity, _lootPrice);
                     Run.UnresolvedLoot.RemoveAll(name => name == _lootName);
                     Supervisor.Save();
                 }

@@ -40,4 +40,5 @@ public sealed class AwakeningSettings
     public ToggleNode ModCatalogValidated { get; set; } = new(false);
     [Menu("Boss catalog validated", "Enable after verifying the seed metadata classifiers and invitation rosters on current game data. Combat works before this; success is withheld.")]
     public ToggleNode BossCatalogValidated { get; set; } = new(false);
+    public AwakeningEconomySettings Economy { get; set; } = new();
 }
