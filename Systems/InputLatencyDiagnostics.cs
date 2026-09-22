@@ -71,18 +71,51 @@ namespace AutoExile.Systems
                 Interlocked.Increment(ref _dropped);
         }
 
-        public static void Drain(Action<string> logger, int maximum = 24)
+        // 2026-09-22 (user): while verbose InputTrace records were flowing into the ExileCore overlay log, the cursor
+        // often showed the busy hourglass and clicks were lost. Same records, same detail, but written by a dedicated
+        // background thread to Plugins/Temp/AutoExile/InputTrace.log, so Tick/Render never format or render them.
+        private static Thread? _writer;
+        public static string TraceFile { get; } = Path.Combine(AppContext.BaseDirectory, "Plugins", "Temp", "AutoExile", "InputTrace.log");
+        private static void EnsureWriter()
         {
-            var dropped = Interlocked.Exchange(ref _dropped, 0);
-            if (dropped != 0) Enqueue($"[InputTrace] at={DateTimeOffset.Now:O} event=dropped count={dropped}");
-            // Both a count limit and a time budget prevent log bursts monopolizing Tick.
-            var started = Stopwatch.GetTimestamp();
-            for (var i = 0; i < maximum && Pending.TryDequeue(out var record); i++)
+            lock (Lifecycle)
             {
-                try { logger(record); }
-                catch { Interlocked.Increment(ref _dropped); break; }
-                if (Stopwatch.GetElapsedTime(started).TotalMilliseconds >= 2) break;
+                if (_writer != null) return;
+                _writer = new Thread(WriteLoop) { IsBackground = true, Name = "AutoExile InputTrace writer", Priority = ThreadPriority.BelowNormal };
+                _writer.Start();
             }
+        }
+        private static void WriteLoop()
+        {
+            StreamWriter? w = null;
+            while (true)
+            {
+                try
+                {
+                    if (w == null)
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(TraceFile)!);
+                        var info = new FileInfo(TraceFile);
+                        if (info.Exists && info.Length > 64L * 1024 * 1024)
+                        { var old = TraceFile + ".1"; if (File.Exists(old)) File.Delete(old); File.Move(TraceFile, old); }
+                        w = new StreamWriter(new FileStream(TraceFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete), new System.Text.UTF8Encoding(false), 1 << 16);
+                    }
+                    var dropped = Interlocked.Exchange(ref _dropped, 0);
+                    if (dropped != 0) w.WriteLine($"[InputTrace] at={DateTimeOffset.Now:O} event=dropped count={dropped}");
+                    var wrote = 0;
+                    while (Pending.TryDequeue(out var record)) { w.WriteLine(record); wrote++; }
+                    if (wrote > 0) w.Flush();
+                    if (w.BaseStream.Length > 64L * 1024 * 1024) { w.Dispose(); w = null; }
+                }
+                catch { try { w?.Dispose(); } catch { } w = null; Thread.Sleep(1000); }
+                Thread.Sleep(200);
+            }
+        }
+
+        public static void Drain(Action<string> _, int maximum = 24)
+        {
+            // Records go to the trace file from the writer thread; the overlay logger is no longer used.
+            EnsureWriter();
         }
 
         private static void Watch(CancellationToken stop, Func<string> snapshot)

@@ -952,6 +952,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             {
                 Run.Recipe = materials.Select((item, i) => new RecipeItem(MaterialNames[i], item!.Path)).ToList();
                 CancelInput(ctx); _log.Event(Run, "recipe.reuse_device_stock", Run.Recipe);
+                if (!HasUsableInventoryMap(ctx)) { SetPhase(AwakeningPhase.RestockMap, "preloaded_recipe_fetch_map_first"); return; }
                 SetPhase(AwakeningPhase.OpenMap, "verify_preloaded_recipe_before_activation"); return;
             }
         }
@@ -1414,7 +1415,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         while (_materialIndex < Run.Recipe.Count && (inv.Counts.GetValueOrDefault(Run.Recipe[_materialIndex].Path) >= 1
             || _deviceMaterialPaths.ContainsKey(Run.Recipe[_materialIndex].Name))) _materialIndex++;
-        if (_materialIndex == Run.Recipe.Count) { SetPhase(AwakeningPhase.OpenMap, "materials_ready"); return; }
+        if (_materialIndex == Run.Recipe.Count)
+        {
+            // Batch (user, 2026-09-22): take the map in the same stash visit instead of opening the device, finding no
+            // map, and reopening the stash for it.
+            if (!HasUsableInventoryMap(ctx)) { SetPhase(AwakeningPhase.RestockMap, "materials_ready_fetch_map_same_visit"); return; }
+            SetPhase(AwakeningPhase.OpenMap, "materials_ready"); return;
+        }
         var material = Run.Recipe[_materialIndex];
         var tab = ctx.Settings.Awakening.SupplyTab.Value;
         if (string.IsNullOrWhiteSpace(tab)) tab = ctx.StashIndex.BestTabForPath(material.Path)?.Name;
@@ -1513,6 +1520,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             return AwakeningMapPolicy.Rejections(m).Count == 0 && m.Quantity >= ctx.Settings.Awakening.Economy.MapMinQuantity.Value;
         }
         catch { return false; }
+    }
+    private bool HasUsableInventoryMap(BotContext ctx)
+    {
+        try { return StashSystem.GetInventorySlotItems(ctx.Game)?.Any(i => i.Item?.Path?.Contains("MapKeyTier16") == true && UsableStashMap(ctx, i.Item)) == true; }
+        catch { return true; } // unknown → let OpenMap decide as before
     }
     private int _mapTierStep, _mapPage; private DateTime _mapTierClickAt, _mapStashSkipUntil;
     private void RestockMap(BotContext ctx)
