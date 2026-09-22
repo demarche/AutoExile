@@ -70,8 +70,21 @@ public static class AwakeningGameReader
             var observations = mods?.ItemMods?.Select(m => new ModObservation(m.RawName, m.Group,
                 Translation(m.Translation) + " " + m.DisplayName, m.ModRecord?.StatNames?.Select(x => x.ToString()).ToArray() ?? [],
                 m.Values.Select(x => (int)x).ToArray(), implicitNames.Contains(m.RawName))).ToList() ?? new();
+            // Stashed maps carry no Stats component (quantity read 0, so no stored map was ever "usable" and the bot
+            // bought maps while 260+ sat in the map tab). Sum the mods' item-quantity stats.
+            double quantity = MapModChecker.GetItemQuantity(entity);
+            if (quantity <= 0 && mods?.Identified == true)
+            {
+                var fromMods = 0;
+                foreach (var o in observations)
+                    for (var k = 0; k < o.Stats.Length && k < o.Values.Length; k++)
+                        if (o.Stats[k].Contains("item_drop_quantity", StringComparison.OrdinalIgnoreCase) || o.Stats[k].Contains("item_found_quantity", StringComparison.OrdinalIgnoreCase))
+                            fromMods += o.Values[k];
+                // Sum of the mods' quantity values matches the market's "Item Quantity" (116 = 16+19+13+19+10+13+16+10).
+                if (fromMods > 0) quantity = fromMods;
+            }
             return new(entity.Path, Name(gc, entity), tier, mods?.Identified == true, entity.IsValid && mods?.ItemMods != null && tier > 0,
-                observations, MapModChecker.GetItemQuantity(entity), layout, mods?.ItemRarity == ItemRarity.Normal);
+                observations, quantity, layout, mods?.ItemRarity == ItemRarity.Normal);
         }
         catch { return new(entity.Path ?? "", "", 0, false, false, []); }
     }
