@@ -420,7 +420,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             _inspectionStatus = "";
             _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
-            _mapBankRunDone = false; _mapBankLogged = false; _mapTierStep = 0; _mapPage = 0; _chaosStoreClicks = 0;
+            _mapBankRunDone = false; _mapBankLogged = false; _mapTierStep = 0; _mapPage = 0; _chaosStoreClicks = 0; _bossHpSig = -1; _bossNoDamageSeconds = 0; _fightTickAt = DateTime.MinValue;
             _guardianChecked = false; _guardianCasts = 0; _scrollsChecked = false;
             _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false;
             _defensiveClear = false;
@@ -2075,6 +2075,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (Run.DropSite == null) { var c = EncounterCenter(); Run.DropSite = [c.X, c.Y]; }
         SetPhase(AwakeningPhase.Loot, "encounter_deaths_confirmed");
     }
+    private double _bossHpSig = -1, _bossNoDamageSeconds; private DateTime _fightTickAt; private bool _approachLogged;
     private void Fight(BotContext ctx, bool regular)
     {
         var now = DateTime.UtcNow;
@@ -2089,6 +2090,31 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (closest == null) { if (regular) Explore(ctx); else SetPhase(AwakeningPhase.Scout, "boss_not_observable"); return; }
         if (Vector2.Distance(ctx.Game.Player.GridPosNum, closest.GridPosNum) > ctx.Settings.Build.CombatRange.Value)
         { Navigate(ctx, closest.GridPosNum); return; }
+        if (!regular)
+        {
+            // 2026-09-22 05:03–05:11: The Deceitful God / Cardinal of Fear kept exactly the same HP for two 300 s
+            // attempts while the character stood ~160 grids away sparking at trash ("Hold productive Spark").
+            // Track boss HP while fighting: no change for 15 s → walk up to the boss; for 90 s → give the encounter up.
+            var sig = alive.Sum(e => (double)(e.GetComponent<Life>()?.CurHP ?? 0) + (e.GetComponent<Life>()?.CurES ?? 0));
+            var dt = _fightTickAt == DateTime.MinValue ? 0 : Math.Min(1.0, (now - _fightTickAt).TotalSeconds); _fightTickAt = now;
+            if (Math.Abs(sig - _bossHpSig) > 1) { _bossHpSig = sig; _bossNoDamageSeconds = 0; _approachLogged = false; }
+            else _bossNoDamageSeconds += dt;
+            if (_bossNoDamageSeconds >= 90)
+            {
+                _log.Event(Run, "fight.boss_stalled_skip", new { seconds = _bossNoDamageSeconds, bosses = alive.Select(e => new { e.RenderName, hp = e.GetComponent<Life>()?.CurHP,
+                    d = Math.Round(Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum)) }).ToArray() });
+                _bossNoDamageSeconds = 0;
+                Run.BossesCompleted = true; _enRouteLoot = false; ctx.Combat.Suspend(); ctx.Navigation.Stop(ctx.Game);
+                if (Run.DropSite == null) { var c = EncounterCenter(); Run.DropSite = [c.X, c.Y]; }
+                SetPhase(AwakeningPhase.Loot, "boss_no_damage_skip"); return;
+            }
+            var bossDistance = Vector2.Distance(ctx.Game.Player.GridPosNum, closest.GridPosNum);
+            if (_bossNoDamageSeconds >= 15 && bossDistance > 22)
+            {
+                if (!_approachLogged) { _approachLogged = true; _log.Event(Run, "fight.no_damage_approach", new { seconds = _bossNoDamageSeconds, closest.RenderName, d = Math.Round(bossDistance) }); }
+                ctx.Combat.Suspend(); Navigate(ctx, closest.GridPosNum); Status = $"No boss damage: approaching {closest.RenderName} ({bossDistance:0})"; return;
+            }
+        }
         if (regular)
         {
             var samples = alive.Select(e => new MonsterHealthSample(e.Id, (double)(e.GetComponent<Life>()?.CurHP ?? 0) + (e.GetComponent<Life>()?.CurES ?? 0)));
