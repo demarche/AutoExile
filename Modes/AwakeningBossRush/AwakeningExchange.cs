@@ -221,6 +221,9 @@ public sealed class AwakeningExchange
             // Order exactly the requested quantity and round the Chaos up so the ratio still meets that ask.
             want = request.Quantity; have = (long)Math.Ceiling(request.Quantity * (double)rh / rw);
             if (have <= 0) { Fail("bad_amounts"); return; }
+            // 2026-09-22 05:19: 1 Sacrifice at Dawn for 1c (market 3.17:1) raised Faustus' "unbalanced ratio" dialog and
+            // the order was not registered. Take everything the rounded-up chaos buys at that ask (1c → 3 Dawn).
+            want = Math.Max(want, (long)Math.Floor(have * (double)rw / rh));
         }
         else if (request.Kind == ExchangeKind.BuyAtBid)
         {
