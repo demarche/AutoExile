@@ -420,7 +420,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             _inspectionStatus = "";
             _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
-            _mapBankRunDone = false; _mapBankLogged = false; _mapTierStep = 0; _mapPage = 0; _chaosStoreClicks = 0; _bossHpSig = -1; _bossNoDamageSeconds = 0; _fightTickAt = DateTime.MinValue;
+            _mapBankRunDone = false; _mapBankLogged = false; _mapTierStep = 0; _mapPage = 0; _mapWithdrawRetries = 0; _chaosStoreClicks = 0; _bossHpSig = -1; _bossNoDamageSeconds = 0; _fightTickAt = DateTime.MinValue;
             _guardianChecked = false; _guardianCasts = 0; _scrollsChecked = false;
             _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false;
             _defensiveClear = false;
@@ -892,13 +892,17 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                     _log.Event(Run, "portals.auto_rebound", new { previous, current = Run.PortalIds, skippedComplete = present.Count - candidates.Count, Run.Instance, Run.Deaths });
                     SetPhase(AwakeningPhase.EnterPortal, "portals_rebound_after_return"); return;
                 }
-                // Unrelated existing portals are never overwritten or entered.
-                Finish(ctx, AttemptOutcome.OperationalFailure, "unrecognized_portal_set"); return;
+                // 2026-09-22 05:48: after 2 deaths (bosses done, loot banked) the remaining portals were not adoptable and
+                // "unrecognized_portal_set" stopped the loop. Unrelated portals are still never entered: abandon this
+                // map, record the visible portals as the baseline and continue with a fresh map (activation replaces them).
+                _log.Event(Run, "portals.abandon_unrecognized", new { Run.Instance, Run.Deaths, Run.BossesCompleted,
+                    present = present.Select(p => new { p.Id, area = p.GetComponent<Portal>()?.Area?.Name, p.RenderName, complete = PortalLooksComplete(ctx, p) }).ToArray() });
             }
             _log.Event(Run, "run.portals_exhausted");
             var attempt = Run.AttemptId;
             Supervisor.State.Run = new() { AttemptId = attempt, AttemptNumber = 1, Phase = AwakeningPhase.Prepare,
-                BuildMvid = Supervisor.Mvid, BuildFingerprint = Run.BuildFingerprint, BuildConfiguration = Run.BuildConfiguration };
+                BuildMvid = Supervisor.Mvid, BuildFingerprint = Run.BuildFingerprint, BuildConfiguration = Run.BuildConfiguration,
+                PriorPortalIds = present.Select(p => (long)p.Id).ToList() };
             Supervisor.Save();
         }
         if (Run.ActivationRequested) { Finish(ctx, AttemptOutcome.OperationalFailure, "activation_indeterminate_do_not_reactivate"); return; }
@@ -1526,7 +1530,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         try { return StashSystem.GetInventorySlotItems(ctx.Game)?.Any(i => i.Item?.Path?.Contains("MapKeyTier16") == true && UsableStashMap(ctx, i.Item)) == true; }
         catch { return true; } // unknown → let OpenMap decide as before
     }
-    private int _mapTierStep, _mapPage; private DateTime _mapTierClickAt, _mapStashSkipUntil;
+    private int _mapTierStep, _mapPage, _mapWithdrawRetries; private DateTime _mapTierClickAt, _mapStashSkipUntil;
     private void RestockMap(BotContext ctx)
     {
         if ((DateTime.UtcNow - _phaseAt).TotalSeconds > 60)
@@ -1642,7 +1646,19 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             }
         }
         else _restockEmptySince = DateTime.MinValue;
-        if (result == StashResult.Failed) { Finish(ctx, AttemptOutcome.OperationalFailure, "Tmp_no_usable_map:" + Status); return; }
+        if (result == StashResult.Failed)
+        {
+            // 2026-09-22 05:31: one "Timed out in phase: WithdrawItems" stopped the whole loop. Retry the withdrawal
+            // once, then fall through to the next source (MAP tab → market) instead of ending the attempt.
+            ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
+            _log.Event(Run, "map.restock_withdraw_failed", new { tab = MapRestockTabs[Math.Min(_mapRestockTabIndex, MapRestockTabs.Length - 1)], Status, retry = _mapWithdrawRetries });
+            if (_mapWithdrawRetries++ < 1) { _mapRestockStarted = false; _phaseAt = DateTime.UtcNow; return; }
+            _mapWithdrawRetries = 0;
+            if (_mapRestockTabIndex < MapRestockTabs.Length - 1) { _mapTierStep = 0; _mapPage = 0; _mapRestockTabIndex++; _mapRestockStarted = false; _restockEmptySince = DateTime.MinValue; _phaseAt = DateTime.UtcNow; return; }
+            if (ctx.Settings.Awakening.Economy.AutoBuyMaps.Value && !_marketTried)
+            { _marketTried = true; _marketStarted = false; SetPhase(AwakeningPhase.MarketBuy, "map_withdraw_failed_buy_from_market"); return; }
+            Finish(ctx, AttemptOutcome.OperationalFailure, "Tmp_no_usable_map:" + Status); return;
+        }
         if (result != StashResult.Succeeded) return;
         ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
         _log.Event(Run, "map.restocked", new { tab = "Tmp", count = 1 });

@@ -174,6 +174,7 @@ public sealed class AwakeningMarketBuyer
         ("flask_charges", "PLAYERS GAIN REDUCED FLASK CHARGES", "reduced flask charges"),
         ("elemental_weakness", "PLAYERS ARE CURSED WITH ELEMENTAL WEAKNESS", "elemental weakness"),
         ("extra_lightning", "MONSTERS DEAL EXTRA PHYSICAL DAMAGE AS LIGHTNING", "damage as lightning|damage as extra lightning"),
+        ("spell_suppress", "MONSTERS HAVE CHANCE TO SUPPRESS SPELL DAMAGE", "suppress spell damage"),
     };
     private void PlanFilters(Element market)
     {

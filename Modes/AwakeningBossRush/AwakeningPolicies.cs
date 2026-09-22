@@ -24,7 +24,9 @@ public static class AwakeningMapPolicy
         ("flask_charges", "Players gain #% reduced Flask Charges", @"Map.*FlaskCharges|map_player.*flask.*charge|reduced Flask Charges"),
         // 2026-09-21 (user decision A): one-shots at full ES on a map with these mods.
         ("elemental_weakness", "Players are Cursed with Elemental Weakness", @"MapPlayerCurseElementalWeakness|Cursed with Elemental Weakness"),
-        ("extra_lightning", "Monsters deal #% extra Physical Damage as Lightning", @"MapMonsterLightningDamage|extra Physical Damage as Lightning|extra Damage as Lightning")
+        ("extra_lightning", "Monsters deal #% extra Physical Damage as Lightning", @"MapMonsterLightningDamage|extra Physical Damage as Lightning|extra Damage as Lightning"),
+        // 2026-09-22 (user decision): Spark is a spell; suppression halves its damage (death on 04:41).
+        ("spell_suppress", "Monsters have +#% chance to Suppress Spell Damage", @"spell_suppression|Suppress Spell Damage")
     ];
 
     public static List<string> Rejections(MapObservation map)
