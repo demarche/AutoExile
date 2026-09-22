@@ -133,11 +133,16 @@ public sealed class AwakeningMarketBuyer
     private static bool _filtersSet;
     private int _filterRounds, _fStage, _fTries;
     private DateTime _fActedAt;
+    private int _fieldIdx = -1;
+    private DateTime _blurredAt;
     private readonly Dictionary<string, int> _ruleTries = new();
     private string? _typingRule; private int _typeTries;
     private readonly Dictionary<string, int> _removeTries = new();
     private static readonly int[] FCategory = { 2, 3, 1, 0, 0, 1, 2, 0, 0, 1, 0, 0, 1, 0, 3 };
     private static readonly int[] FMapHeader = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 0, 0 };
+    private static readonly int[] FTypeHeader = { 2, 3, 1, 0, 0, 1, 2, 0, 0, 0, 0 };
+    private static readonly int[] FTierLabel = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 1, 0, 0, 0, 0 };
+    private readonly HashSet<int> _typedFields = new(); private bool _needBlur;
     private static readonly int[] FTierRow = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 1, 0, 0 };
     private static readonly int[] FTierMin = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 1, 0, 0, 1, 0, 0, 0 };
     private static readonly int[] FTierMax = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 1, 0, 0, 1, 0, 1, 0 };
@@ -172,8 +177,13 @@ public sealed class AwakeningMarketBuyer
     };
     private void PlanFilters(Element market)
     {
-        _fStage = _resetFilters && !_resetDone ? -1 : 0; _fTries = 0; _fActedAt = DateTime.MinValue; _ruleTries.Clear(); _typingRule = null; _removeTries.Clear();
+        _fStage = _resetFilters && !_resetDone ? -1 : 0; _fTries = 0; _fActedAt = DateTime.MinValue; _ruleTries.Clear(); _typingRule = null; _removeTries.Clear(); _typedFields.Clear(); _needBlur = false; _fieldIdx = -1; _blurredAt = DateTime.MinValue;
         _log("market.filters_planned", new { round = _filterRounds, _request!.MinQuantity, _request.MinPackSize });
+    }
+    private static string FieldValue(GameController gc, Element f)
+    {
+        var t = Lower(f); if (t.Length > 0) return t;
+        var i = AwakeningGameReader.InputText(gc, f); return (i ?? "").Trim().ToLowerInvariant();
     }
     private static string Lower(Element? e) => Regex.Replace(Text(e), @"<[^>]*>|[{}]", "").Trim().ToLowerInvariant();
     private bool Act(string what)
@@ -218,7 +228,14 @@ public sealed class AwakeningMarketBuyer
             case 0: // Item Category = Map
             {
                 var field = Child(market, FCategory);
-                if (field == null) { _log("market.filter_field_missing", new { stage = 0 }); _fStage = 99; return; }
+                if (field == null || !field.IsVisible)
+                {
+                    // A reset (or a fresh client) collapses "Type Filters": expand it; never mark unset filters as set.
+                    var typeHeader = Child(market, FTypeHeader);
+                    if (typeHeader != null && InView(gc, market, typeHeader) && Act("expand_type")) { Click(gc, typeHeader); _log("market.filter_expand", new { section = "type" }); }
+                    else if (typeHeader == null) { _log("market.filter_field_missing", new { stage = 0 }); _filterRounds = 99; Set(Step.Search, "filter panel not found"); }
+                    return;
+                }
                 if (Lower(field) == "map") { _fStage = 1; _fTries = 0; return; }
                 if (!InView(gc, market, field) || !Act("category")) return;
                 TypeInto(gc, field, "MAP", Keys.Down, Keys.Return);
@@ -231,13 +248,24 @@ public sealed class AwakeningMarketBuyer
                 { if (header != null && InView(gc, market, header) && Act("expand_map")) Click(gc, header); return; }
                 var want = new (int[] Path, string Value)[] { (FTierMin, "16"), (FTierMax, "16"),
                     (FQuantityMin, _request!.MinQuantity.ToString(CultureInfo.InvariantCulture)), (FPackMin, _request.MinPackSize.ToString(CultureInfo.InvariantCulture)) };
-                foreach (var (path, value) in want)
+                // One field at a time: type → click the neutral "Map Tier" label (blur; a focused field only shows its
+                // new text after losing focus) → verify via InputText/Text → next field. Up to 3 tries per field.
+                for (var i = 0; i < want.Length; i++)
                 {
+                    var (path, value) = want[i];
                     var f = Child(market, path);
                     if (f == null) continue;
-                    if (Lower(f) == value) continue;
+                    if (FieldValue(gc, f) == value) { if (_needBlur && _fieldIdx == i) _needBlur = false; continue; }
+                    if (_needBlur && _fieldIdx == i)
+                    {
+                        var label = Child(market, FTierLabel);
+                        if (label != null && InView(gc, market, label)) { Click(gc, label); _fActedAt = DateTime.UtcNow; _needBlur = false; _blurredAt = DateTime.UtcNow; }
+                        return;
+                    }
+                    if (_fieldIdx == i && (DateTime.UtcNow - _blurredAt).TotalMilliseconds < 2500) return; // let the blur settle
+                    if (_fieldIdx == i) _log("market.filter_retype", new { field = value, text = Text(f), input = AwakeningGameReader.InputText(gc, f) });
                     if (!InView(gc, market, f) || !Act("field:" + value)) return;
-                    TypeInto(gc, f, value);
+                    TypeInto(gc, f, value); _fieldIdx = i; _needBlur = true; _blurredAt = DateTime.MinValue;
                     return;
                 }
                 // All values verified. The section must stay expanded: a collapsed filter section is not applied

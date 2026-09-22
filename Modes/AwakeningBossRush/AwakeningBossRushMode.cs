@@ -852,23 +852,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private void Prepare(BotContext ctx)
     {
         if (ctx.Game.Area?.CurrentArea?.IsHideout != true) { Status = "Waiting for hideout"; return; }
+        if (!Run.ActivationRequested && !Run.ActivationConfirmed && EnsureChaosKnown(ctx)) return;
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && !_listingChecked && PlanListings(ctx)) return;
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && PlanDivineConversion(ctx)) return;
         if (EnsureGuardian(ctx)) return;
         // 2026-09-22 00:47: QuickPortal (F2) needs Portal Scrolls; with 0 left the character was stranded in the map.
-        if (!Run.ActivationRequested && !Run.ActivationConfirmed && !_scrollsChecked)
-        {
-            _scrollsChecked = true;
-            var scrolls = AwakeningExchange.CountInMainInventory(ctx.Game, "Portal Scroll");
-            if (scrolls < 5 && ctx.Settings.Awakening.Economy.AutoRestock.Value)
-            {
-                _restockQueue.Clear();
-                _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.BuyAtAsk, "Portal Scroll", "Chaos Orb", 40, 1.0));
-                _log.Event(Run, "restock.portal_scrolls", new { scrolls });
-                _restockBackToPrepare = true; CancelInput(ctx);
-                SetPhase(AwakeningPhase.Restock, "portal_scrolls_low"); return;
-            }
-        }
+        // Take a stack from the stash; only when the stash has none, buy with 1 chaos at Faustus (user).
+        if (!Run.ActivationRequested && !Run.ActivationConfirmed && TickPortalScrolls(ctx)) return;
         var moveConflict = ctx.Combat.MovementBindingConflict(ctx.Game, ctx.Navigation.MoveKey);
         if (moveConflict != null)
         {
@@ -1158,6 +1148,55 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         catch (Exception ex) { _log.Event(Run, "guardian.resummon_failed", new { error = ex.Message }); _guardianChecked = true; return false; }
         Status = "Re-summoning the Animate Guardian"; return true;
     }
+    // The Currency stash tab (Chaos count) is only in the server inventories after the stash was opened once
+    // (user, 2026-09-22). Open it before any Chaos-based decision; give up after 15 s.
+    private int _scrollStage; private DateTime _scrollStageAt;
+    private bool TickPortalScrolls(BotContext ctx)
+    {
+        const string name = "Portal Scroll";
+        if (_scrollsChecked) return false;
+        var carried = AwakeningExchange.CountInMainInventory(ctx.Game, name);
+        if (carried >= 5) { if (_scrollStage == 1) { ctx.Stash.Cancel(ctx.Game, ctx.Navigation); _log.Event(Run, "portal_scrolls.withdrawn", new { carried }); } _scrollsChecked = true; _scrollStage = 0; return false; }
+        var total = AwakeningExchange.CountHeld(ctx.Game, name);
+        if (_scrollStage == 0)
+        {
+            _log.Event(Run, "portal_scrolls.low", new { carried, stash = total - carried });
+            if (total - carried > 0)
+            {
+                if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true) { TryClickStashLabel(ctx); _phaseAt = DateTime.UtcNow; return true; }
+                ctx.Stash.ApplyIncubators = false;
+                if (ctx.Stash.Start(withdrawTabName: "Currency", withdrawFragmentPath: "Metadata/Items/Currency/CurrencyPortal", withdrawCount: 1, itemFilter: _ => false))
+                { _scrollStage = 1; _scrollStageAt = DateTime.UtcNow; _phaseAt = DateTime.UtcNow; return true; }
+            }
+            _scrollStage = 2;
+        }
+        if (_scrollStage == 1)
+        {
+            var r = ctx.Stash.Tick(ctx.Game, ctx.Navigation); Status = "Portal Scrolls: " + ctx.Stash.Status; _phaseAt = DateTime.UtcNow;
+            if (r is StashResult.InProgress or StashResult.None && (DateTime.UtcNow - _scrollStageAt).TotalSeconds < 20) return true;
+            ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
+            if (AwakeningExchange.CountInMainInventory(ctx.Game, name) >= 5) { _scrollsChecked = true; _scrollStage = 0; return false; }
+            _log.Event(Run, "portal_scrolls.stash_failed", new { ctx.Stash.Status }); _scrollStage = 2;
+        }
+        // Stash empty (or unreadable): 1 chaos buys a stack's worth at the best ask.
+        _scrollsChecked = true; _scrollStage = 0;
+        if (!ctx.Settings.Awakening.Economy.AutoRestock.Value) return false;
+        _restockQueue.Clear();
+        _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.BuyAtAsk, name, "Chaos Orb", 0, 1.0));
+        _log.Event(Run, "restock.portal_scrolls", new { carried, mode = "faustus_1c" });
+        _restockBackToPrepare = true; CancelInput(ctx);
+        SetPhase(AwakeningPhase.Restock, "portal_scrolls_low"); return true;
+    }
+    private DateTime _chaosKnownSince = DateTime.MinValue;
+    private bool EnsureChaosKnown(BotContext ctx)
+    {
+        if (AwakeningExchange.HeldBreakdown(ctx.Game, "Chaos Orb").Any(r => r.ToString()!.Contains("StashInventoryId"))) { _chaosKnownSince = DateTime.MinValue; return false; }
+        if (_chaosKnownSince == DateTime.MinValue) { _chaosKnownSince = DateTime.UtcNow; _log.Event(Run, "chaos.unknown_open_stash", new { }); }
+        if ((DateTime.UtcNow - _chaosKnownSince).TotalSeconds > 15) return false;
+        _phaseAt = DateTime.UtcNow;
+        if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true) TryClickStashLabel(ctx);
+        Status = "Opening the stash to load the Chaos count"; return true;
+    }
     private bool PlanDivineConversion(BotContext ctx)
     {
         if (!ctx.Settings.Awakening.Economy.AutoRestock.Value) return false;
@@ -1248,6 +1287,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                     }
                     else _log.Event(Run, "restock.bid_already_pending", new { done.WantName, since = _bidPending[done.WantName] });
                 }
+                else if (done.WantName == "Portal Scroll") _log.Event(Run, "restock.portal_scrolls_failed", new { _exchange.FailReason });
                 else if (economy.StopWhenOutOfChaos.Value) { Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:restock_failed:" + _exchange.FailReason); return; }
             }
             if (_exchange.Succeeded && done.Kind == ExchangeKind.BuyAtBid && done.WantName == "Divine Orb")

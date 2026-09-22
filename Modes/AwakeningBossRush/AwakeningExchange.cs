@@ -206,6 +206,13 @@ public sealed class AwakeningExchange
         {
             // Asks: chaos per item = Give/Get. Take the cheapest levels that cover the quantity; order at the worst one needed.
             if (counter.Count == 0) { Fail("no_sellers"); return; }
+            if (request.Quantity <= 0)
+            {
+                // "Spend 1 chaos" (user, 2026-09-22: cheap consumables like Portal Scrolls): as many as the best ask gives for 1c.
+                var bestAsk = counter.OrderBy(b => (double)b.Give / b.Get).First();
+                want = Math.Max(1, (long)Math.Floor((double)bestAsk.Get / bestAsk.Give)); have = 1;
+                goto planned;
+            }
             var levels = counter.OrderBy(b => (double)b.Give / b.Get).ToList();
             long covered = 0; var chosen = levels[0];
             foreach (var l in levels) { chosen = l; covered += Math.Max(1, l.Listed); if (covered >= request.Quantity) break; }
@@ -248,6 +255,7 @@ public sealed class AwakeningExchange
             if (counter.Count > 0 && counter.Max(b => (double)b.Get / b.Give) >= unit) { Fail("would_fill_at_bid_use_sell"); return; }
             have = request.Quantity; want = (long)(unit * request.Quantity);
         }
+        planned:
         if (want <= 0 || have <= 0 || want > int.MaxValue || have > int.MaxValue) { Fail("bad_amounts"); return; }
         _orderWant = (int)want; _orderHave = (int)have;
         var chaosPerItem = request.Kind is ExchangeKind.BuyAtAsk or ExchangeKind.BuyAtBid ? (double)have / want : (double)want / have;
