@@ -1919,7 +1919,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             .Select(e => (e, d: Vector2.Distance(player, e.GridPosNum))).ToList();
         var crowded = crowdNow.Count(x => x.d < 12) >= 4 || crowdNow.Any(x => x.d < 8 && x.e.Rarity is MonsterRarity.Rare or MonsterRarity.Unique);
         // 2026-09-22: kiting every 2.5 s reset Spark's Intensity (lost while moving). Only kite a crowd that is hurting us.
-        var kite = crowded && hurting && !burst && inside.Count == 0 && (now - _lastKiteAt).TotalSeconds >= 2.5 && Run.Phase is not AwakeningPhase.MapBoss;
+        // 2026-09-22 06:12: during the Feared fight three rare Spirits/Totems stood 5–6 grid away and one hit took 4700 ES
+        // to 0 without any earlier damage, so "hurting" never fired. In a pinnacle fight kite a close crowd pre-emptively.
+        var kite = crowded && (hurting || Run.Phase == AwakeningPhase.Fight) && !burst && inside.Count == 0 && (now - _lastKiteAt).TotalSeconds >= 2.5 && Run.Phase is not AwakeningPhase.MapBoss;
         if (inside.Count == 0 && !burst && !kite) return false;
         if (kite) _lastKiteAt = now;
         var away = Vector2.Zero;
@@ -2310,6 +2312,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 _log.Event(Run, "loot.pickup_timeout", new { _lootId, _lootName, _lootBefore, _lootQuantity, stillOnGround,
                     inventoryCount = inv.Counts.GetValueOrDefault(_lootPath), ctx.Interaction.Status, ctx.Interaction.LastFailReason, ctx.Navigation.LastRecoveryAction,
                     rawInput = BotInput.RecentRawInputDiagnostics });
+                // Gone from the ground (picked into a split stack, 06:13): no need to walk back for it later.
+                if (!stillOnGround) _pendingValuables.Remove(_lootId);
                 ctx.Interaction.Cancel(ctx.Game); _lootAttempts[_lootId] = _lootAttempts.GetValueOrDefault(_lootId) + 1;
                 if (_lootAttempts[_lootId] >= 3)
                 {
@@ -2796,5 +2800,5 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         ctx.Graphics.DrawText($"Bosses {Run.Bosses.Values.Count(b => b.Life == BossLife.DeadConfirmed)}/{Run.Bosses.Count} | Loot {Run.RevenueChaos:F1}c | Deaths {Run.Deaths}",
             origin + new Vector2(0, 40), SharpDX.Color.Gold);
     }
-    public void Dispose() { Supervisor.Save(); _log.Dispose(); }
+    public void Dispose() { Supervisor.Save(); Supervisor.Flush(); _log.Dispose(); }
 }

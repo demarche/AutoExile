@@ -15,14 +15,33 @@ public sealed class AwakeningTelemetry : IDisposable
     {
         _log = log;
         _generation = generation;
+        // Rotation (2026-09-22): the single ~190 MB events.jsonl inside the OneDrive folder was re-synced on every
+        // append; the active file is now rotated at 24 MB (events-<utc>.jsonl), so sync only touches a small file.
         _writer = Task.Run(async () =>
         {
             try
             {
                 Directory.CreateDirectory(directory);
-                await using var stream = new FileStream(Path.Combine(directory, "events.jsonl"), FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
-                await using var writer = new StreamWriter(stream) { AutoFlush = true };
-                await foreach (var line in _disk.Reader.ReadAllAsync()) await writer.WriteLineAsync(line);
+                var path = Path.Combine(directory, "events.jsonl");
+                while (true)
+                {
+                    long size;
+                    await using (var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+                    await using (var writer = new StreamWriter(stream, new System.Text.UTF8Encoding(false), 1 << 16))
+                    {
+                        size = stream.Length;
+                        var rotate = false;
+                        while (!rotate && await _disk.Reader.WaitToReadAsync())
+                        {
+                            while (_disk.Reader.TryRead(out var line)) { await writer.WriteLineAsync(line); size += line.Length + 2; }
+                            await writer.FlushAsync();
+                            rotate = size > 24L * 1024 * 1024;
+                        }
+                        if (!rotate) return; // channel completed
+                    }
+                    try { File.Move(path, Path.Combine(directory, $"events-{DateTime.UtcNow:yyyyMMdd-HHmmss}.jsonl")); }
+                    catch (Exception ex) { Error = "rotate: " + ex.Message; }
+                }
             }
             catch (Exception ex) { Error = ex.Message; }
         });
@@ -31,9 +50,9 @@ public sealed class AwakeningTelemetry : IDisposable
     {
         var line = AwakeningJson.Serialize(new { schema = 1, @event = name, utc = DateTime.UtcNow, generation = _generation, run.RunId, run.AttemptId,
             run.BuildMvid, run.Instance, run.Area, run.Phase, elapsedMs = run.ElapsedSeconds * 1000, data });
-        // Existing ExileCore log sink includes these records in Logs/VerboseYYYYMMDD.log.
-        try { _log("[Awakening] " + line); }
-        catch (Exception ex) { Error = "Verbose sink: " + ex.Message; }
+        // 2026-09-22 (user: busy hourglass during the Awakening verbose log): every record was also pushed through the
+        // ExileCore overlay/Verbose logger on the Tick thread (120-sample ring flushes came in bursts). The identical
+        // records stay in events.jsonl, written off-thread; the overlay sink is no longer used.
         if (!_disk.Writer.TryWrite(line)) Dropped++;
     }
     public void Sample(object snapshot)

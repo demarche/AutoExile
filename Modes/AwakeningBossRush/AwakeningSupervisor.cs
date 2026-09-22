@@ -36,9 +36,46 @@ public sealed class AwakeningSupervisor
         && run.UnresolvedLoot != null && run.MapBossIds != null && run.DeadMapBossIds != null && run.LootSweptBosses != null
         && (run.Map == null || (run.Map.Mods != null && run.Map.Mods.All(m => m != null && m.Stats != null && m.Values != null)))
         && double.IsFinite(run.ElapsedSeconds) && double.IsFinite(run.OperatingSeconds) && run.AttemptNumber >= 0;
+    // 2026-09-22 (user: busy hourglass while the Awakening verbose log runs): Save() used to serialize the ~1.3 MB
+    // checkpoint, fsync it and retry the OneDrive-locked replace with up to 1.5 s of Thread.Sleep — all on the game
+    // Tick thread. Now the snapshot is serialized on the caller (consistent state) and written by a background thread
+    // (latest snapshot wins). A persistent write failure still sets StorageError, which disarms the loop.
+    private readonly object _saveGate = new();
+    private byte[]? _pendingSnapshot;
+    private readonly AutoResetEvent _saveSignal = new(false);
+    private readonly ManualResetEventSlim _saveIdle = new(true);
+    private Thread? _saver;
     public bool Save()
     {
         if (StorageError.Length > 0) return false;
+        byte[] snapshot;
+        // Finished runs keep their outcome/mod evidence; their scout breadcrumbs (Visited) made the checkpoint ~1.3 MB.
+        foreach (var h in State.History) if (h.Visited.Count > 0) h.Visited = new();
+        try { snapshot = JsonSerializer.SerializeToUtf8Bytes(State, AwakeningJson.Options); }
+        catch (Exception ex) { StorageError = $"serialize checkpoint: {ex.GetType().Name}: {ex.Message}"; State.Armed = false; return false; }
+        lock (_saveGate)
+        {
+            _pendingSnapshot = snapshot; _saveIdle.Reset();
+            if (_saver == null) { _saver = new Thread(SaveLoop) { IsBackground = true, Name = "Awakening checkpoint writer", Priority = ThreadPriority.BelowNormal }; _saver.Start(); }
+        }
+        _saveSignal.Set();
+        return true;
+    }
+    /// <summary>Waits (bounded) until the latest snapshot is on disk; used on unload.</summary>
+    public void Flush(int timeoutMs = 2000) => _saveIdle.Wait(timeoutMs);
+    private void SaveLoop()
+    {
+        while (true)
+        {
+            _saveSignal.WaitOne(1000);
+            byte[]? snapshot;
+            lock (_saveGate) { snapshot = _pendingSnapshot; _pendingSnapshot = null; if (snapshot == null) { _saveIdle.Set(); continue; } }
+            WriteSnapshot(snapshot);
+            lock (_saveGate) { if (_pendingSnapshot == null) _saveIdle.Set(); }
+        }
+    }
+    private void WriteSnapshot(byte[] snapshot)
+    {
         var operation = "write temporary checkpoint";
         try
         {
@@ -46,15 +83,11 @@ public sealed class AwakeningSupervisor
             var temp = _file + ".tmp";
             using (var fs = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
             {
-                JsonSerializer.Serialize(fs, State, AwakeningJson.Options);
+                fs.Write(snapshot, 0, snapshot.Length);
                 fs.Flush(true);
             }
             operation = "replace checkpoint";
-            // Cloud sync and file scanners can briefly deny replacement on Windows.
-            // Only retry the already flushed replacement, never the command or its game action.
-            // At most 85 ms of backoff; persistent failures still disarm before input starts.
-            // 2026-09-22 23:23: OneDrive held the 1.3 MB checkpoint longer than 85 ms ("Access to the path is denied")
-            // and the loop stopped after a death. Back off up to ~1.5 s, then fall back to overwriting in place.
+            // Cloud sync and file scanners can briefly deny replacement on Windows (OneDrive): back off, then overwrite in place.
             int[] delaysMs = [10, 25, 50, 100, 200, 400, 700];
             for (int retry = 0; ; retry++)
             {
@@ -77,9 +110,8 @@ public sealed class AwakeningSupervisor
                     Thread.Sleep(delaysMs[retry]);
                 }
             }
-            return true;
         }
-        catch (Exception ex) { StorageError = $"{operation}: {ex.GetType().Name} (0x{ex.HResult:X8}): {ex.Message}"; State.Armed = false; return false; }
+        catch (Exception ex) { StorageError = $"{operation}: {ex.GetType().Name} (0x{ex.HResult:X8}): {ex.Message}"; State.Armed = false; }
     }
     public string Command(string action, string requestId, string expectedGeneration, string review = "", string expectedMvid = "")
     {
