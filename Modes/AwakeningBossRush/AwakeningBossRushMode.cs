@@ -867,7 +867,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         var inv = AwakeningGameReader.Inventory(ctx.Game);
         if (!inv.Valid) { Status = "Waiting for inventory"; return; }
-        if (inv.OutsideReservedColumn > 0 && (Run.ActivationConfirmed || Run.Recipe.Count == 0))
+        if (inv.OutsideReservedColumn > 0 && !_leftoversAccepted && (Run.ActivationConfirmed || Run.Recipe.Count == 0))
         { SetPhase(AwakeningPhase.OpenStash, "stash_before_attempt"); return; }
         if (Run.ActivationConfirmed)
         {
@@ -2635,7 +2635,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         CancelInput(ctx); SetPhase(AwakeningPhase.ExternalStash, "stash_visible");
     }
     private bool _mapBankStarted, _mapBankDone, _mapBankRunDone, _mapBankLogged;
-    private int _f3Retries, _modReleases;
+    private int _f3Retries, _modReleases; private bool _leftoverStoreTried, _leftoverStoring, _leftoversAccepted;
     private bool IsBankableMap(BotContext ctx, Entity? item)
     {
         try
@@ -2651,6 +2651,16 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             // StashSystem closes the stash after its store batch; bank at most once per run, then reopen for F3.
             if (_mapBankStarted && !_externalIssued) { _mapBankRunDone = true; ctx.Stash.Cancel(ctx.Game, ctx.Navigation); SetPhase(AwakeningPhase.OpenStash, "reopen_stash_after_map_bank"); return; }
+            if (_leftoverStoreTried)
+            {
+                // The leftover store batch closed the stash: accept what remains and move on.
+                ctx.Stash.Cancel(ctx.Game, ctx.Navigation); _leftoverStoring = false; _leftoverStoreTried = false; _leftoversAccepted = true;
+                _f3Retries = 0; _modReleases = 0; Run.StashCompleted = true;
+                _log.Event(Run, "external.stash_leftovers", new { closed = true, items = StashSystem.GetInventorySlotItems(ctx.Game)?.Where(i => i.PosX < 11).Select(i => i.Item?.Path).Take(20).ToArray() });
+                if (Run.ReturnedToHideout && Run.BossesCompleted) Finish(ctx, AttemptOutcome.Success, "bosses_loot_hideout_stash_leftovers");
+                else SetPhase(AwakeningPhase.Prepare, "initial_stash_leftovers");
+                return;
+            }
             Status = "Stash closed during external operation"; return;
         }
         // Map banking: StashieV2 sends maps to the MAP (map stash) tab, which RestockMap cannot read. Acceptable T16
@@ -2697,9 +2707,27 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             { _f3Retries++; _lastKeyAt = DateTime.UtcNow; _log.Event(Run, "external.F3_retry", new { retry = _f3Retries, inventory.OutsideReservedColumn }); return; }
             if (_f3Retries >= 2)
             {
+                // 2026-09-22 06:30: StashieV2 never files a looted body armour (BodyStrInt17); Prepare then reopened the
+                // stash and pressed F3 forever. Move non-reserved leftovers into "Tmp" once, then accept whatever remains.
+                if (!_leftoverStoreTried)
+                {
+                    _leftoverStoreTried = true; ctx.Stash.ApplyIncubators = false;
+                    _leftoverStoring = ctx.Stash.Start(storeTabName: "Tmp", itemFilter: i => i.PosX < 11 && i.Item?.Path?.Contains("MapKeyTier16") != true);
+                    _log.Event(Run, "external.leftovers_to_Tmp", new { started = _leftoverStoring, items = StashSystem.GetInventorySlotItems(ctx.Game)?.Where(i => i.PosX < 11).Select(i => i.Item?.Path).Take(20).ToArray() });
+                    if (_leftoverStoring) return;
+                }
+                if (_leftoverStoring)
+                {
+                    var r = ctx.Stash.Tick(ctx.Game, ctx.Navigation);
+                    if (r is StashResult.InProgress or StashResult.None) { _phaseAt = DateTime.UtcNow; return; }
+                    ctx.Stash.Cancel(ctx.Game, ctx.Navigation); _leftoverStoring = false;
+                    if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true) return; // reopen handled by the phase
+                }
+                inventory = AwakeningGameReader.Inventory(ctx.Game);
+                _leftoversAccepted = true;
                 _log.Event(Run, "external.stash_leftovers", new { inventory.OutsideReservedColumn,
                     items = StashSystem.GetInventorySlotItems(ctx.Game)?.Select(i => i.Item?.Path).Take(20).ToArray() });
-                _f3Retries = 0; _modReleases = 0; Run.StashCompleted = true;
+                _f3Retries = 0; _modReleases = 0; _leftoverStoreTried = false; Run.StashCompleted = true;
                 if (Run.ReturnedToHideout && Run.BossesCompleted) Finish(ctx, AttemptOutcome.Success, "bosses_loot_hideout_stash_leftovers");
                 else SetPhase(AwakeningPhase.Prepare, "initial_stash_leftovers");
                 return;
@@ -2711,7 +2739,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (_stableEmpty < 5 || (DateTime.UtcNow - _lastKeyAt).TotalSeconds < 2) return;
         if (_quietAt == DateTime.MinValue) { _quietAt = DateTime.UtcNow; return; }
         if ((DateTime.UtcNow - _quietAt).TotalSeconds < 1) return;
-        Run.StashCompleted = true; _f3Retries = 0; _modReleases = 0;
+        Run.StashCompleted = true; _f3Retries = 0; _modReleases = 0; _leftoversAccepted = false;
         _log.Event(Run, "external.stash_complete", new { inventory.OutsideReservedColumn, stashBusy });
         if (Run.ReturnedToHideout && Run.BossesCompleted) Finish(ctx, AttemptOutcome.Success, "bosses_loot_hideout_stash_confirmed");
         else SetPhase(AwakeningPhase.Prepare, "initial_stash_complete");
