@@ -54,7 +54,7 @@ public sealed class AwakeningMarketBuyer
     public void Start(GameController gc, MarketMapRequest request)
     {
         _request = request; _keys.Clear(); _skippedSellers.Clear(); Purchases.Clear();
-        Bought = 0; Spent = 0; FailReason = ""; _searches = 0; _filterRounds = 0;
+        Bought = 0; Spent = 0; FailReason = ""; _searches = 0; _filterRounds = 0; _resetDone = false;
         _homeArea = gc.Area?.CurrentArea?.Name ?? ""; _homeHash = AreaHash(gc);
         _startedAt = DateTime.UtcNow; Set(Step.OpenMarket, "opening the market");
         _log("market.started", request);
@@ -144,6 +144,9 @@ public sealed class AwakeningMarketBuyer
     private static readonly int[] FPackMin = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 1, 0, 1, 1, 0, 0, 0 };
     private static readonly int[] FQuantityMin = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 1, 1, 0, 1, 0, 0, 0 };
     private static readonly int[] FViewport = { 2, 3, 1 };
+    // Broom icon right of "Search" (user, 2026-09-22): resets every filter to default.
+    private static readonly int[] FResetAll = { 2, 3, 1, 0, 0, 2, 1, 0 };
+    private bool _resetFilters, _resetDone;
     private static readonly int[] FGroupTitle = { 2, 3, 1, 0, 0, 1, 2, 1, 0, 0, 0, 0 };
     private static readonly int[] FGroupEdit = { 2, 3, 1, 0, 0, 1, 2, 1, 0, 0, 1, 0 };
     private static readonly int[] FGroupRows = { 2, 3, 1, 0, 0, 1, 2, 1, 0, 1 };
@@ -169,7 +172,7 @@ public sealed class AwakeningMarketBuyer
     };
     private void PlanFilters(Element market)
     {
-        _fStage = 0; _fTries = 0; _fActedAt = DateTime.MinValue; _ruleTries.Clear(); _typingRule = null; _removeTries.Clear();
+        _fStage = _resetFilters && !_resetDone ? -1 : 0; _fTries = 0; _fActedAt = DateTime.MinValue; _ruleTries.Clear(); _typingRule = null; _removeTries.Clear();
         _log("market.filters_planned", new { round = _filterRounds, _request!.MinQuantity, _request.MinPackSize });
     }
     private static string Lower(Element? e) => Regex.Replace(Text(e), @"<[^>]*>|[{}]", "").Trim().ToLowerInvariant();
@@ -205,6 +208,13 @@ public sealed class AwakeningMarketBuyer
         if ((DateTime.UtcNow - _fActedAt).TotalMilliseconds < 1300) return;
         switch (_fStage)
         {
+            case -1: // start from a clean slate (results were wrong or a stale stat row could not be removed)
+            {
+                var broom = Child(market, FResetAll);
+                _resetDone = true; _resetFilters = false; _fStage = 0; _fTries = 0;
+                if (broom != null) { Click(gc, broom); _fActedAt = DateTime.UtcNow; _log("market.filters_reset", new { round = _filterRounds }); }
+                return;
+            }
             case 0: // Item Category = Map
             {
                 var field = Child(market, FCategory);
@@ -264,6 +274,7 @@ public sealed class AwakeningMarketBuyer
                     // Fractured variants and duplicates are harmless inside a Not group; only foreign stats are removed
                     // (removing re-lays out the list and a stale × click repeated forever on 2026-09-22).
                     if (e.Text.Length > 0 && rule.Id == null && _removeTries.GetValueOrDefault(e.Text) < 3) { wrong = e; break; }
+                    if (e.Text.Length > 0 && rule.Id == null && !_resetDone) { _resetFilters = true; PlanFilters(market); return; }
                 }
                 if (wrong.Row != null)
                 {
@@ -319,7 +330,7 @@ public sealed class AwakeningMarketBuyer
         }
         _log("market.results", new { count = rows.Count, rows = rows.Select(r => new { r.Name, r.Price, r.Currency, r.Seller, r.Quantity, r.Pack, r.Prefix, r.Suffix, reject = r.Reject }) });
         if (rows.Count > 0 && rows.All(r => r.Reject?.StartsWith("not_T16", StringComparison.Ordinal) == true) && _filterRounds < 3)
-        { _filtersSet = false; Set(Step.Search, "results are not T16 maps: resetting the filters"); return; }
+        { _filtersSet = false; _resetFilters = true; Set(Step.Search, "results are not T16 maps: resetting the filters"); return; }
         var pick = rows.FirstOrDefault(r => r.Reject == null && !_skippedSellers.Contains(r.Seller));
         if (pick == null) { GoHomeOrFail(gc, rows.Count == 0 ? "no_results" : "no_acceptable_listing"); return; }
         var travel = Child(pick.Entry, 0, 1, 2, 0, 4, 0);

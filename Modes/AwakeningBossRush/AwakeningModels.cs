@@ -54,6 +54,8 @@ public sealed class AwakeningRun
     public DateTime? LastNewBossUtc { get; set; }
     // Where the pinnacle drops lie (encounter centre when looting started). Survives deaths so a re-entry goes straight back.
     public float[]? DropSite { get; set; }
+    // Where the character arrived through the map device portal (the portals stay there): the way home without scrolls.
+    public float[]? EntryPos { get; set; }
     public List<string> LootReceipts { get; set; } = new();
     public List<string> UnresolvedLoot { get; set; } = new();
     public List<float[]> Visited { get; set; } = new();

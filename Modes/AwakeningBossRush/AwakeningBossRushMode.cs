@@ -421,7 +421,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _inspectionStatus = "";
             _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
             _mapBankRunDone = false; _mapBankLogged = false; _mapTierStep = 0; _chaosStoreClicks = 0;
-            _guardianChecked = false; _guardianCasts = 0;
+            _guardianChecked = false; _guardianCasts = 0; _scrollsChecked = false;
             _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false;
             _defensiveClear = false;
             _lootDefenseActive = false; _lootDefenseSuppressedUntil = DateTime.MinValue;
@@ -524,6 +524,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 var hash = (long)(gc.IngameState.Data.CurrentAreaHash);
                 if (Run.Instance != 0 && Run.Instance != hash) { Finish(ctx, AttemptOutcome.OperationalFailure, "wrong_instance_on_reentry"); return; }
                 Run.Instance = hash; Run.Area = gc.Area!.CurrentArea.Name; Run.EnteredUtc = now;
+                if (Run.EntryPos == null) Run.EntryPos = [gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y];
                 var raw = gc.IngameState.Data.RawPathfindingData;
                 if (raw != null) ctx.Exploration.Initialize(raw, gc.IngameState.Data.RawTerrainTargetingData, gc.Player.GridPosNum, ctx.Settings.Build.BlinkRange.Value);
                 ctx.MapDevice.Cancel(gc, ctx.Navigation); _damage.Reset(now);
@@ -854,6 +855,20 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && !_listingChecked && PlanListings(ctx)) return;
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && PlanDivineConversion(ctx)) return;
         if (EnsureGuardian(ctx)) return;
+        // 2026-09-22 00:47: QuickPortal (F2) needs Portal Scrolls; with 0 left the character was stranded in the map.
+        if (!Run.ActivationRequested && !Run.ActivationConfirmed && !_scrollsChecked)
+        {
+            _scrollsChecked = true;
+            var scrolls = AwakeningExchange.CountInMainInventory(ctx.Game, "Portal Scroll");
+            if (scrolls < 5 && ctx.Settings.Awakening.Economy.AutoRestock.Value)
+            {
+                _restockQueue.Clear();
+                _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.BuyAtAsk, "Portal Scroll", "Chaos Orb", 40, 1.0));
+                _log.Event(Run, "restock.portal_scrolls", new { scrolls });
+                _restockBackToPrepare = true; CancelInput(ctx);
+                SetPhase(AwakeningPhase.Restock, "portal_scrolls_low"); return;
+            }
+        }
         var moveConflict = ctx.Combat.MovementBindingConflict(ctx.Game, ctx.Navigation.MoveKey);
         if (moveConflict != null)
         {
@@ -1111,7 +1126,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private bool _divineDiagLogged, _stashChaosFull;
     // Animate Guardian (Metadata/Monsters/AnimatedItem/AnimatedArmour) is a big part of survival. It cannot be
     // re-summoned in the area it died in; in the Hideout the user's middle-mouse binding on empty floor brings it back.
-    private bool _guardianChecked; private int _guardianCasts; private DateTime _guardianCastAt;
+    private bool _guardianChecked, _scrollsChecked; private int _guardianCasts; private DateTime _guardianCastAt;
     private static bool GuardianPresent(BotContext ctx) => ctx.Game.EntityListWrapper.OnlyValidEntities.Any(e =>
         e.Path.StartsWith("Metadata/Monsters/AnimatedItem/AnimatedArmour", StringComparison.Ordinal) && e.IsAlive && !e.IsHostile);
     private bool EnsureGuardian(BotContext ctx)
@@ -1258,7 +1273,10 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             var chaos = AwakeningExchange.CountHeld(ctx.Game, "Chaos Orb");
             var estimate = next.MaxUnitChaos / 1.5 * next.Quantity;
-            if (chaos < estimate)
+            // 2026-09-22 01:34: right after a host restart the Currency stash tab is not loaded yet, CountHeld reads 0
+            // and the loop stopped with "out_of_chaos" while 3800c sat in the stash. Unknown ≠ empty: let Faustus decide.
+            var chaosKnown = AwakeningExchange.HeldBreakdown(ctx.Game, "Chaos Orb").Count > 0;
+            if (chaosKnown && chaos < estimate)
             {
                 var sellable = economy.SellWhenChaosShort.Value && _restockSales < SellableNames.Length
                     ? SellableNames.Skip(_restockSales).FirstOrDefault(n => AwakeningExchange.CountHeld(ctx.Game, n) > 0) : null;
@@ -2258,7 +2276,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if ((DateTime.UtcNow - _quietAt).TotalSeconds < ctx.Settings.Awakening.LootSettleSeconds.Value) return;
         // After the quiet metadata-complete scan, 60 grids is well inside the entity bubble.
         // Do not require walking onto corpses beyond rocks when their surrounding loot is already observable.
-        foreach (var nearby in Run.Bosses.Values.Where(b => b.Life == BossLife.DeadConfirmed && Vector2.Distance(ctx.Game.Player.GridPosNum, new(b.X, b.Y)) < 60))
+        foreach (var nearby in Run.Bosses.Values.Where(b => b.Life == BossLife.DeadConfirmed && Vector2.Distance(ctx.Game.Player.GridPosNum, new(b.X, b.Y)) < 25))
             if (!Run.LootSweptBosses.Contains(nearby.Id))
             {
                 Run.LootSweptBosses.Add(nearby.Id);
@@ -2294,11 +2312,23 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             Status = "Drops collected; waiting for the encounter to settle (no new boss for " + AwakeningBossTracker.SettleSeconds + "s)"; return;
         }
         _log.Event(Run, "encounter.complete", new { basis, bosses = Run.Bosses.Values.Select(b => b.Member).ToArray() });
-        Run.DropSite = null;
+        // 2026-09-22: the drop site is kept for the rest of this map. A re-entry (after a death or a failed return) used
+        // to find nothing near the entrance, call the encounter complete in 2 s and leave a Maven's Chisel on the ground.
         CancelInput(ctx); SetPhase(AwakeningPhase.Return, "loot_complete");
     }
     private void Return(BotContext ctx)
     {
+        // After a "/exit" relog the character is in town: "/hideout" works from there.
+        if (ctx.Game.Area?.CurrentArea?.IsTown == true && !ctx.Game.IsLoading)
+        {
+            if (_returnChatKeys.Count == 0 && (DateTime.UtcNow - _returnF2At).TotalSeconds > 6)
+            {
+                _log.Event(Run, "return.town_to_hideout", new { area = ctx.Game.Area.CurrentArea.Name });
+                foreach (var k in new[] { Keys.Return, Keys.None, Keys.OemQuestion, Keys.H, Keys.I, Keys.D, Keys.E, Keys.O, Keys.U, Keys.T, Keys.Return }) _returnChatKeys.Enqueue(k);
+                _returnF2At = DateTime.UtcNow; _phaseAt = DateTime.UtcNow;
+            }
+            PumpReturnKeys(); return;
+        }
         if (ctx.Game.Area?.CurrentArea?.IsHideout == true && !ctx.Game.IsLoading)
         {
             Run.ReturnedToHideout = true;
@@ -2317,9 +2347,67 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             else SetPhase(AwakeningPhase.OpenStash, "hideout_confirmed");
             return;
         }
-        if (!_externalIssued && BotInput.CanAct && BotInput.PressKey(Keys.F2))
-        { _externalIssued = true; _log.Event(Run, "external.F2", new { plugin = "QuickPortal" }); }
+        if (!_externalIssued)
+        {
+            if (BotInput.CanAct && BotInput.PressKey(Keys.F2))
+            { _externalIssued = true; _returnF2At = DateTime.UtcNow; _returnF2Count = 1; _returnChatTries = 0; _returnChatKeys.Clear(); _returnWalkLogged = false; _log.Event(Run, "external.F2", new { plugin = "QuickPortal" }); }
+            return;
+        }
+        // 2026-09-22 00:47: one F2 did nothing and the phase waited 60 s, then stopped the loop. Press it again, then
+        // fall back to walking into a portal that is already open in the map (the map device's or a town portal).
+        if (ctx.Game.IsLoading || (DateTime.UtcNow - _returnF2At).TotalSeconds < 8) return;
+        if (ctx.Game.IngameState.IngameUi.InventoryPanel?.IsVisible == true || ctx.Game.IngameState.IngameUi.StashElement?.IsVisible == true)
+        { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
+        if (_returnF2Count < 3)
+        {
+            if (BotInput.CanAct && BotInput.PressKey(Keys.F2))
+            { _returnF2Count++; _returnF2At = DateTime.UtcNow; _log.Event(Run, "external.F2_retry", new { count = _returnF2Count }); }
+            return;
+        }
+        ctx.Interaction.Tick(ctx.Game);
+        if (ctx.Interaction.IsBusy) return;
+        var portal = ctx.Game.EntityListWrapper.OnlyValidEntities.Where(e => e.IsTargetable &&
+                (e.Path.Contains("MultiplexPortal", StringComparison.Ordinal) || e.Path.Contains("PlayerPortal", StringComparison.Ordinal) || e.Path.Contains("TownPortal", StringComparison.Ordinal)))
+            .OrderBy(e => e.DistancePlayer).FirstOrDefault();
+        // Without Portal Scrolls the way home is the map device portal at the map entrance (user, 2026-09-22):
+        // walk back to where we arrived; its portals come into view there.
+        if (portal == null && Run.EntryPos is { Length: 2 } entry)
+        {
+            var target = new Vector2(entry[0], entry[1]);
+            if (Vector2.Distance(ctx.Game.Player.GridPosNum, target) > 15)
+            {
+                if (!_returnWalkLogged) { _returnWalkLogged = true; _log.Event(Run, "return.walk_to_entry", new { x = entry[0], y = entry[1], distance = Vector2.Distance(ctx.Game.Player.GridPosNum, target) }); }
+                _phaseAt = DateTime.UtcNow; Navigate(ctx, target); Status = "Return: walking back to the map entrance portal"; return;
+            }
+        }
+        if (portal == null)
+        {
+            // No open portal and QuickPortal failed (e.g. out of Portal Scrolls): "/hideout" does not work in maps, so
+            // log out with "/exit"; the relog lands in town, from where "/hideout" is typed (2026-09-22 01:30, verified).
+            if (_returnChatKeys.Count == 0 && _returnChatTries < 2)
+            {
+                _returnChatTries++; _phaseAt = DateTime.UtcNow;
+                _log.Event(Run, "return.chat_exit", new { attempt = _returnChatTries, portalScrolls = AwakeningExchange.CountInMainInventory(ctx.Game, "Portal Scroll") });
+                if (AwakeningGameReader.ChatOpen(ctx.Game)) _returnChatKeys.Enqueue(Keys.Escape);
+                foreach (var k in new[] { Keys.Return, Keys.None, Keys.OemQuestion, Keys.E, Keys.X, Keys.I, Keys.T, Keys.Return }) _returnChatKeys.Enqueue(k);
+            }
+            if (PumpReturnKeys()) return;
+            Status = "Return: no portal found"; return;
+        }
+        _log.Event(Run, "return.portal_walk", new { portal.Id, portal.Path, distance = portal.DistancePlayer });
+        ctx.Interaction.InteractWithEntity(portal, ctx.Navigation, false, requireVerified: true);
+        _returnF2At = DateTime.UtcNow; Status = "Return: walking into the open portal";
     }
+    private DateTime _returnF2At, _returnKeyAt; private int _returnF2Count, _returnChatTries; private bool _returnWalkLogged;
+    private bool PumpReturnKeys()
+    {
+        if (_returnChatKeys.Count == 0) return false;
+        if (_returnChatKeys.Peek() == Keys.None) { if ((DateTime.UtcNow - _returnKeyAt).TotalMilliseconds >= 700) { _returnChatKeys.Dequeue(); _returnKeyAt = DateTime.UtcNow; } return true; }
+        if (BotInput.CanAct && BotInput.PressKey(_returnChatKeys.Peek())) { _returnChatKeys.Dequeue(); _returnKeyAt = DateTime.UtcNow; }
+        if (_returnChatKeys.Count == 0) _returnF2At = DateTime.UtcNow.AddSeconds(4);
+        return true;
+    }
+    private readonly Queue<Keys> _returnChatKeys = new();
     // 2026-09-22 17:51: a restock that stopped on the price cap left the Faustus exchange panel open after a host
     // restart; 60 s of stash-label clicks and move clicks were swallowed by it. Close such panels first.
     private DateTime _blockerEscapeAt; private int _blockerEscapes;
