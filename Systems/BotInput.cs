@@ -1759,6 +1759,28 @@ namespace AutoExile.Systems
         }
 
         /// <summary>Move cursor, settle, right-click. Suspends continuous movement.</summary>
+        /// <summary>Mouse wheel over a point (e.g. scrolling the market filter panel). notches > 0 scrolls up.</summary>
+        public static bool Wheel(Vector2 absPos, int notches)
+        {
+            if (!CanAct) { LogAction("Wheel", absPos, null, false); return false; }
+            if (!ClampToWindow(ref absPos)) { LogAction("Wheel", absPos, null, false); return false; }
+            SuspendMovement();
+            ReleaseAllKeys();
+            var moveMs = EstimateMoveMs(absPos);
+            var settle = RandSettle();
+            NextActionAt = DateTime.Now.AddMilliseconds(moveMs + settle + 150 + ActionCooldownMs);
+            _ = RunClickSequence("wheel", async () =>
+            {
+                await MoveCursorTo(absPos).ConfigureAwait(false);
+                await Task.Delay(settle).ConfigureAwait(false);
+                await SendDelay().ConfigureAwait(false);
+                MarkInputEvent("Wheel", notches.ToString());
+                MouseEvent(0x0800, 0, 0, unchecked((uint)(notches * 120)), UIntPtr.Zero);
+            });
+            LogAction("Wheel", absPos, null, true);
+            return true;
+        }
+
         public static bool RightClick(Vector2 absPos)
         {
             if (TryCaptureReplay("RightClick", absPos)) return true;

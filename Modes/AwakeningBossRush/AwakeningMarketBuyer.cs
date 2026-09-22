@@ -24,7 +24,7 @@ public sealed record MarketMapRequest(int Count, double MaxUnitChaos, double Fol
 /// </summary>
 public sealed class AwakeningMarketBuyer
 {
-    private enum Step { Idle, OpenMarket, Search, Read, Travel, Arrive, Buy, Home, Done, Failed }
+    private enum Step { Idle, OpenMarket, Filters, Search, Read, Travel, Arrive, Buy, Home, Done, Failed }
     private Step _step = Step.Idle;
     private DateTime _stepAt, _startedAt, _actionAt, _clickAt;
     private readonly Action<string, object> _log;
@@ -54,7 +54,7 @@ public sealed class AwakeningMarketBuyer
     public void Start(GameController gc, MarketMapRequest request)
     {
         _request = request; _keys.Clear(); _skippedSellers.Clear(); Purchases.Clear();
-        Bought = 0; Spent = 0; FailReason = ""; _searches = 0;
+        Bought = 0; Spent = 0; FailReason = ""; _searches = 0; _filterRounds = 0;
         _homeArea = gc.Area?.CurrentArea?.Name ?? ""; _homeHash = AreaHash(gc);
         _startedAt = DateTime.UtcNow; Set(Step.OpenMarket, "opening the market");
         _log("market.started", request);
@@ -76,6 +76,8 @@ public sealed class AwakeningMarketBuyer
             // Keys.None = pause 700 ms (the chat box needs a moment to open before "/" is typed, otherwise "/" opens
             // the market and the letters act as hotkeys, e.g. hideout edit mode).
             if (_keys.Peek() == Keys.None) { if ((DateTime.UtcNow - _keyAt).TotalMilliseconds >= 700) { _keys.Dequeue(); _keyAt = DateTime.UtcNow; } return; }
+            // Keys.Pause = 250 ms gap between typed characters (market filter fields drop keystrokes typed too fast).
+            if (_keys.Peek() == Keys.Pause) { if ((DateTime.UtcNow - _keyAt).TotalMilliseconds >= 250) { _keys.Dequeue(); _keyAt = DateTime.UtcNow; } return; }
             // "/hideout" is only typed into an open chat box; otherwise "/" opens the market and the letters are hotkeys.
             if (_keys.Peek() == Keys.OemQuestion && _chatRetries < 2 && !AwakeningGameReader.ChatOpen(ctx.Game))
             {
@@ -91,6 +93,7 @@ public sealed class AwakeningMarketBuyer
         switch (_step)
         {
             case Step.OpenMarket: TickOpen(gc); break;
+            case Step.Filters: TickFilters(gc); break;
             case Step.Search: TickSearch(gc); break;
             case Step.Read: TickRead(gc); break;
             case Step.Travel: break;
@@ -116,10 +119,191 @@ public sealed class AwakeningMarketBuyer
         var button = Descendants(market).Where(e => Text(e).Trim().Equals("search", StringComparison.OrdinalIgnoreCase))
             .OrderByDescending(e => e.GetClientRect().Y).FirstOrDefault();
         if (button == null) { Status = "Market: search button not found"; return; }
+        // 2026-09-22: a PoE restart cleared the manually saved filters (category Any → gems listed). Fill them in.
+        if (!_filtersSet && _filterRounds < 3) { _filterRounds++; PlanFilters(market); Set(Step.Filters, "setting the search filters"); return; }
         _searches++;
         if (_searches > 6) { Fail("too_many_searches"); return; }
         Click(gc, button);
         Set(Step.Read, "waiting for results");
+    }
+    // ── Search filters (paths relative to the market root; calibrated 2026-09-22 from ui-mkt3/mkt4/pk/nt) ──
+    // A PoE restart clears the market filters. The bot sets: Category = Map, Map Tier 16–16, IIQ >= min, Pack >= min,
+    // and a "Not" stat group holding the NG map mods. Every value is read back (Element.Text) and re-entered if a
+    // keystroke was lost (the game shows a busy/hourglass cursor for a moment after a filter changes).
+    private static bool _filtersSet;
+    private int _filterRounds, _fStage, _fTries;
+    private DateTime _fActedAt;
+    private readonly Dictionary<string, int> _ruleTries = new();
+    private string? _typingRule; private int _typeTries;
+    private readonly Dictionary<string, int> _removeTries = new();
+    private static readonly int[] FCategory = { 2, 3, 1, 0, 0, 1, 2, 0, 0, 1, 0, 0, 1, 0, 3 };
+    private static readonly int[] FMapHeader = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 0, 0 };
+    private static readonly int[] FTierRow = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 1, 0, 0 };
+    private static readonly int[] FTierMin = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 1, 0, 0, 1, 0, 0, 0 };
+    private static readonly int[] FTierMax = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 1, 0, 0, 1, 0, 1, 0 };
+    private static readonly int[] FPackMin = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 1, 0, 1, 1, 0, 0, 0 };
+    private static readonly int[] FQuantityMin = { 2, 3, 1, 0, 0, 1, 2, 0, 5, 1, 1, 0, 1, 0, 0, 0 };
+    private static readonly int[] FViewport = { 2, 3, 1 };
+    private static readonly int[] FGroupTitle = { 2, 3, 1, 0, 0, 1, 2, 1, 0, 0, 0, 0 };
+    private static readonly int[] FGroupEdit = { 2, 3, 1, 0, 0, 1, 2, 1, 0, 0, 1, 0 };
+    private static readonly int[] FGroupRows = { 2, 3, 1, 0, 0, 1, 2, 1, 0, 1 };
+    // Query typed into "+ Add Stat Filter" (letters and spaces only), and the lower-case text the picked row must contain.
+    private static readonly (string Id, string Query, string Key)[] NotRules =
+    {
+        ("no_regen", "PLAYERS CANNOT REGENERATE LIFE", "players cannot regenerate"),
+        ("less_recovery", "LESS RECOVERY RATE OF LIFE AND ENERGY SHIELD", "less recovery rate"),
+        ("physical_thorns", "PHYSICAL THORNS", "physical thorns"),
+        ("elemental_thorns", "ELEMENTAL THORNS", "elemental thorns"),
+        ("shaper_touched", "MONSTERS IN AREA ARE SHAPER", "shaper-touched"),
+        ("max_resists", "PLAYERS HAVE TO ALL MAXIMUM RESISTANCES", "maximum resistances"),
+        ("defences", "PLAYERS HAVE MORE DEFENCES", "defences"),
+        ("shaper_influence", "AREA IS INFLUENCED BY THE SHAPER", "influenced by the shaper"),
+        ("eradicator", "OCCUPIED BY THE ERADICATOR", "eradicator"),
+        ("purifier", "OCCUPIED BY THE PURIFIER", "purifier"),
+        ("constrictor", "OCCUPIED BY THE CONSTRICTOR", "constrictor"),
+        ("enslaver", "OCCUPIED BY THE ENSLAVER", "enslaver"),
+        ("no_leech", "MONSTERS CANNOT BE LEECHED FROM", "cannot be leeched"),
+        ("flask_charges", "PLAYERS GAIN REDUCED FLASK CHARGES", "reduced flask charges"),
+        ("elemental_weakness", "PLAYERS ARE CURSED WITH ELEMENTAL WEAKNESS", "elemental weakness"),
+        ("extra_lightning", "MONSTERS DEAL EXTRA PHYSICAL DAMAGE AS LIGHTNING", "damage as lightning|damage as extra lightning"),
+    };
+    private void PlanFilters(Element market)
+    {
+        _fStage = 0; _fTries = 0; _fActedAt = DateTime.MinValue; _ruleTries.Clear(); _typingRule = null; _removeTries.Clear();
+        _log("market.filters_planned", new { round = _filterRounds, _request!.MinQuantity, _request.MinPackSize });
+    }
+    private static string Lower(Element? e) => Regex.Replace(Text(e), @"<[^>]*>|[{}]", "").Trim().ToLowerInvariant();
+    private bool Act(string what)
+    {
+        _fActedAt = DateTime.UtcNow; _stepAt = DateTime.UtcNow;
+        if (++_fTries > 12) { _log("market.filter_gave_up", new { stage = _fStage, what }); _fStage++; _fTries = 0; return false; }
+        return true;
+    }
+    // Scrolls the filter panel until the element is inside it; returns false while scrolling.
+    private bool InView(GameController gc, Element market, Element e)
+    {
+        var view = Child(market, FViewport)?.GetClientRect(); var r = e.GetClientRect();
+        if (view == null || (r.Center.Y > view.Value.Top + 20 && r.Center.Y < view.Value.Bottom - 20)) return true;
+        var w = gc.Window.GetWindowRectangle();
+        if (BotInput.Wheel(new Vector2(w.X + view.Value.Center.X, w.Y + view.Value.Center.Y), r.Center.Y < view.Value.Top ? 3 : -3))
+        { _fActedAt = DateTime.UtcNow; _stepAt = DateTime.UtcNow; }
+        return false;
+    }
+    private void TypeInto(GameController gc, Element field, string text, params Keys[] after)
+    {
+        Click(gc, field);
+        _keys.Enqueue(Keys.None);
+        _keys.Enqueue(Keys.End);
+        for (var i = 0; i < 50; i++) _keys.Enqueue(Keys.Back);
+        foreach (var ch in text.ToUpperInvariant()) { _keys.Enqueue(ch == ' ' ? Keys.Space : (Keys)ch); _keys.Enqueue(Keys.Pause); }
+        if (after.Length > 0) { _keys.Enqueue(Keys.None); foreach (var k in after) _keys.Enqueue(k); }
+    }
+    private void TickFilters(GameController gc)
+    {
+        var market = MarketRoot(gc);
+        if (market == null) { Set(Step.OpenMarket, "market closed, reopening"); return; }
+        if ((DateTime.UtcNow - _fActedAt).TotalMilliseconds < 1300) return;
+        switch (_fStage)
+        {
+            case 0: // Item Category = Map
+            {
+                var field = Child(market, FCategory);
+                if (field == null) { _log("market.filter_field_missing", new { stage = 0 }); _fStage = 99; return; }
+                if (Lower(field) == "map") { _fStage = 1; _fTries = 0; return; }
+                if (!InView(gc, market, field) || !Act("category")) return;
+                TypeInto(gc, field, "MAP", Keys.Down, Keys.Return);
+                return;
+            }
+            case 1: // Map Tier 16-16, IIQ, Pack
+            {
+                var header = Child(market, FMapHeader);
+                if (Child(market, FTierRow)?.IsVisible != true)
+                { if (header != null && InView(gc, market, header) && Act("expand_map")) Click(gc, header); return; }
+                var want = new (int[] Path, string Value)[] { (FTierMin, "16"), (FTierMax, "16"),
+                    (FQuantityMin, _request!.MinQuantity.ToString(CultureInfo.InvariantCulture)), (FPackMin, _request.MinPackSize.ToString(CultureInfo.InvariantCulture)) };
+                foreach (var (path, value) in want)
+                {
+                    var f = Child(market, path);
+                    if (f == null) continue;
+                    if (Lower(f) == value) continue;
+                    if (!InView(gc, market, f) || !Act("field:" + value)) return;
+                    TypeInto(gc, f, value);
+                    return;
+                }
+                // All values verified. The section must stay expanded: a collapsed filter section is not applied
+                // (2026-09-22: Tier 2 maps listed while "Map Tier 16-16" sat in the collapsed section).
+                _fStage = 2; _fTries = 0; return;
+            }
+            case 2: // Stat group type = Not
+            {
+                var title = Child(market, FGroupTitle);
+                if (title == null) { _log("market.filter_field_missing", new { stage = 2 }); _fStage = 99; return; }
+                if (Lower(title) == "not") { _fStage = 3; _fTries = 0; return; }
+                var edit = Child(market, FGroupEdit);
+                if (edit == null || !InView(gc, market, edit) || !Act("group_not")) return;
+                // Options: Stat Filters, Not, If, Count, ... → "Not" is the second entry.
+                Click(gc, edit);
+                _keys.Enqueue(Keys.None); _keys.Enqueue(Keys.Down); if (_fTries % 2 == 1) _keys.Enqueue(Keys.Down); _keys.Enqueue(Keys.Return);
+                return;
+            }
+            case 3: // NG mods inside the Not group
+            {
+                // Group body: child 0 = the stat rows (row,0,0,0 = text, row,1,4 = remove), child 1 = "+ Add Stat Filter" (,3 = input).
+                var group = Child(market, FGroupRows);
+                if (group == null) { _fStage = 99; return; }
+                var input = Child(group, 1, 3);
+                var kids = Child(group, 0)?.Children.Where(k => k != null).ToList() ?? new();
+                var entries = kids.Select(k => (Row: k, Text: Lower(Child(k, 0, 0, 0)))).ToList();
+                bool Matches(string text, string key) => key.Split('|').Any(x => text.Contains(x));
+                // Wrong picks are removed: not an NG mod, a "fractured" variant, or a duplicate of an earlier row.
+                var seen = new HashSet<string>();
+                (Element Row, string Text) wrong = default;
+                foreach (var e in entries)
+                {
+                    var rule = NotRules.FirstOrDefault(r => Matches(e.Text, r.Key));
+                    // Fractured variants and duplicates are harmless inside a Not group; only foreign stats are removed
+                    // (removing re-lays out the list and a stale × click repeated forever on 2026-09-22).
+                    if (e.Text.Length > 0 && rule.Id == null && _removeTries.GetValueOrDefault(e.Text) < 3) { wrong = e; break; }
+                }
+                if (wrong.Row != null)
+                {
+                    _removeTries[wrong.Text] = _removeTries.GetValueOrDefault(wrong.Text) + 1; _stepAt = DateTime.UtcNow;
+                    var remove = Child(wrong.Row, 1, 4);
+                    _log("market.not_filter_removed", new { text = wrong.Text });
+                    if (remove != null && InView(gc, market, remove)) { Click(gc, remove); _fActedAt = DateTime.UtcNow; }
+                    return;
+                }
+                foreach (var rule in NotRules)
+                {
+                    if (entries.Any(e => Matches(e.Text, rule.Key) && !e.Text.StartsWith("fractured", StringComparison.Ordinal))) { if (_typingRule == rule.Id) _typingRule = null; continue; }
+                    var tries = _ruleTries.GetValueOrDefault(rule.Id);
+                    if (tries >= 3) continue;
+                    if (input == null || !InView(gc, market, input)) return;
+                    _fActedAt = DateTime.UtcNow; _stepAt = DateTime.UtcNow;
+                    var typed = Lower(input);
+                    if (_typingRule == rule.Id && typed == rule.Query.ToLowerInvariant())
+                    {
+                        // The query is in the box: pick the (tries)th option (a retry takes the next one down).
+                        _ruleTries[rule.Id] = tries + 1; _typingRule = null;
+                        for (var i = 0; i <= tries; i++) _keys.Enqueue(Keys.Down);
+                        _keys.Enqueue(Keys.Return);
+                        _log("market.not_filter_pick", new { rule.Id, option = tries + 1 });
+                        return;
+                    }
+                    if (_typingRule == rule.Id && ++_typeTries > 3) { _ruleTries[rule.Id] = 3; _typingRule = null; _log("market.not_filter_type_failed", new { rule.Id, typed }); return; }
+                    if (_typingRule != rule.Id) { _typingRule = rule.Id; _typeTries = 0; }
+                    TypeInto(gc, input, rule.Query);
+                    _log("market.not_filter_type", new { rule.Id, typed });
+                    return;
+                }
+                _log("market.not_filters", new { present = entries.Select(e => e.Text).ToArray(),
+                    missing = NotRules.Where(r => !entries.Any(e => Matches(e.Text, r.Key) && !e.Text.StartsWith("fractured", StringComparison.Ordinal))).Select(r => r.Id).ToArray() });
+                _fStage = 99; return;
+            }
+            default:
+                _filtersSet = true; _log("market.filters_set", new { round = _filterRounds }); Set(Step.Search, "filters set");
+                return;
+        }
     }
     private void TickRead(GameController gc)
     {
@@ -134,6 +318,8 @@ public sealed class AwakeningMarketBuyer
             return;
         }
         _log("market.results", new { count = rows.Count, rows = rows.Select(r => new { r.Name, r.Price, r.Currency, r.Seller, r.Quantity, r.Pack, r.Prefix, r.Suffix, reject = r.Reject }) });
+        if (rows.Count > 0 && rows.All(r => r.Reject?.StartsWith("not_T16", StringComparison.Ordinal) == true) && _filterRounds < 3)
+        { _filtersSet = false; Set(Step.Search, "results are not T16 maps: resetting the filters"); return; }
         var pick = rows.FirstOrDefault(r => r.Reject == null && !_skippedSellers.Contains(r.Seller));
         if (pick == null) { GoHomeOrFail(gc, rows.Count == 0 ? "no_results" : "no_acceptable_listing"); return; }
         var travel = Child(pick.Entry, 0, 1, 2, 0, 4, 0);

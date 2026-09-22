@@ -80,6 +80,16 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private bool _deviceStockChecked;
     private DateTime _deviceStockFirstRead = DateTime.MinValue, _priceWaitSince = DateTime.MinValue;
     private bool _defensiveClear;
+    private int _maxIntensity;
+    private static int SparkIntensity(BotContext ctx)
+    {
+        try
+        {
+            var b = ctx.Game.Player.GetComponent<Buffs>()?.BuffsList?.FirstOrDefault(x => x?.Name == "spell_boost_charge");
+            return b == null ? 0 : b.Charges;
+        }
+        catch { return -1; }
+    }
     private readonly SparkProgressTracker _scoutDamage = new();
     // Loot defense: hold position and Spark only enemies that are actually close to the drops.
     private readonly SparkProgressTracker _lootDefenseDamage = new();
@@ -265,6 +275,24 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         if (action == "market_cancel") { _market.Cancel(); _marketManual = false; return Supervisor.RecordCommand(id, "market_cancelled"); }
         if (action == "exchange_cancel") { _exchange.Cancel(); _exchangeManual = false; return Supervisor.RecordCommand(id, "exchange_cancelled"); }
+        if (action == "ui_read")
+        {
+            // Read-only: value = "path:..." → InputText/Text of the element and its descendants (3 levels).
+            var el = ResolveUi(ctx, review ?? "");
+            if (el == null) return Supervisor.RecordCommand(id, "not_found");
+            var rows = new List<string>();
+            void Walk(ExileCore.PoEMemory.Element e, string p, int d)
+            {
+                string? tx = null; try { tx = e.Text; } catch { }
+                var input = AwakeningGameReader.InputText(ctx.Game, e);
+                if (!string.IsNullOrEmpty(tx) || !string.IsNullOrEmpty(input)) rows.Add($"{p} text='{tx}' input='{input}'");
+                if (d >= 3) return;
+                var kids = e.Children; for (var i = 0; i < kids.Count; i++) if (kids[i] != null) Walk(kids[i], p + "," + i, d + 1);
+            }
+            Walk(el, "", 0);
+            _log.Event(Run, "ui.read", new { review, rows });
+            return Supervisor.RecordCommand(id, "read:" + string.Join(" | ", rows).Replace(":", ";"));
+        }
         if (action is "ui_click" or "ui_type" or "ui_key")
         {
             // Calibration helpers (bot stopped): value "path:50,2,3" or "text:Search" [+ "@underPath"], then "|right|ctrl" or "|<text to type>".
@@ -393,6 +421,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _inspectionStatus = "";
             _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
             _mapBankRunDone = false; _mapBankLogged = false; _mapTierStep = 0; _chaosStoreClicks = 0;
+            _guardianChecked = false; _guardianCasts = 0;
             _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false;
             _defensiveClear = false;
             _lootDefenseActive = false; _lootDefenseSuppressedUntil = DateTime.MinValue;
@@ -824,6 +853,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (ctx.Game.Area?.CurrentArea?.IsHideout != true) { Status = "Waiting for hideout"; return; }
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && !_listingChecked && PlanListings(ctx)) return;
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && PlanDivineConversion(ctx)) return;
+        if (EnsureGuardian(ctx)) return;
         var moveConflict = ctx.Combat.MovementBindingConflict(ctx.Game, ctx.Navigation.MoveKey);
         if (moveConflict != null)
         {
@@ -1079,6 +1109,40 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private const int DivineConvertAbove = 4000, DivineKeepChaos = 1000;
     private DateTime _divineOrderAt = DateTime.MinValue;
     private bool _divineDiagLogged, _stashChaosFull;
+    // Animate Guardian (Metadata/Monsters/AnimatedItem/AnimatedArmour) is a big part of survival. It cannot be
+    // re-summoned in the area it died in; in the Hideout the user's middle-mouse binding on empty floor brings it back.
+    private bool _guardianChecked; private int _guardianCasts; private DateTime _guardianCastAt;
+    private static bool GuardianPresent(BotContext ctx) => ctx.Game.EntityListWrapper.OnlyValidEntities.Any(e =>
+        e.Path.StartsWith("Metadata/Monsters/AnimatedItem/AnimatedArmour", StringComparison.Ordinal) && e.IsAlive && !e.IsHostile);
+    private bool EnsureGuardian(BotContext ctx)
+    {
+        if (_guardianChecked) return false;
+        var now = DateTime.UtcNow;
+        if ((now - _phaseAt).TotalSeconds < 1.5) { Status = "Checking the Animate Guardian"; return true; }
+        if (GuardianPresent(ctx))
+        {
+            if (_guardianCasts > 0) _log.Event(Run, "guardian.resummoned", new { casts = _guardianCasts });
+            _guardianChecked = true; return false;
+        }
+        if (_guardianCasts >= 3) { _log.Event(Run, "guardian.resummon_failed", new { casts = _guardianCasts }); _guardianChecked = true; return false; }
+        _phaseAt = now.AddSeconds(-1.5); // keep the Prepare deadline away while casting
+        if ((now - _guardianCastAt).TotalSeconds < 2.5 || !BotInput.CanAct) { Status = "Re-summoning the Animate Guardian"; return true; }
+        try
+        {
+            var render = ctx.Game.Player.GetComponent<Render>();
+            var p = ctx.Game.IngameState.Camera.WorldToScreen(render!.PosNum);
+            Vector2[] offsets = [new(0, 170), new(-230, 120), new(230, 120)];
+            var off = offsets[_guardianCasts % offsets.Length];
+            var w = ctx.Game.Window.GetWindowRectangle();
+            if (BotInput.CursorPressKey(new Vector2(w.X + p.X + off.X, w.Y + p.Y + off.Y), Keys.MButton))
+            {
+                _guardianCasts++; _guardianCastAt = now;
+                _log.Event(Run, "guardian.resummon_cast", new { attempt = _guardianCasts, x = p.X + off.X, y = p.Y + off.Y });
+            }
+        }
+        catch (Exception ex) { _log.Event(Run, "guardian.resummon_failed", new { error = ex.Message }); _guardianChecked = true; return false; }
+        Status = "Re-summoning the Animate Guardian"; return true;
+    }
     private bool PlanDivineConversion(BotContext ctx)
     {
         if (!ctx.Settings.Awakening.Economy.AutoRestock.Value) return false;
@@ -1497,6 +1561,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         foreach (var p in _market.Purchases) { _ledger.Purchase("Map (Tier 16)", 1, p.Price, "market:" + p.Seller); _ledger.Price("Map (Tier 16)", p.Price, "market:" + source); }
         _market.Purchases.Clear();
     }
+    private DateTime _marketRetryAt = DateTime.MinValue; private int _marketRetries;
     private void MarketBuy(BotContext ctx)
     {
         // Maps ran out (Atlas + Tmp): buy MapBuyCount maps through the in-game market, then open the map from the inventory.
@@ -1507,11 +1572,27 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _market.Start(ctx.Game, MarketRequest(ctx, ctx.Settings.Awakening.Economy.MapBuyCount.Value)); _marketStarted = true; return;
         }
         if (_market.Busy) { _market.Tick(ctx); Status = _market.Status; return; }
+        if (_marketRetryAt != DateTime.MinValue)
+        {
+            _phaseAt = DateTime.UtcNow;
+            if (DateTime.UtcNow < _marketRetryAt) { Status = $"Market: retrying in {(_marketRetryAt - DateTime.UtcNow).TotalSeconds:0}s"; return; }
+            _marketRetryAt = DateTime.MinValue; _marketStarted = false; return;
+        }
         // The market / results pane stays open after a purchase and blocks the map device click.
         if (AwakeningMarketBuyer.MarketOpen(ctx.Game)) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); Status = "Closing the market"; return; }
         RecordMarketResult("auto");
         _log.Event(Run, "market.restock_done", new { ok = _market.Succeeded, bought = _market.Bought, spent = _market.Spent, reason = _market.FailReason });
-        if (_market.Succeeded) { _mapRestockAttempted = false; SetPhase(AwakeningPhase.OpenMap, "market_maps_bought"); return; }
+        // Bulk purchases (mapBuyCount 10): the spare maps are stored (Tmp bank / MAP tab), so look there again next time.
+        if (_market.Bought > 1) _mapStashSkipUntil = DateTime.MinValue;
+        if (_market.Succeeded) { _marketRetries = 0; _mapRestockAttempted = false; SetPhase(AwakeningPhase.OpenMap, "market_maps_bought"); return; }
+        // 2026-09-22 (user): the loop must finish without a human. A failed search (too_many_searches, no acceptable
+        // listing, timeouts) waits 10 s and searches again; only running out of chaos, or 8 failures in a row, stops.
+        if (_marketRetries < 8 && !_market.FailReason.Contains("chaos", StringComparison.OrdinalIgnoreCase))
+        {
+            _marketRetries++; _marketRetryAt = DateTime.UtcNow.AddSeconds(10);
+            _log.Event(Run, "market.retry_scheduled", new { reason = _market.FailReason, retry = _marketRetries });
+            return;
+        }
         Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:market_" + _market.FailReason);
     }
     private void EnterPortal(BotContext ctx)
@@ -1567,7 +1648,14 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _defensiveClear = true;
             _scoutDamage.Observe(enemies.Select(e => new MonsterHealthSample(e.Id,
                 (double)(e.GetComponent<Life>()?.CurHP ?? 0) + (e.GetComponent<Life>()?.CurES ?? 0))), now);
-            if (_scoutDamage.NoProgressSeconds(now) >= ctx.Settings.Awakening.NoDamageSeconds.Value || (now - _scoutPositionSince).TotalSeconds >= 12)
+            // 2026-09-22 (user): Spark has Pinpoint — "spell_boost_charge" (Intensity, max 4) builds per cast while
+            // standing and is lost when moving. 142 no-damage repositions happened after ~3 s, often before Intensity
+            // was up, and the old 12 s cap walked away from packs that were still losing HP. Stay until Intensity is
+            // full; reposition only without HP progress (hard cap 30 s).
+            var intensity = SparkIntensity(ctx);
+            if (intensity > _maxIntensity) _maxIntensity = intensity;
+            var building = intensity >= 0 && intensity < Math.Max(4, _maxIntensity) && (now - _scoutPositionSince).TotalSeconds < 6;
+            if (!building && (_scoutDamage.NoProgressSeconds(now) >= ctx.Settings.Awakening.NoDamageSeconds.Value || (now - _scoutPositionSince).TotalSeconds >= 30))
             {
                 if (pushing)
                 {
@@ -1717,7 +1805,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var crowdNow = gc.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster && e.IsAlive && e.IsHostile && e.IsTargetable)
             .Select(e => (e, d: Vector2.Distance(player, e.GridPosNum))).ToList();
         var crowded = crowdNow.Count(x => x.d < 12) >= 4 || crowdNow.Any(x => x.d < 8 && x.e.Rarity is MonsterRarity.Rare or MonsterRarity.Unique);
-        var kite = crowded && !burst && inside.Count == 0 && (now - _lastKiteAt).TotalSeconds >= 2.5 && Run.Phase is not AwakeningPhase.MapBoss;
+        // 2026-09-22: kiting every 2.5 s reset Spark's Intensity (lost while moving). Only kite a crowd that is hurting us.
+        var kite = crowded && hurting && !burst && inside.Count == 0 && (now - _lastKiteAt).TotalSeconds >= 2.5 && Run.Phase is not AwakeningPhase.MapBoss;
         if (inside.Count == 0 && !burst && !kite) return false;
         if (kite) _lastKiteAt = now;
         var away = Vector2.Zero;

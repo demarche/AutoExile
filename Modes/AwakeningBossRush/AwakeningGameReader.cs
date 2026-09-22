@@ -38,6 +38,23 @@ public static class AwakeningGameReader
         try { return (Property(Property(gc.IngameState.IngameUi, "ChatPanel"), "ChatInputElement") as Element)?.IsVisible == true; }
         catch { return false; }
     }
+    /// <summary>Text typed into a UI input field (market filters): reads the element as the chat input's element type,
+    /// which exposes InputText. Returns null when unavailable.</summary>
+    public static string? InputText(GameController gc, Element? e)
+    {
+        if (e == null) return null;
+        try
+        {
+            var chat = Property(Property(gc.IngameState.IngameUi, "ChatPanel"), "ChatInputElement");
+            var t = chat?.GetType();
+            var prop = t?.GetProperty("InputText");
+            if (t == null || prop == null) return null;
+            var m = e.GetType().GetMethods().FirstOrDefault(x => x.Name == "AsObject" && x.IsGenericMethodDefinition && x.GetParameters().Length == 0);
+            var obj = m?.MakeGenericMethod(t).Invoke(e, null);
+            return obj == null ? null : prop.GetValue(obj) as string;
+        }
+        catch { return null; }
+    }
     public static bool? StashieBusy()
     {
         try { return Core.ParallelRunner.FindByName("Stashie_DropItemsToStash") != null || Core.ParallelRunner.FindByName("Drop To Stash") != null; }
