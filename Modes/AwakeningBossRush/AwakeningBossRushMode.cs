@@ -2631,6 +2631,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         CancelInput(ctx); SetPhase(AwakeningPhase.ExternalStash, "stash_visible");
     }
     private bool _mapBankStarted, _mapBankDone, _mapBankRunDone, _mapBankLogged;
+    private int _f3Retries, _modReleases;
     private bool IsBankableMap(BotContext ctx, Entity? item)
     {
         try
@@ -2681,13 +2682,32 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         var inventory = AwakeningGameReader.Inventory(ctx.Game);
         var stashBusy = AwakeningGameReader.StashieBusy();
-        _stableEmpty = AwakeningLootPolicy.StashComplete(inventory) && stashBusy == false && Control.ModifierKeys == Keys.None ? _stableEmpty + 1 : 0;
+        // 2026-09-22 06:00: F3 right after the Ctrl+right-click chaos store; the phase then waited 60 s and the loop
+        // stopped (stash_visible timeout). A modifier left down (Ctrl) blocks both StashieV2 and this check: release it.
+        if (stashBusy == false && Control.ModifierKeys != Keys.None && _modReleases < 3 && (DateTime.UtcNow - _lastKeyAt).TotalSeconds > 1.5)
+        { _modReleases++; BotInput.ReleaseAllKeys(); _log.Event(Run, "external.modifier_released", new { mods = Control.ModifierKeys.ToString() }); _lastKeyAt = DateTime.UtcNow; return; }
+        // StashieV2 idle but items still outside the reserved column: press F3 again (max 2), then accept the leftovers.
+        if (stashBusy == false && !AwakeningLootPolicy.StashComplete(inventory) && (DateTime.UtcNow - _lastKeyAt).TotalSeconds > 8)
+        {
+            if (_f3Retries < 2 && BotInput.CanAct && BotInput.PressKey(Keys.F3))
+            { _f3Retries++; _lastKeyAt = DateTime.UtcNow; _log.Event(Run, "external.F3_retry", new { retry = _f3Retries, inventory.OutsideReservedColumn }); return; }
+            if (_f3Retries >= 2)
+            {
+                _log.Event(Run, "external.stash_leftovers", new { inventory.OutsideReservedColumn,
+                    items = StashSystem.GetInventorySlotItems(ctx.Game)?.Select(i => i.Item?.Path).Take(20).ToArray() });
+                _f3Retries = 0; _modReleases = 0; Run.StashCompleted = true;
+                if (Run.ReturnedToHideout && Run.BossesCompleted) Finish(ctx, AttemptOutcome.Success, "bosses_loot_hideout_stash_leftovers");
+                else SetPhase(AwakeningPhase.Prepare, "initial_stash_leftovers");
+                return;
+            }
+        }
+        _stableEmpty = AwakeningLootPolicy.StashComplete(inventory) && stashBusy == false && (Control.ModifierKeys == Keys.None || _modReleases >= 3) ? _stableEmpty + 1 : 0;
         if (_stableEmpty == 0) _quietAt = DateTime.MinValue;
         // Await an idle interval after the final transfer; never toggle F3 to "retry" an active coroutine.
         if (_stableEmpty < 5 || (DateTime.UtcNow - _lastKeyAt).TotalSeconds < 2) return;
         if (_quietAt == DateTime.MinValue) { _quietAt = DateTime.UtcNow; return; }
         if ((DateTime.UtcNow - _quietAt).TotalSeconds < 1) return;
-        Run.StashCompleted = true;
+        Run.StashCompleted = true; _f3Retries = 0; _modReleases = 0;
         _log.Event(Run, "external.stash_complete", new { inventory.OutsideReservedColumn, stashBusy });
         if (Run.ReturnedToHideout && Run.BossesCompleted) Finish(ctx, AttemptOutcome.Success, "bosses_loot_hideout_stash_confirmed");
         else SetPhase(AwakeningPhase.Prepare, "initial_stash_complete");
