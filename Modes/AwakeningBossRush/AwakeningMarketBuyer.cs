@@ -227,9 +227,9 @@ public sealed class AwakeningMarketBuyer
         t.SetApartmentState(ApartmentState.STA); t.IsBackground = true; t.Start(); t.Join(800);
         return ok;
     }
-    private void PasteInto(GameController gc, Element field, string text)
+    private void PasteInto(GameController gc, Element field, string text, params Keys[] after)
     {
-        if (!SetClipboard(text)) { TypeInto(gc, field, text); return; }
+        if (!SetClipboard(text)) { TypeInto(gc, field, text, after); return; }
         Click(gc, field);
         _keys.Enqueue(Keys.None);
         // The add-stat box is empty after each pick ("typed": "" in every log line); Ctrl+A + Back clears any leftover.
@@ -237,6 +237,7 @@ public sealed class AwakeningMarketBuyer
         _keys.Enqueue(Keys.Back);
         _keys.Enqueue(Keys.V | Keys.Control);
         _keys.Enqueue(Keys.Pause);
+        if (after.Length > 0) { _keys.Enqueue(Keys.None); foreach (var k in after) _keys.Enqueue(k); }
     }
     private void TickFilters(GameController gc)
     {
@@ -265,7 +266,7 @@ public sealed class AwakeningMarketBuyer
                 }
                 if (Lower(field) == "map") { _fStage = 1; _fTries = 0; return; }
                 if (!InView(gc, market, field) || !Act("category")) return;
-                TypeInto(gc, field, "MAP", Keys.Down, Keys.Return);
+                PasteInto(gc, field, "MAP", Keys.Down, Keys.Return);
                 return;
             }
             case 1: // Map Tier 16-16, IIQ, Pack
@@ -292,7 +293,9 @@ public sealed class AwakeningMarketBuyer
                     if (_fieldIdx == i && (DateTime.UtcNow - _blurredAt).TotalMilliseconds < 2500) return; // let the blur settle
                     if (_fieldIdx == i) _log("market.filter_retype", new { field = value, text = Text(f), input = AwakeningGameReader.InputText(gc, f) });
                     if (!InView(gc, market, f) || !Act("field:" + value)) return;
-                    TypeInto(gc, f, value); _fieldIdx = i; _needBlur = true; _blurredAt = DateTime.MinValue;
+                    // 2026-09-23 (user): the IIQ box stayed empty — single keystrokes are lost while the client shows the
+                    // busy cursor. One Ctrl+V is far more reliable than typing the digits.
+                    PasteInto(gc, f, value); _fieldIdx = i; _needBlur = true; _blurredAt = DateTime.MinValue;
                     return;
                 }
                 // All values verified. The section must stay expanded: a collapsed filter section is not applied

@@ -189,9 +189,26 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         ctx.Settings.Running.Value = false;
         if (!ctx.Settings.Awakening.AllowManualStart.Value)
         { Status = "Insert start disabled: enable Awakening / Allow manual Insert start"; return; }
-        if (ctx.Game.Area?.CurrentArea?.IsHideout != true || ctx.Game.IsLoading || Run.RecoveryRequired || _shutdownRequested ||
-            (Run.AttemptNumber > 0 && Run.Outcome == AttemptOutcome.None))
-        { Status = "Manual start requires Hideout and a finished, recovered attempt"; return; }
+        // 2026-09-23 (user): Insert refused to start. It now heals the states it used to refuse:
+        //  - a stale attempt left with no outcome (the loop was stopped mid-map) is closed here,
+        //  - a pending recovery, or standing in a map, starts the walk home instead of refusing.
+        if (_shutdownRequested || ctx.Game.IsLoading) { Status = "Manual start: the host is busy (loading/shutting down)"; return; }
+        if (Run.AttemptNumber > 0 && Run.Outcome == AttemptOutcome.None)
+        {
+            _log.Event(Run, "manual_start.closed_stale_attempt", new { Run.Phase, Run.AttemptNumber, Run.Instance });
+            Finish(ctx, AttemptOutcome.OperationalFailure, "manual_insert_closed_stale_attempt");
+        }
+        if (ctx.Game.Area?.CurrentArea?.IsHideout != true || Run.RecoveryRequired)
+        {
+            // Not home yet: run the same recovery the "return" command uses, then press Insert again (or let the
+            // recovery finish and use Insert once the Hideout is loaded).
+            if (Run.Outcome == AttemptOutcome.None) Finish(ctx, AttemptOutcome.OperationalFailure, "manual_insert_before_return");
+            CancelInput(ctx); Run.RecoveryRequired = true; SetPhase(AwakeningPhase.Return, "manual_insert_requested_return");
+            ctx.Settings.Running.Value = true; _lastRunning = true;
+            Status = "Manual start: returning to the Hideout first — press Insert again when home";
+            _log.Event(Run, "manual_start.return_first", new { area = ctx.Game.Area?.CurrentArea?.Name, Run.RecoveryRequired });
+            return;
+        }
         string Send(string action, string review = "") => Command(ctx, action, Guid.NewGuid().ToString("N"), Supervisor.Generation, review, Supervisor.Mvid);
         if (Run.Outcome != AttemptOutcome.None && !Run.Reviewed)
         {
@@ -422,7 +439,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
             _mapBankRunDone = false; _mapBankLogged = false; _mapTierStep = 0; _mapPage = 0; _mapWithdrawRetries = 0; _chaosStoreClicks = 0; _bossHpSig = -1; _bossNoDamageSeconds = 0; _fightTickAt = DateTime.MinValue;
             _guardianChecked = false; _guardianCasts = 0; _scrollsChecked = false;
-            _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false; _marketRetries = 0; _marketRetryAt = DateTime.MinValue;
+            _stashedForRestock = false; _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false; _marketRetries = 0; _marketRetryAt = DateTime.MinValue;
             _defensiveClear = false;
             _lootDefenseActive = false; _lootDefenseSuppressedUntil = DateTime.MinValue;
             _uniqueEvidence.Clear();
@@ -1226,7 +1243,20 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     // Chaos collected from Faustus lands in the inventory; with the stash open, Ctrl+right-click on a Chaos stack
     // moves every Chaos Orb in the inventory into the stash (user-verified).
-    private DateTime _chaosStoreAt; private int _chaosStoreClicks, _chaosNoDrop, _chaosCarried = -1;
+    private DateTime _chaosStoreAt, _chaosF3At; private int _chaosStoreClicks, _chaosNoDrop, _chaosCarried = -1; private bool _chaosF3Tried;
+    /// <summary>Free inventory cells (12x5 grid); -1 when the inventory cannot be read.</summary>
+    private static int InventoryFreeCells(BotContext ctx)
+    {
+        try
+        {
+            var items = StashSystem.GetInventorySlotItems(ctx.Game);
+            if (items == null) return -1;
+            var used = 0;
+            foreach (var i in items) used += Math.Max(1, i.SizeX) * Math.Max(1, i.SizeY);
+            return Math.Max(0, 60 - used);
+        }
+        catch { return -1; }
+    }
     private bool StoreInventoryChaos(BotContext ctx)
     {
         if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true) return false;
@@ -1237,11 +1267,20 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         try
         {
             var chaos = StashSystem.GetInventorySlotItems(ctx.Game)?.FirstOrDefault(i => i.Item?.Path == "Metadata/Items/Currency/CurrencyRerollRare");
-            if (chaos == null) { _chaosStoreClicks = 0; _chaosNoDrop = 0; _chaosCarried = -1; return false; }
+            if (chaos == null) { _chaosStoreClicks = 0; _chaosNoDrop = 0; _chaosCarried = -1; _chaosF3Tried = false; return false; }
             // Chaos still in the inventory after two store clicks: the Currency tab is full (5000 cap).
             var carried = AwakeningExchange.CountInMainInventory(ctx.Game, "Chaos Orb");
             if (carried == _chaosCarried) _chaosNoDrop++; else { _chaosNoDrop = 0; _chaosCarried = carried; }
-            if (_chaosNoDrop >= 2) { if (!_stashChaosFull) { _stashChaosFull = true; _log.Event(Run, "chaos.stash_full", new { inventory = carried }); } _chaosStoreClicks = 20; return false; }
+            if (_chaosNoDrop >= 2)
+            {
+                // 2026-09-23: Ctrl+right-click stopped moving the 1120 Chaos in the inventory. Hand the stash-away to
+                // StashieV2 (F3) once — it files currency the same way the loot pass does — before giving up.
+                if (!_chaosF3Tried && AwakeningGameReader.StashieBusy() == false && BotInput.CanAct && BotInput.PressKey(Keys.F3))
+                { _chaosF3Tried = true; _chaosF3At = DateTime.UtcNow; _chaosStoreAt = DateTime.UtcNow; _log.Event(Run, "chaos.stash_via_F3", new { inventory = carried }); return true; }
+                if (_chaosF3Tried && ((DateTime.UtcNow - _chaosF3At).TotalSeconds < 6 || AwakeningGameReader.StashieBusy() == true)) return true; // let StashieV2 finish
+                if (!_stashChaosFull) { _stashChaosFull = true; _log.Event(Run, "chaos.stash_full", new { inventory = carried }); }
+                _chaosStoreClicks = 20; return false;
+            }
             if (!BotInput.CanAct) return true;
             var w = ctx.Game.Window.GetWindowRectangle(); var rc = chaos.GetClientRect();
             if (BotInput.CtrlRightClick(new Vector2(w.X + rc.Center.X, w.Y + rc.Center.Y)))
@@ -1319,6 +1358,16 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             SetPhase(AwakeningPhase.IndexStash, "restock_complete_reindex"); return;
         }
         var next = _restockQueue.Peek();
+        // 2026-09-23 (user): selling materials for Chaos at Faustus fills the inventory, the collect then cannot hand
+        // the orbs over and the loop stops. Bank what is carried (Ctrl+right-click Chaos, then F3) before trading.
+        var free = InventoryFreeCells(ctx);
+        if (free >= 0 && free < 8 && !_stashedForRestock)
+        {
+            _stashedForRestock = true; _restockBackToPrepare = true;
+            _log.Event(Run, "restock.stash_before_faustus", new { free, chaos = AwakeningExchange.CountInMainInventory(ctx.Game, "Chaos Orb") });
+            if (ctx.Game.IngameState.IngameUi.CurrencyExchangePanel?.IsVisible == true) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
+            SetPhase(AwakeningPhase.OpenStash, "stash_before_faustus"); return;
+        }
         if (next.Kind is ExchangeKind.BuyAtAsk or ExchangeKind.BuyAtBid)
         {
             var chaos = AwakeningExchange.CountHeld(ctx.Game, "Chaos Orb");
@@ -1516,7 +1565,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         if (result == MapDeviceResult.Failed) Finish(ctx, AttemptOutcome.OperationalFailure, "map_device:" + Status);
     }
-    private bool _mapRestockAttempted, _mapRestockStarted, _mapBossSkipped;
+    private bool _mapRestockAttempted, _mapRestockStarted, _mapBossSkipped, _stashedForRestock;
     private static bool _mapStashDumped;
     private int _mapRestockTabIndex;
     private static readonly string[] MapRestockTabs = { "Tmp", "MAP" };
