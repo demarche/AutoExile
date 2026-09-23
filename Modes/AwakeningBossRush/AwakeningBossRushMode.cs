@@ -545,7 +545,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 var raw = gc.IngameState.Data.RawPathfindingData;
                 if (raw != null) ctx.Exploration.Initialize(raw, gc.IngameState.Data.RawTerrainTargetingData, gc.Player.GridPosNum, ctx.Settings.Build.BlinkRange.Value);
                 ctx.MapDevice.Cancel(gc, ctx.Navigation); _damage.Reset(now);
-                SetPhase(AwakeningPhase.Scout, "entered_expected_map");
+                SetPhase(AwakeningPhase.Scout, "entered_expected_map"); _graceUntil = DateTime.UtcNow.AddSeconds(Run.Deaths > 0 ? 2.5 : 1.2);
                 _log.Event(Run, "attempt.entered", new { Run.AttemptNumber, Run.Instance });
             }
             if (inMap && Run.EnteredUtc.HasValue && ((now - _sampleAt).TotalMilliseconds >= 250 || !gc.Player.IsAlive))
@@ -1286,11 +1286,14 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // 2026-09-23 (user): the inventory was full of Chaos and withdrawals timed out. One Ctrl+right-click moves one
         // stack, so keep clicking (up to 20) until no Chaos stack is left; two clicks without the count dropping mean
         // the Currency tab is full.
-        if (_chaosStoreClicks >= 20 || (DateTime.UtcNow - _chaosStoreAt).TotalSeconds < 0.8) return false;
+        if (_chaosStoreClicks >= 20 && !(_chaosF3Tried && (DateTime.UtcNow - _chaosF3At).TotalSeconds < 6)) return false;
         try
         {
             var chaos = StashSystem.GetInventorySlotItems(ctx.Game)?.FirstOrDefault(i => i.Item?.Path == "Metadata/Items/Currency/CurrencyRerollRare");
             if (chaos == null) { _chaosStoreClicks = 0; _chaosNoDrop = 0; _chaosCarried = -1; _chaosF3Tried = false; return false; }
+            // 2026-09-23 04:27: the cooldown used to return false, so the caller carried on (withdraw, market) after
+            // one click with 1180 Chaos still filling the inventory. While Chaos remains, the caller waits.
+            if ((DateTime.UtcNow - _chaosStoreAt).TotalSeconds < 0.8) return true;
             // Chaos still in the inventory after two store clicks: the Currency tab is full (5000 cap).
             var carried = AwakeningExchange.CountInMainInventory(ctx.Game, "Chaos Orb");
             if (carried == _chaosCarried) _chaosNoDrop++; else { _chaosNoDrop = 0; _chaosCarried = carried; }
@@ -1644,7 +1647,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private void RestockMap(BotContext ctx)
     {
         if ((DateTime.UtcNow - _phaseAt).TotalSeconds > 60)
-        { Finish(ctx, AttemptOutcome.OperationalFailure, "Tmp_map_restock_timeout"); return; }
+        {
+            // 2026-09-23: a slow Tmp withdrawal (two 30 s retries) ran into this 60 s limit and ended the session.
+            ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
+            _log.Event(Run, "map.restock_timeout", new { tab = _mapRestockTabIndex, marketTried = _marketTried });
+            if (ctx.Settings.Awakening.Economy.AutoBuyMaps.Value && !_marketTried)
+            { _marketTried = true; _marketStarted = false; SetPhase(AwakeningPhase.MarketBuy, "restock_timeout_buy_from_market"); return; }
+            _mapRestockStarted = false; _mapRestockTabIndex = 0; _mapTierStep = 0; _mapPage = 0; _marketTried = false; _phaseAt = DateTime.UtcNow.AddSeconds(30);
+            Status = "Map restock timed out; retrying shortly"; return;
+        }
         if (ctx.Game.IngameState.IngameUi.Atlas?.IsVisible == true)
         { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
         if (!_mapRestockStarted)
@@ -1817,10 +1828,17 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // stash. A chaos shortage now goes back through Faustus (sell stock, then retry) instead of ending the session.
         if (_market.FailReason.Contains("chaos", StringComparison.OrdinalIgnoreCase) && _chaosShortRecoveries < 3)
         {
-            _chaosShortRecoveries++; _marketStarted = false; _marketRetryAt = DateTime.MinValue;
-            _indexStarted = false; ctx.StashIndex.Reset(); _restockTried = false; _listingChecked = false;
-            _log.Event(Run, "market.chaos_short_sell_first", new { reason = _market.FailReason, attempt = _chaosShortRecoveries });
-            SetPhase(AwakeningPhase.IndexStash, "sell_for_chaos_before_market"); return;
+            _chaosShortRecoveries++; _marketStarted = false; _marketRetryAt = DateTime.MinValue; _marketTried = false;
+            // 2026-09-23 04:14: the old path only re-indexed the stash — nothing was sold and the loop stopped anyway.
+            // First pick up what already sold at Faustus (listed Chisels, filled bids), then sell stock at the best
+            // bid, and only then search the market again.
+            _restockQueue.Clear();
+            _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.Collect, "Chaos Orb", "Chaos Orb", 0));
+            var sell = SellableNames.Select(n => (n, held: AwakeningExchange.CountHeld(ctx.Game, n))).Where(x => x.held > 0).Take(2).ToList();
+            foreach (var (n, held) in sell) _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.SellAtBid, "Chaos Orb", n, held));
+            _lastCollectAt = DateTime.UtcNow; _restockBackToPrepare = true; _stashedForRestock = false;
+            _log.Event(Run, "market.chaos_short_sell_first", new { reason = _market.FailReason, attempt = _chaosShortRecoveries, sell = sell.Select(x => x.n + ":" + x.held).ToArray() });
+            SetPhase(AwakeningPhase.Restock, "collect_and_sell_before_market"); return;
         }
         if (!_market.FailReason.Contains("chaos", StringComparison.OrdinalIgnoreCase))
         {
@@ -1927,10 +1945,20 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         Status = $"Beast: killing {beast.RenderName} ({BeastValue(beast):0}c)"; Decision = "Valuable beast";
         return true;
     }
+    // Grace period (user, 2026-09-23): a freshly entered character is untouchable until it acts. Spend the first
+    // second(s) standing still while the entity list streams in, so bosses, beasts, drops and incoming casts are known
+    // before the first step — longer on a re-entry after a death, where the pinnacle fight is already live.
+    private DateTime _graceUntil;
     private void Scout(BotContext ctx, bool lootDefense = false)
     {
         UpdateInvitation(ctx, Run.ActivationConfirmed);
         var now = DateTime.UtcNow;
+        if (!lootDefense && now < _graceUntil)
+        {
+            ctx.Combat.Suspend();
+            if (Run.Deaths == 0 && (Run.Bosses.Count > 0 || ValuableBeast(ctx, 200) != null)) _graceUntil = now; // enough is known: go
+            Status = "Grace period: reading the area"; return;
+        }
         if (!lootDefense && Run.BossesCompleted && AwakeningBossTracker.Complete(Run))
         { SetPhase(AwakeningPhase.Loot, "roster_search_done"); return; }
         if (!lootDefense && !Run.BossesCompleted && AwakeningBossTracker.AllTrackedDead(Run) && Vector2.Distance(ctx.Game.Player.GridPosNum, EncounterCenter()) <= 80)
