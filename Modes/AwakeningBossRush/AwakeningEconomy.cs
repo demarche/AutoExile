@@ -145,6 +145,16 @@ public static class AwakeningUiInspector
             new JsonSerializerOptions { WriteIndented = false }));
         return file;
     }
+    public static string DumpElement(GameController gc, string directory, string label, Element? start, int maxDepth = 9, bool includeHidden = false)
+    {
+        _includeHidden = includeHidden;
+        var nodes = new List<object>();
+        if (start != null) nodes.Add(Node(start, "anchor", 0, maxDepth));
+        var file = Path.Combine(directory, $"ui-{label}-{DateTime.Now:yyyyMMdd-HHmmss}.json");
+        File.WriteAllText(file, JsonSerializer.Serialize(new { utc = DateTime.UtcNow, label, window = gc.Window.GetWindowRectangle().ToString(), visibleRoots = nodes, found = start != null },
+            new JsonSerializerOptions { WriteIndented = false }));
+        return file;
+    }
     /// <summary>Dumps the items under a UI grid (e.g. a seller's "Select Items To Buy" tab): entity, map read-out,
     /// listed price and every scalar property of the inventory element (to find the "highlighted" flag).</summary>
     public static string DumpItems(GameController gc, string directory, string label, string rootPath)

@@ -27,6 +27,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private readonly AwakeningLedger _ledger;
     private readonly AwakeningExchange _exchange;
     private readonly AwakeningMarketBuyer _market;
+    private readonly AwakeningBeastSeller _beasts;
     private bool _marketManual, _marketTried, _marketStarted;
     private bool _exchangeManual;
     private readonly Queue<Keys> _uiKeys = new();
@@ -35,7 +36,17 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var root = ctx.Game.IngameState.IngameUi;
         var at = spec.IndexOf('@'); string? under = at > 0 ? spec[(at + 1)..] : null; if (at > 0) spec = spec[..at];
         if (spec.StartsWith("path:")) return AwakeningUiInspector.FindByPath(root, spec[5..]);
-        if (spec.StartsWith("text:")) return AwakeningUiInspector.FindByText(root, spec[5..], under);
+        if (spec.StartsWith("text:"))
+        {
+            // "text:Set Item Price^2/2,0,1": the element with that text, 2 parents up, then child path 2,0,1.
+            var caret = spec.IndexOf('^');
+            if (caret < 0) return AwakeningUiInspector.FindByText(root, spec[5..], under);
+            var anchor = AwakeningUiInspector.FindByText(root, spec[5..caret], under);
+            var rest = spec[(caret + 1)..]; var slash = rest.IndexOf('/');
+            var ups = int.TryParse(slash < 0 ? rest : rest[..slash], out var u) ? u : 0;
+            for (var i = 0; i < ups && anchor != null; i++) anchor = anchor.Parent;
+            return anchor == null || slash < 0 ? anchor : AwakeningUiInspector.FindByPath(anchor, rest[(slash + 1)..]);
+        }
         return null;
     }
     private readonly Queue<ExchangeRequest> _restockQueue = new();
@@ -136,6 +147,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         _ledger = new(_directory);
         _exchange = new((name, data) => _log.Event(Run, name, data));
         _market = new((name, data) => _log.Event(Run, name, data));
+        _beasts = new((name, data) => _log.Event(Run, name, data)) { Navigate = (c, p) => { Navigate(c, p); return true; } };
         RefreshAnalysis();
         _log.Event(Run, "plugin.loaded", new { Supervisor.Generation, Supervisor.Mvid, Supervisor.StorageError });
     }
@@ -249,7 +261,14 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             var parts = (review ?? "").Split('|');
             var label = Regex.Replace(string.IsNullOrWhiteSpace(parts[0]) ? "manual" : parts[0], @"[^A-Za-z0-9_-]", "");
             var depth = parts.Length > 2 && int.TryParse(parts[2], out var dd) ? dd : 9;
-            var file = AwakeningUiInspector.Dump(ctx.Game, _directory, label, parts.Length > 1 && parts[1].Length > 0 ? parts[1] : null, depth, parts.Length > 3 && parts[3] == "hidden");
+            string? rootSpec = parts.Length > 1 && parts[1].Length > 0 ? parts[1] : null;
+            string? file;
+            if (rootSpec != null && rootSpec.StartsWith("text:"))
+            {
+                var anchor = ResolveUi(ctx, rootSpec);
+                file = AwakeningUiInspector.DumpElement(ctx.Game, _directory, label, anchor, depth, parts.Length > 3 && parts[3] == "hidden");
+            }
+            else file = AwakeningUiInspector.Dump(ctx.Game, _directory, label, rootSpec, depth, parts.Length > 3 && parts[3] == "hidden");
             _log.Event(Run, "ui.inspected", new { file });
             return Supervisor.RecordCommand(id, "inspected:" + Path.GetFileName(file));
         }
@@ -292,6 +311,23 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         if (action == "market_cancel") { _market.Cancel(); _marketManual = false; return Supervisor.RecordCommand(id, "market_cancelled"); }
         if (action == "exchange_cancel") { _exchange.Cancel(); _exchangeManual = false; return Supervisor.RecordCommand(id, "exchange_cancelled"); }
+        if (action == "inventory_read")
+        {
+            // Read-only: the player's inventory (and the cursor) as "x,y:name[:captured monster]".
+            var rows = new List<string>();
+            try
+            {
+                foreach (var i in StashSystem.GetInventorySlotItems(ctx.Game) ?? new List<ServerInventory.InventSlotItem>())
+                {
+                    var n = i.Item == null ? "?" : AwakeningGameReader.Name(ctx.Game, i.Item);
+                    var cm = i.Item?.Path == AwakeningBeastSeller.ItemisedPath ? ":" + AwakeningBeastSeller.CapturedName(i.Item) : "";
+                    rows.Add($"{i.PosX},{i.PosY}:{n}{cm}");
+                }
+            }
+            catch (Exception ex) { rows.Add("error " + ex.Message); }
+            _log.Event(Run, "inventory.read", new { rows });
+            return Supervisor.RecordCommand(id, "inv:" + string.Join(" | ", rows).Replace(":", "="));
+        }
         if (action == "ui_read")
         {
             // Read-only: value = "path:..." → InputText/Text of the element and its descendants (3 levels).
@@ -440,6 +476,10 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _mapBankRunDone = false; _mapBankLogged = false; _mapTierStep = 0; _mapPage = 0; _mapWithdrawRetries = 0; _chaosStoreClicks = 0; _bossHpSig = -1; _bossNoDamageSeconds = 0; _fightTickAt = DateTime.MinValue;
             _guardianChecked = false; _guardianCasts = 0; _scrollsChecked = false;
             _stashedForRestock = false; _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false; _marketRetries = 0; _chaosShortRecoveries = 0; _marketRetryAt = DateTime.MinValue;
+            // Remembered map source (user, 2026-09-23): skip a Tmp tab known to be empty and start at the MAP page
+            // that held the last usable map, instead of walking Tmp → MAP page 1..6 every time.
+            if (_tmpKnownEmpty && DateTime.UtcNow >= _mapStashSkipUntil) _mapRestockTabIndex = 1;
+            _mapCurrentPage = 1;
             _defensiveClear = false;
             _lootDefenseActive = false; _lootDefenseSuppressedUntil = DateTime.MinValue;
             _uniqueEvidence.Clear();
@@ -519,7 +559,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             if (Run.EnteredUtc.HasValue) Run.ElapsedSeconds += elapsed;
             var gc = ctx.Game;
             if (!gc.InGame || gc.IsLoading || gc.Player == null) return;
-            bool inMap = gc.Area?.CurrentArea != null && !gc.Area.CurrentArea.IsTown && !gc.Area.CurrentArea.IsHideout;
+            // The Menagerie is visited between maps to itemise captured beasts: it is never "a map".
+            bool inMap = gc.Area?.CurrentArea != null && !gc.Area.CurrentArea.IsTown && !gc.Area.CurrentArea.IsHideout && gc.Area.CurrentArea.Name != "The Menagerie";
             if (inMap && Run.Outcome == AttemptOutcome.None && !Run.ActivationRequested && !Run.ActivationConfirmed)
             { Finish(ctx, AttemptOutcome.OperationalFailure, "unexpected_map_before_activation"); return; }
             if (!inMap && Run.EnteredUtc.HasValue && Run.Outcome == AttemptOutcome.None && Run.Phase is AwakeningPhase.Scout or AwakeningPhase.Fight or AwakeningPhase.Loot or AwakeningPhase.MapBoss)
@@ -880,6 +921,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     private void Prepare(BotContext ctx)
     {
+        if (!Run.ActivationRequested && !Run.ActivationConfirmed && TickBeastSales(ctx)) return;
         if (ctx.Game.Area?.CurrentArea?.IsHideout != true) { Status = "Waiting for hideout"; return; }
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && EnsureChaosKnown(ctx)) return;
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && !_listingChecked && PlanListings(ctx)) return;
@@ -949,7 +991,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // stop_after_map must also hold when the previous map ended in deaths (the death path re-enters Prepare, not Finish(Success)).
         if (_manualContinuous && _stopAfterMap) { _stopAfterMap = false; Finish(ctx, AttemptOutcome.OperationalFailure, "stop_after_map_before_new_map"); return; }
         if (StrictMapRecipe.Portals(ctx.Game).Any(p => !Run.PriorPortalIds.Contains(p.Id)))
-        { Finish(ctx, AttemptOutcome.OperationalFailure, "unrecognized_portal_set_before_activation"); return; }
+        {
+            // 2026-09-23 04:52: portals left from a stopped/abandoned map stopped the loop here. They are never entered;
+            // activating the next map replaces them, so record them as the baseline and carry on.
+            var present = StrictMapRecipe.Portals(ctx.Game);
+            _log.Event(Run, "portals.baseline_adopted", new { previous = Run.PriorPortalIds, current = present.Select(p => (long)p.Id).ToArray() });
+            Run.PriorPortalIds = present.Select(p => (long)p.Id).ToList(); Supervisor.Save();
+        }
         if (!ctx.Settings.Awakening.ModCatalogValidated.Value) { WriteEvidence(ctx); Finish(ctx, AttemptOutcome.OperationalFailure, "preflight: validate 17 NG rules using map evidence"); return; }
         if (ctx.Settings.Awakening.ExarchReadyCounter.Value < 0) { WriteEvidence(ctx); Finish(ctx, AttemptOutcome.OperationalFailure, "preflight: calibrate Exarch ready counter"); return; }
         if (!ctx.NinjaPrice.IsLoaded || (DateTime.Now - ctx.NinjaPrice.LastRefreshTime).TotalMinutes > ctx.Settings.Awakening.MaxPriceAgeMinutes.Value)
@@ -1128,7 +1176,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private int HeldMaterial(BotContext ctx, string name)
     {
         var held = AwakeningExchange.CountHeld(ctx.Game, name);
-        try { held = Math.Max(held, ctx.StashIndex.Tabs.SelectMany(t => t.Items).Where(e => e.BaseName.Equals(name, StringComparison.OrdinalIgnoreCase)).Sum(e => e.Stack)); } catch { }
+        try
+        {
+            held = Math.Max(held, ctx.StashIndex.Tabs.SelectMany(t => t.Items).Where(e => e.BaseName.Equals(name, StringComparison.OrdinalIgnoreCase)
+                || (e.BaseName.Length == 0 && ctx.Game.Files.BaseItemTypes.Translate(e.ItemPath)?.BaseName?.Equals(name, StringComparison.OrdinalIgnoreCase) == true)).Sum(e => e.Stack));
+        }
+        catch { }
         if (_deviceMaterialPaths.ContainsKey(name)) held++;
         return held;
     }
@@ -1136,10 +1189,17 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     {
         var economy = ctx.Settings.Awakening.Economy;
         _restockTried = true; _restockQueue.Clear(); _restockSales = 0;
+        var skipped = new List<string>();
         foreach (var name in MaterialNames)
         {
             var target = name.StartsWith("Horned") ? economy.ScarabTarget.Value : economy.SacrificeTarget.Value;
-            var need = target - HeldMaterial(ctx, name);
+            var held = HeldMaterial(ctx, name);
+            // 2026-09-23 (user): Sacrifices kept being bought while the Fragment tab (General) still held plenty —
+            // one missing Scarab topped every Sacrifice up to its target. Only materials at/below the reorder point
+            // (or missing) are bought now; the rest are left for a later trip.
+            var reorderAt = name.StartsWith("Horned") ? 1 : Math.Max(3, target / 4);
+            if (held > reorderAt) { skipped.Add(name + ":" + held); continue; }
+            var need = target - held;
             if (need <= 0) continue;
             var category = name.StartsWith("Horned") ? NinjaPriceCategory.Scarab : NinjaPriceCategory.Fragment;
             var ninja = ctx.NinjaPrice.GetPrice(name, category).MinChaosValue;
@@ -1147,7 +1207,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             // 2026-09-22: Sacrifice at Dusk at 0.20c vs a 0.17c cap stopped the loop.
             _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.BuyAtAsk, name, "Chaos Orb", need, ninja > 0 ? Math.Max(ninja * 1.5, ninja + 1) : 300));
         }
-        _log.Event(Run, "restock.planned", _restockQueue.ToArray());
+        _log.Event(Run, "restock.planned", new { orders = _restockQueue.ToArray(), stockedEnough = skipped });
         CancelInput(ctx);
         SetPhase(AwakeningPhase.Restock, "restock_via_faustus");
     }
@@ -1267,6 +1327,48 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // Chaos collected from Faustus lands in the inventory; with the stash open, Ctrl+right-click on a Chaos stack
     // moves every Chaos Orb in the inventory into the stash (user-verified).
     private DateTime _chaosStoreAt, _chaosF3At; private int _chaosStoreClicks, _chaosNoDrop, _chaosCarried = -1; private bool _chaosF3Tried;
+    // 2026-09-23 04:47: a 20-Chaos stack sat on the mouse cursor ("Cursor1"). While something is held, every
+    // Ctrl+click, F3 pass and withdrawal silently does nothing — that is why 300 Chaos never left the inventory and
+    // the Tmp map withdrawals kept timing out. Put the held item down in a free inventory cell first.
+    private DateTime _cursorClearAt, _cursorGiveUpUntil; private int _cursorAttempts;
+    private bool ClearCursorItem(BotContext ctx)
+    {
+        try
+        {
+            var cursor = ctx.Game.IngameState.Data.ServerData.PlayerInventories
+                .Select(h => h?.Inventory).FirstOrDefault(i => i != null && i.InventType.ToString() == "Cursor");
+            if (cursor == null || cursor.Items == null || cursor.Items.Count == 0) { _cursorAttempts = 0; return false; }
+            if (DateTime.UtcNow < _cursorGiveUpUntil) return false;   // never block the caller forever
+            if (_cursorAttempts >= 8)
+            {
+                _log.Event(Run, "cursor.clear_failed", new { attempts = _cursorAttempts });
+                _cursorAttempts = 0; _cursorGiveUpUntil = DateTime.UtcNow.AddSeconds(30); return false;
+            }
+            if ((DateTime.UtcNow - _cursorClearAt).TotalSeconds < 1 || !BotInput.CanAct) return true;
+            var panel = ctx.Game.IngameState.IngameUi.InventoryPanel;
+            if (panel?.IsVisible != true) { BotInput.PressKey(Keys.I); _cursorClearAt = DateTime.UtcNow; Status = "Opening the inventory to put down the held item"; return true; }
+            var grid = panel[InventoryIndex.PlayerInventory];
+            var rect = grid?.GetClientRect();
+            if (rect == null || rect.Value.Width <= 0) return true;
+            var used = new bool[12, 5];
+            foreach (var i in StashSystem.GetInventorySlotItems(ctx.Game) ?? new List<ServerInventory.InventSlotItem>())
+                for (var x = i.PosX; x < Math.Min(12, i.PosX + i.SizeX); x++)
+                    for (var y = i.PosY; y < Math.Min(5, i.PosY + i.SizeY); y++) if (x >= 0 && y >= 0) used[x, y] = true;
+            float cw = rect.Value.Width / 12f, ch = rect.Value.Height / 5f;
+            for (var x = 10; x >= 0; x--)          // columns left of the reserved column 11
+                for (var y = 0; y < 5; y++)
+                {
+                    if (used[x, y]) continue;
+                    var w = ctx.Game.Window.GetWindowRectangle();
+                    var at = new Vector2(w.X + rect.Value.X + (x + 0.5f) * cw, w.Y + rect.Value.Y + (y + 0.5f) * ch);
+                    if (BotInput.Click(at)) { _cursorClearAt = DateTime.UtcNow; _cursorAttempts++; _log.Event(Run, "cursor.item_placed", new { x, y, count = cursor.Items.Count, attempt = _cursorAttempts }); }
+                    Status = "Putting down the held item"; return true;
+                }
+            _log.Event(Run, "cursor.no_free_cell", new { }); _cursorGiveUpUntil = DateTime.UtcNow.AddSeconds(10);
+            return false;
+        }
+        catch { return false; }
+    }
     /// <summary>Free inventory cells (12x5 grid); -1 when the inventory cannot be read.</summary>
     private static int InventoryFreeCells(BotContext ctx)
     {
@@ -1283,6 +1385,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private bool StoreInventoryChaos(BotContext ctx)
     {
         if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true) return false;
+        if (ClearCursorItem(ctx)) return true;
         // 2026-09-23 (user): the inventory was full of Chaos and withdrawals timed out. One Ctrl+right-click moves one
         // stack, so keep clicking (up to 20) until no Chaos stack is left; two clicks without the count dropping mean
         // the Currency tab is full.
@@ -1648,8 +1751,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         catch { return true; } // unknown → let OpenMap decide as before
     }
     private int _mapTierStep, _mapPage, _mapWithdrawRetries; private DateTime _mapTierClickAt, _mapStashSkipUntil;
+    private static bool _tmpKnownEmpty; private static int _mapMemPage = 1; private int _mapCurrentPage = 1;
+    // Page order for the T16 view of the MAP tab: the remembered page first, then the others (page 1 is shown first).
+    private List<int> MapPageOrder() => (_mapMemPage > 1 ? new List<int> { _mapMemPage } : new List<int>())
+        .Concat(Enumerable.Range(2, 5).Where(p => p != _mapMemPage)).ToList();
     private void RestockMap(BotContext ctx)
     {
+        if (ClearCursorItem(ctx)) { _phaseAt = DateTime.UtcNow; return; }
         if ((DateTime.UtcNow - _phaseAt).TotalSeconds > 60)
         {
             // 2026-09-23: a slow Tmp withdrawal (two 30 s retries) ran into this 60 s limit and ended the session.
@@ -1734,12 +1842,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                     catch (Exception ex) { _log.Event(Run, "map.stash_calibration", new { error = ex.Message }); }
                 }
             }
-            else if (_mapRestockTabIndex > 0 && _mapPage < 6 && (DateTime.UtcNow - _restockEmptySince).TotalSeconds > 2)
+            else if (_mapRestockTabIndex > 0 && _mapPage < MapPageOrder().Count && (DateTime.UtcNow - _restockEmptySince).TotalSeconds > (_mapPage == 0 && _mapMemPage > 1 ? 0.3 : 2))
             {
                 // The T16 view of the map stash has 6 pages ("1".."6", 72 maps each); bulk-bought maps filed by
                 // StashieV2 can sit on any of them (2026-09-22: page 1 held none, the bot bought 10 more maps).
                 if ((DateTime.UtcNow - _mapTierClickAt).TotalSeconds < 1.2 || !BotInput.CanAct) return;
-                var next = (_mapPage + 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                var pageNumber = MapPageOrder()[_mapPage];
+                var next = pageNumber.ToString(System.Globalization.CultureInfo.InvariantCulture);
                 Element? button = null;
                 try
                 {
@@ -1754,10 +1863,10 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 }
                 catch { }
                 _mapPage++; _mapTierClickAt = DateTime.UtcNow;
-                if (button == null) { _log.Event(Run, "map.stash_page_missing", new { page = next }); _mapPage = 6; return; }
+                if (button == null) { _log.Event(Run, "map.stash_page_missing", new { page = next }); _mapPage = 99; return; }
                 var w = ctx.Game.Window.GetWindowRectangle(); var rc = button.GetClientRect();
                 if (BotInput.Click(new Vector2(w.X + rc.Center.X, w.Y + rc.Center.Y)))
-                    _log.Event(Run, "map.stash_page", new { page = next });
+                { _mapCurrentPage = pageNumber; _log.Event(Run, "map.stash_page", new { page = next, remembered = _mapMemPage }); }
                 _restockEmptySince = DateTime.MinValue; _phaseAt = DateTime.UtcNow;
                 return;
             }
@@ -1765,7 +1874,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             {
                 ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
                 // StashieV2 files maps into the "MAP" (map stash) tab: try it after "Tmp" before buying.
-                if (_mapRestockTabIndex > 0) _mapStashSkipUntil = DateTime.UtcNow.AddMinutes(45);
+                if (_mapRestockTabIndex > 0) { _mapStashSkipUntil = DateTime.UtcNow.AddMinutes(45); _mapMemPage = 1; }
+                else _tmpKnownEmpty = true;
                 if (_mapRestockTabIndex < MapRestockTabs.Length - 1 && DateTime.UtcNow >= _mapStashSkipUntil)
                 { _mapTierStep = 0; _mapPage = 0; _mapRestockTabIndex++; _mapRestockStarted = false; _restockEmptySince = DateTime.MinValue; _phaseAt = DateTime.UtcNow; return; }
                 if (ctx.Settings.Awakening.Economy.AutoBuyMaps.Value && !_marketTried)
@@ -1789,7 +1899,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         if (result != StashResult.Succeeded) return;
         ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
-        _log.Event(Run, "map.restocked", new { tab = "Tmp", count = 1 });
+        if (_mapRestockTabIndex > 0) _mapMemPage = _mapCurrentPage; else _tmpKnownEmpty = false;
+        _log.Event(Run, "map.restocked", new { tab = MapRestockTabs[Math.Min(_mapRestockTabIndex, MapRestockTabs.Length - 1)], page = _mapRestockTabIndex > 0 ? _mapCurrentPage : 0, count = 1 });
         SetPhase(AwakeningPhase.OpenMap, "Tmp_map_ready");
     }
     private MarketMapRequest MarketRequest(BotContext ctx, int count)
@@ -1824,7 +1935,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         RecordMarketResult("auto");
         _log.Event(Run, "market.restock_done", new { ok = _market.Succeeded, bought = _market.Bought, spent = _market.Spent, reason = _market.FailReason });
         // Bulk purchases (mapBuyCount 10): the spare maps are stored (Tmp bank / MAP tab), so look there again next time.
-        if (_market.Bought > 1) _mapStashSkipUntil = DateTime.MinValue;
+        if (_market.Bought > 1) { _mapStashSkipUntil = DateTime.MinValue; _tmpKnownEmpty = false; }
         if (_market.Succeeded) { _marketRetries = 0; _mapRestockAttempted = false; SetPhase(AwakeningPhase.OpenMap, "market_maps_bought"); return; }
         // 2026-09-22 (user): the loop must finish without a human. A failed search (too_many_searches, no acceptable
         // listing, timeouts) waits 10 s and searches again; only running out of chaos, or 8 failures in a row, stops.
@@ -1882,6 +1993,79 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private static DateTime _beastPricesAt = DateTime.MinValue;
     private readonly HashSet<long> _beastIgnored = new();
     private long _beastId; private DateTime _beastSince; private double _beastHp = -1; private DateTime _beastHpAt;
+    private DateTime _beastYieldAt; private bool _beastYielding;
+    private double _beastHpFraction = -1, _beastChaos; private string _beastName = "";
+    // Captured valuable beasts waiting in Einhar's Bestiary (estimated from hunted kills). The first hideout visit of a
+    // session always checks once (beasts captured before the session, e.g. the Black Mórrigan found 2026-09-23).
+    private static double _pendingBeastChaos; private static int _pendingBeasts; private static bool _beastSessionChecked;
+    private DateTime _beastTripAt = DateTime.MinValue; private bool _beastListing;
+    private static int _merchantListings; private static DateTime _merchantCollectAt = DateTime.UtcNow;
+    private DateTime _beastListAttemptAt = DateTime.MinValue;
+    private const double BeastTripMinChaos = 150;
+    /// <summary>Hideout step between maps: itemise valuable captured beasts in the Menagerie (Ctrl+right-click in
+    /// Einhar's Bestiary) and list them at Faustus' Merchant in the same trip. Batched: only when the estimated
+    /// captured value reaches BeastTripMinChaos (≈ 40 s trip vs one map ≈ 250 s), plus one check per session.</summary>
+    private bool TickBeastSales(BotContext ctx)
+    {
+        if (_beasts.Busy)
+        {
+            _beasts.Tick(ctx); Status = _beasts.Status; _phaseAt = DateTime.UtcNow; return true;
+        }
+        if (_beasts.Finished)
+        {
+            var itemised = AwakeningBeastSeller.CountItemised(ctx.Game);
+            if (!_beastListing && itemised > 0 && ctx.Game.Area?.CurrentArea?.IsHideout == true && ctx.Game.Area.CurrentArea.Name != "The Menagerie")
+            {
+                _beastListing = true; _beastListAttemptAt = DateTime.UtcNow;
+                _beasts.StartList(item =>
+                {
+                    LoadBeastPrices();
+                    var name = AwakeningBeastSeller.CapturedName(item);
+                    // A hair under poe.ninja so it sells quickly (Merchant listings are locked for a while once placed).
+                    return _beastPrices.TryGetValue(name, out var v) && v >= BeastMinChaos ? Math.Floor(v * 0.9) : 0;
+                });
+                return true;
+            }
+            if (_beasts.Listed > 0) _merchantListings += _beasts.Listed;
+            if (_beasts.EarningsCollected > 0) _merchantListings = Math.Max(0, _merchantListings - _beasts.EarningsCollected);
+            _merchantCollectAt = DateTime.UtcNow;
+            _beastListing = false; _beasts.Reset();
+            return false;
+        }
+        // Itemised beasts already in the inventory (a listing that failed, or itemised by hand) are listed before the
+        // stash pass would file them away; retried at most every 10 minutes.
+        if (ctx.Game.Area?.CurrentArea?.IsHideout == true && ctx.Game.Area.CurrentArea.Name != "The Menagerie" && ctx.Settings.Running.Value
+            && AwakeningBeastSeller.CountItemised(ctx.Game) > 0 && (DateTime.UtcNow - _beastListAttemptAt).TotalMinutes >= 10)
+        {
+            _beastListAttemptAt = DateTime.UtcNow; _beastListing = true; CancelInput(ctx);
+            _beasts.StartList(item =>
+            {
+                LoadBeastPrices();
+                var name = AwakeningBeastSeller.CapturedName(item);
+                return _beastPrices.TryGetValue(name, out var v) && v >= BeastMinChaos ? Math.Floor(v * 0.9) : 0;
+            });
+            return true;
+        }
+        // Sold Merchant listings pay into "Earnings (Remove-only)": empty it every 45 minutes while listings are out.
+        if (_merchantListings > 0 && ctx.Game.Area?.CurrentArea?.IsHideout == true && ctx.Settings.Running.Value
+            && (DateTime.UtcNow - _merchantCollectAt).TotalMinutes >= 45 && InventoryFreeCells(ctx) >= 4)
+        {
+            _merchantCollectAt = DateTime.UtcNow; _beastListing = true; CancelInput(ctx);
+            _log.Event(Run, "shop.collect_planned", new { listings = _merchantListings });
+            _beasts.StartCollect(); return true;
+        }
+        if (ctx.Game.Area?.CurrentArea?.IsHideout != true || !ctx.Settings.Running.Value) return false;
+        if ((DateTime.UtcNow - _beastTripAt).TotalMinutes < 20) return false;
+        if (_beastSessionChecked && _pendingBeastChaos < BeastTripMinChaos) return false;
+        if (InventoryFreeCells(ctx) < 4) return false;
+        LoadBeastPrices();
+        var valuable = _beastPrices.Where(kv => kv.Value >= BeastMinChaos).Select(kv => (kv.Key, kv.Value)).ToList();
+        if (valuable.Count == 0) return false;
+        _beastSessionChecked = true; _beastTripAt = DateTime.UtcNow; _pendingBeastChaos = 0; _pendingBeasts = 0;
+        CancelInput(ctx);
+        _beasts.Start(ctx.Game, valuable);
+        return true;
+    }
     private void LoadBeastPrices()
     {
         if ((DateTime.UtcNow - _beastPricesAt).TotalMinutes < 10) return;
@@ -1924,7 +2108,18 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private bool HuntBeast(BotContext ctx, float radius)
     {
         var beast = ValuableBeast(ctx, radius);
-        if (beast == null) { if (_beastId != 0) { _log.Event(Run, "beast.lost", new { id = _beastId }); _beastId = 0; } return false; }
+        if (beast == null)
+        {
+            if (_beastId != 0)
+            {
+                // A hunted beast that disappears at low HP was killed (Einhar captures it): count it for the Menagerie trip.
+                var killed = _beastHpFraction >= 0 && _beastHpFraction < 0.2;
+                _log.Event(Run, killed ? "beast.killed" : "beast.lost", new { id = _beastId, name = _beastName, chaos = _beastChaos, hp = _beastHpFraction });
+                if (killed) { _pendingBeastChaos += _beastChaos; _pendingBeasts++; }
+                _beastId = 0;
+            }
+            return false;
+        }
         var now = DateTime.UtcNow;
         if (_beastId != beast.Id)
         {
@@ -1933,6 +2128,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 distance = Vector2.Distance(ctx.Game.Player.GridPosNum, beast.GridPosNum) });
         }
         var hp = (double)(beast.GetComponent<Life>()?.CurHP ?? 0) + (beast.GetComponent<Life>()?.CurES ?? 0);
+        try { var l = beast.GetComponent<Life>(); var max = (double)(l?.MaxHP ?? 0) + (l?.MaxES ?? 0); _beastHpFraction = max > 0 ? hp / max : -1; } catch { _beastHpFraction = -1; }
+        _beastName = beast.RenderName ?? ""; _beastChaos = BeastValue(beast);
         if (_beastHp < 0 || Math.Abs(hp - _beastHp) > 1) { _beastHp = hp; _beastHpAt = now; }
         // Unreachable or immune (frozen beast, behind terrain): give it up for the rest of the map.
         if ((now - _beastHpAt).TotalSeconds > 25 || (now - _beastSince).TotalSeconds > 90)
@@ -1942,7 +2139,26 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             return false;
         }
         var distance = Vector2.Distance(ctx.Game.Player.GridPosNum, beast.GridPosNum);
-        if (distance > 45) { ctx.Combat.Suspend(); Navigate(ctx, beast.GridPosNum); Status = $"Beast: walking to {beast.RenderName} ({distance:0})"; return true; }
+        if (distance > 45)
+        {
+            // 2026-09-23 04:01/04:02: two of three deaths in one map came while walking 130-195 grid to a 665c beast with
+            // combat suspended, straight through packs. Packs within reach are fought first (Scout's defensive clear),
+            // and the hunt's give-up clocks are paused meanwhile; the walk resumes once the way is clear.
+            var player = ctx.Game.Player.GridPosNum;
+            var blocking = ctx.Game.EntityListWrapper.OnlyValidEntities.Any(e => e.Type == EntityType.Monster && e.Id != beast.Id
+                && e.IsAlive && e.IsHostile && e.IsTargetable && !FrozenLegion(e) && !_scoutIgnored.Contains(e.Id)
+                && (e.GetComponent<Life>()?.CurHP ?? 0) > 1 && Vector2.Distance(player, e.GridPosNum) < 35);
+            if (blocking)
+            {
+                _beastHpAt = now; _beastSince = _beastSince.AddMilliseconds(Math.Min(250, Math.Max(0, (now - _beastYieldAt).TotalMilliseconds)));
+                _beastYieldAt = now;
+                if (!_beastYielding) { _beastYielding = true; _log.Event(Run, "beast.clear_path_first", new { beast.Id, beast.RenderName, distance }); }
+                return false;
+            }
+            _beastYielding = false; _beastYieldAt = now;
+            ctx.Combat.Suspend(); Navigate(ctx, beast.GridPosNum); Status = $"Beast: walking to {beast.RenderName} ({distance:0})"; return true;
+        }
+        _beastYielding = false; _beastYieldAt = now;
         if (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding) { ctx.Navigation.Stop(ctx.Game); _destination = null; }
         ctx.Combat.Profile.Enabled = true; ctx.Combat.SuppressPositioning = true; ctx.Combat.SuppressTargetedSkills = false;
         ctx.Combat.Tick(ctx);
@@ -1974,7 +2190,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         if (now < _scoutRepositionUntil && (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding)) { TravelSustain(ctx); Status = "Scout repositioning toward stalled pack"; return; }
         // A 50c+ beast that is already loaded is worth more than the seconds it costs; never search for one.
-        if (!lootDefense && HuntBeast(ctx, 200)) return;
+        // After two deaths the next one abandons the map (and its pinnacle loot): off-route beasts wait for the bosses.
+        if (!lootDefense && HuntBeast(ctx, Run.Deaths >= 2 && !Run.BossesCompleted ? 60f : 200f)) return;
         // Known drop site / boss position (e.g. after a death): head straight there. Only enemies close enough to hurt
         // (35 grids) are fought on the way, and a pack that takes no damage is walked past instead of chased.
         var dropSite = KnownDropSite();
@@ -3028,6 +3245,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     private void ExternalStash(BotContext ctx)
     {
+        if (ClearCursorItem(ctx)) { _phaseAt = DateTime.UtcNow; return; }
         if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true)
         {
             // StashSystem closes the stash after its store batch; bank at most once per run, then reopen for F3.

@@ -45,12 +45,18 @@ public sealed class AwakeningSupervisor
     private readonly AutoResetEvent _saveSignal = new(false);
     private readonly ManualResetEventSlim _saveIdle = new(true);
     private Thread? _saver;
+    private const int MaxHistory = 150;
     public bool Save()
     {
         if (StorageError.Length > 0) return false;
         byte[] snapshot;
         // Finished runs keep their outcome/mod evidence; their scout breadcrumbs (Visited) made the checkpoint ~1.3 MB.
         foreach (var h in State.History) if (h.Visited.Count > 0) h.Visited = new();
+        // 2026-09-23: the checkpoint had grown to 4 MB (306 finished runs, each carrying the ~6 KB flat settings dump
+        // in BuildConfiguration) and was re-serialized on the Tick thread on every Save. Finished runs are archived in
+        // runs.jsonl; keep the fingerprint, drop the dump, and keep only the most recent runs for the mod-risk analysis.
+        foreach (var h in State.History) if (h.BuildConfiguration.Length > 0) h.BuildConfiguration = "";
+        if (State.History.Count > MaxHistory) State.History.RemoveRange(0, State.History.Count - MaxHistory);
         try { snapshot = JsonSerializer.SerializeToUtf8Bytes(State, AwakeningJson.Options); }
         catch (Exception ex) { StorageError = $"serialize checkpoint: {ex.GetType().Name}: {ex.Message}"; State.Armed = false; return false; }
         lock (_saveGate)

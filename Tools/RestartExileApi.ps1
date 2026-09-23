@@ -1,4 +1,4 @@
-# Restart ExileAPI (Loader.exe) so it recompiles Plugins\Source\AutoExile, then verify the new build is loaded.
+﻿# Restart ExileAPI (Loader.exe) so it recompiles Plugins\Source\AutoExile, then verify the new build is loaded.
 # Steps: 1) read the running host state  2) kill Loader.exe  3) start Loader.exe  4) wait for the control API
 #        5) confirm the loaded AutoExile.dll (mvid) is the freshly compiled one and that no compile errors were written.
 # Usage: double-click RestartExileApi.bat, or POST {"action":"host.restart"} to http://127.0.0.1:9876/api/control
@@ -71,11 +71,14 @@ if ($before -and $before.awakening) {
 $started = Get-Date
 Start-Sleep -Milliseconds 800  # let the HTTP response that triggered us reach the caller
 Write-Host '[1/4] Killing Loader.exe ...'
-$procs = @(Get-Process -Name 'Loader' -ErrorAction SilentlyContinue)
+# 2026-09-23: a second ExileAPI (Duo follower) runs in another Windows session; only this session's Loader is ours.
+$mySession = (Get-Process -Id $PID).SessionId
+function MyLoaders { @(Get-Process -Name 'Loader' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $mySession }) }
+$procs = MyLoaders
 foreach ($p in $procs) { try { Stop-Process -Id $p.Id -Force } catch { Finish 1 "Could not kill Loader.exe pid $($p.Id): $($_.Exception.Message)" } }
 $deadline = (Get-Date).AddSeconds(20)
-while ((Get-Process -Name 'Loader' -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
-if (Get-Process -Name 'Loader' -ErrorAction SilentlyContinue) { Finish 1 'Loader.exe is still running after 20 seconds.' }
+while ((MyLoaders).Count -gt 0 -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+if ((MyLoaders).Count -gt 0) { Finish 1 'Loader.exe is still running after 20 seconds.' }
 Write-Host "      killed $($procs.Count) process(es)."
 
 Write-Host '[2/4] Starting Loader.exe ...'
