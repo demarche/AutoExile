@@ -439,7 +439,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
             _mapBankRunDone = false; _mapBankLogged = false; _mapTierStep = 0; _mapPage = 0; _mapWithdrawRetries = 0; _chaosStoreClicks = 0; _bossHpSig = -1; _bossNoDamageSeconds = 0; _fightTickAt = DateTime.MinValue;
             _guardianChecked = false; _guardianCasts = 0; _scrollsChecked = false;
-            _stashedForRestock = false; _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false; _marketRetries = 0; _marketRetryAt = DateTime.MinValue;
+            _stashedForRestock = false; _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false; _marketRetries = 0; _chaosShortRecoveries = 0; _marketRetryAt = DateTime.MinValue;
             _defensiveClear = false;
             _lootDefenseActive = false; _lootDefenseSuppressedUntil = DateTime.MinValue;
             _uniqueEvidence.Clear();
@@ -884,6 +884,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && EnsureChaosKnown(ctx)) return;
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && !_listingChecked && PlanListings(ctx)) return;
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && PlanDivineConversion(ctx)) return;
+        if (!Run.ActivationRequested && !Run.ActivationConfirmed && PlanCollect(ctx)) return;
         if (EnsureGuardian(ctx)) return;
         // 2026-09-22 00:47: QuickPortal (F2) needs Portal Scrolls; with 0 left the character was stranded in the map.
         // Take a stack from the stash; only when the stash has none, buy with 1 chaos at Faustus (user).
@@ -901,6 +902,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (Run.ActivationConfirmed)
         {
             if (AbandonDeadlyMap(ctx)) { Status = "Abandoning the map after repeated deaths"; return; }
+            // 2026-09-23: re-entering 25 s after a death, with Energy Shield still empty, just fed another one-shot.
+            // Wait in the Hideout until the pool is back (or 12 s) before stepping into a live pinnacle fight.
+            if (Run.Deaths > 0 && !Run.BossesCompleted)
+            {
+                var life = ctx.Game.Player.GetComponent<Life>();
+                float pool = (life?.CurHP ?? 0) + (life?.CurES ?? 0), max = (life?.MaxHP ?? 0) + (life?.MaxES ?? 0);
+                if (max > 0 && pool / max < 0.9f && (DateTime.UtcNow - _phaseAt).TotalSeconds < 12)
+                { Status = $"Recharging before re-entry ({pool / max:P0})"; return; }
+            }
             var portals = StrictMapRecipe.Portals(ctx.Game).Where(x => Run.PortalIds.Contains(x.Id)).ToList();
             if (portals.Count > 0) { SetPhase(AwakeningPhase.EnterPortal, "retry_existing_map"); return; }
             // Portal entities stream in after the Hideout loads; after a death recovery allow a little longer
@@ -1146,7 +1156,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // 2026-09-22 (user): the Currency tab holds at most 5000 Chaos and the overflow filled the inventory. Above
     // 4000 Chaos, convert all but ~1000 (enough for Scarabs, Sacrifices and maps) into Divine Orbs with a Faustus
     // buy order at the best competing Chaos-for-Divine price (no premium: it may fill slowly, but at the best rate).
-    private const int DivineConvertAbove = 4000, DivineKeepChaos = 1000;
+    private const int DivineConvertAbove = 4500, DivineKeepChaos = 2000;
     private DateTime _divineOrderAt = DateTime.MinValue;
     private bool _divineDiagLogged, _stashChaosFull;
     // Animate Guardian (Metadata/Monsters/AnimatedItem/AnimatedArmour) is a big part of survival. It cannot be
@@ -1304,6 +1314,23 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             return true;
         }
         catch { return false; }
+    }
+    // 2026-09-23 (user): filled Faustus orders (listed Chisels sold for Chaos, Divine bids bought) wait at Faustus
+    // until someone collects them. Visit him every 15 minutes while anything is listed or bid on, collect into the
+    // inventory, then the re-index trip opens the stash and Ctrl+right-click banks the Chaos.
+    private DateTime _lastCollectAt = DateTime.UtcNow;
+    private bool PlanCollect(BotContext ctx)
+    {
+        if (!ctx.Settings.Awakening.Economy.AutoRestock.Value) return false;
+        var pending = _listedThisSession.Count > 0 || _bidPending.Count > 0 || _divineOrderAt != DateTime.MinValue;
+        if (!pending || (DateTime.UtcNow - _lastCollectAt).TotalMinutes < 15) return false;
+        _lastCollectAt = DateTime.UtcNow;
+        _restockQueue.Clear();
+        _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.Collect, "Chaos Orb", "Chaos Orb", 0));
+        _restockBackToPrepare = false; // after collecting: re-index → stash opens → Chaos is stored
+        _log.Event(Run, "faustus.collect_planned", new { listed = _listedThisSession.ToArray(), bids = _bidPending.Keys.ToArray(), divineOrder = _divineOrderAt });
+        SetPhase(AwakeningPhase.Restock, "collect_faustus_orders");
+        return true;
     }
     private bool PlanListings(BotContext ctx)
     {
@@ -1760,7 +1787,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         foreach (var p in _market.Purchases) { _ledger.Purchase("Map (Tier 16)", 1, p.Price, "market:" + p.Seller); _ledger.Price("Map (Tier 16)", p.Price, "market:" + source); }
         _market.Purchases.Clear();
     }
-    private DateTime _marketRetryAt = DateTime.MinValue; private int _marketRetries;
+    private DateTime _marketRetryAt = DateTime.MinValue; private int _marketRetries, _chaosShortRecoveries;
     private void MarketBuy(BotContext ctx)
     {
         // Maps ran out (Atlas + Tmp): buy MapBuyCount maps through the in-game market, then open the map from the inventory.
@@ -1786,8 +1813,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (_market.Succeeded) { _marketRetries = 0; _mapRestockAttempted = false; SetPhase(AwakeningPhase.OpenMap, "market_maps_bought"); return; }
         // 2026-09-22 (user): the loop must finish without a human. A failed search (too_many_searches, no acceptable
         // listing, timeouts) waits 10 s and searches again; only running out of chaos, or 8 failures in a row, stops.
-        // 2026-09-23: eight earlier failures had left the counter at its cap, so the next "no acceptable listing"
-        // stopped the loop outright. Retries never run out; the wait grows to 90 s and only a chaos shortage stops.
+        // 2026-09-23: "out_of_chaos_or_price_changed" stopped the loop while Chisels worth hundreds of chaos sat in the
+        // stash. A chaos shortage now goes back through Faustus (sell stock, then retry) instead of ending the session.
+        if (_market.FailReason.Contains("chaos", StringComparison.OrdinalIgnoreCase) && _chaosShortRecoveries < 3)
+        {
+            _chaosShortRecoveries++; _marketStarted = false; _marketRetryAt = DateTime.MinValue;
+            _indexStarted = false; ctx.StashIndex.Reset(); _restockTried = false; _listingChecked = false;
+            _log.Event(Run, "market.chaos_short_sell_first", new { reason = _market.FailReason, attempt = _chaosShortRecoveries });
+            SetPhase(AwakeningPhase.IndexStash, "sell_for_chaos_before_market"); return;
+        }
         if (!_market.FailReason.Contains("chaos", StringComparison.OrdinalIgnoreCase))
         {
             _marketRetries++; _marketRetryAt = DateTime.UtcNow.AddSeconds(Math.Min(10 + 10 * _marketRetries, 90));

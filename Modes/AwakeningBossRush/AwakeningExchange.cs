@@ -10,7 +10,7 @@ using AutoExile.Systems;
 
 namespace AutoExile.Modes.AwakeningBossRush;
 
-public enum ExchangeKind { BuyAtAsk, SellAtBid, ListAtAskMinus, Quote, BuyAtBid }
+public enum ExchangeKind { BuyAtAsk, SellAtBid, ListAtAskMinus, Quote, BuyAtBid, Collect }
 
 /// <summary>One order through Faustus' Currency Exchange. Want/Have follow the in-game panel.</summary>
 public sealed record ExchangeRequest(ExchangeKind Kind, string WantName, string HaveName, int Quantity, double MaxUnitChaos = 0, double UndercutChaos = 1);
@@ -71,7 +71,12 @@ public sealed class AwakeningExchange
         switch (_step)
         {
             case Step.Open: TickOpen(ctx, open); break;
-            case Step.Collect: if (!CollectFinished(gc, panel!)) Set(Step.PickWant, "picking I Want"); break;
+            case Step.Collect:
+                if (CollectFinished(gc, panel!)) break;
+                // Collect-only visit (2026-09-23, user): pick up what filled orders left at Faustus and stop there.
+                if (_request.Kind == ExchangeKind.Collect)
+                { _log("exchange.done", new { _request, collected = _collectClicks }); Set(Step.Done, $"collected {_collectClicks} finished order(s)"); break; }
+                Set(Step.PickWant, "picking I Want"); break;
             case Step.PickWant: if (Pick(gc, panel!, true)) Set(Step.PickHave, "picking I Have"); break;
             case Step.PickHave: if (Pick(gc, panel!, false)) Set(Step.Quote, "reading the book"); break;
             case Step.Quote: TickQuote(gc, panel!); break;
