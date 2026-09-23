@@ -1304,7 +1304,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 if (!_chaosF3Tried && AwakeningGameReader.StashieBusy() == false && BotInput.CanAct && BotInput.PressKey(Keys.F3))
                 { _chaosF3Tried = true; _chaosF3At = DateTime.UtcNow; _chaosStoreAt = DateTime.UtcNow; _log.Event(Run, "chaos.stash_via_F3", new { inventory = carried }); return true; }
                 if (_chaosF3Tried && ((DateTime.UtcNow - _chaosF3At).TotalSeconds < 6 || AwakeningGameReader.StashieBusy() == true)) return true; // let StashieV2 finish
-                if (!_stashChaosFull) { _stashChaosFull = true; _log.Event(Run, "chaos.stash_full", new { inventory = carried }); }
+                // Only a stash that really reads ~5000 Chaos is "full" (that flag drives the Divine conversion); a click
+                // that simply does not move the stack must not make the bot think it owns 5000 extra Chaos.
+                var inStash = AwakeningExchange.CountHeld(ctx.Game, "Chaos Orb") - carried;
+                if (inStash >= 4900 && !_stashChaosFull) { _stashChaosFull = true; _log.Event(Run, "chaos.stash_full", new { inventory = carried, inStash }); }
+                else if (inStash < 4900) _log.Event(Run, "chaos.store_stuck", new { inventory = carried, inStash });
                 _chaosStoreClicks = 20; return false;
             }
             if (!BotInput.CanAct) return true;

@@ -63,7 +63,13 @@ public sealed class AwakeningExchange
         var gc = ctx.Game;
         if ((DateTime.UtcNow - _startedAt).TotalSeconds > 120) { Fail("overall_timeout:" + _step); return; }
         if ((DateTime.UtcNow - _stepAt).TotalSeconds > (_step == Step.AwaitFill ? 30 : 20)) { Fail("step_timeout:" + _step); return; }
-        if (_keys.Count > 0) { if (BotInput.CanAct && BotInput.PressKey(_keys.Peek())) _keys.Dequeue(); return; }
+        if (_keys.Count > 0)
+        {
+            var k = _keys.Peek();
+            var sent = BotInput.CanAct && ((k & Keys.Control) != 0 ? BotInput.PressCtrlKey(k & Keys.KeyCode) : BotInput.PressKey(k));
+            if (sent) _keys.Dequeue();
+            return;
+        }
         if ((DateTime.UtcNow - _actionAt).TotalMilliseconds < 350 || !BotInput.CanAct) return;
         var panel = gc.IngameState.IngameUi.CurrencyExchangePanel;
         var open = panel?.IsVisible == true;
@@ -140,6 +146,14 @@ public sealed class AwakeningExchange
         Status = "collecting a finished order"; return true;
     }
 
+    private DateTime _searchedAt;
+    private static bool SetClipboard(string text)
+    {
+        var ok = false;
+        var t = new Thread(() => { for (var i = 0; i < 5 && !ok; i++) { try { System.Windows.Forms.Clipboard.SetText(text); ok = true; } catch { Thread.Sleep(30); } } });
+        t.SetApartmentState(ApartmentState.STA); t.IsBackground = true; t.Start(); t.Join(800);
+        return ok;
+    }
     private bool Pick(GameController gc, dynamic panel, bool want)
     {
         var name = want ? _request!.WantName : _request!.HaveName;
@@ -172,12 +186,22 @@ public sealed class AwakeningExchange
             Element? search = null;
             try { search = picker!.SearchInput; } catch { }
             search ??= FindChild(FindChild((Element)picker!, 4), 0);
+            // 2026-09-23: "step_timeout:PickHave" for Maven's Chisels — typed letters were lost while the client showed
+            // the busy cursor and the search was never retried. Paste the query (Ctrl+V) and retype after 3 s.
+            if (_searched == query && (DateTime.UtcNow - _searchedAt).TotalSeconds > 3) _searched = "";
             if (search != null && search.IsVisible && _searched != query)
             {
                 Click(gc, search);
-                for (var i = 0; i < 40; i++) _keys.Enqueue(Keys.Back);
-                foreach (var ch in query.ToUpperInvariant()) if (char.IsLetterOrDigit(ch)) _keys.Enqueue((Keys)ch); else if (ch == ' ') _keys.Enqueue(Keys.Space);
-                _searched = query; Status = "searching the picker for " + query; return false;
+                if (SetClipboard(query))
+                {
+                    _keys.Enqueue(Keys.A | Keys.Control); _keys.Enqueue(Keys.Back); _keys.Enqueue(Keys.V | Keys.Control);
+                }
+                else
+                {
+                    for (var i = 0; i < 40; i++) _keys.Enqueue(Keys.Back);
+                    foreach (var ch in query.ToUpperInvariant()) if (char.IsLetterOrDigit(ch)) _keys.Enqueue((Keys)ch); else if (ch == ' ') _keys.Enqueue(Keys.Space);
+                }
+                _searched = query; _searchedAt = DateTime.UtcNow; Status = "searching the picker for " + query; return false;
             }
             Status = "waiting for " + name + " in the picker"; return false;
         }
