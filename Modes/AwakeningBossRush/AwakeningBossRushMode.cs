@@ -56,7 +56,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private Vector2 _lastPosition;
     private string _lastBossSignature = "";
     private bool _lastRunning, _externalIssued, _relocating, _indexStarted, _withdrawing, _priorForceCtrlClick;
-    private int _materialIndex;
+    private int _materialIndex, _materialRetries;
     private int _stableEmpty;
     private long _lootId;
     private string _lootPath = "", _lootName = "";
@@ -445,7 +445,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _uniqueEvidence.Clear();
             _scoutRepositionUntil = DateTime.MinValue;
             _deviceMaterialPaths.Clear();
-            _materialIndex = 0; _withdrawing = false; _indexStarted = false; _lootId = 0;
+            _materialIndex = 0; _materialRetries = 0; _withdrawing = false; _indexStarted = false; _lootId = 0;
             _lootAttempts.Clear(); _unblockAttempts.Clear(); _scoutIgnored.Clear(); _beastIgnored.Clear(); _beastId = 0; _scoutStalls.Clear(); _lootSkipped.Clear(); _lootInterrupted = false; _enRouteLoot = false; _pushIgnoredUntil.Clear(); _dropSiteReached = false; _restockTried = false; _listingChecked = false; _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
             _lastClock = Stopwatch.GetTimestamp(); _phaseAt = DateTime.UtcNow; _lastPosition = ctx.Game.Player.GridPosNum;
             _lastProgress = DateTime.UtcNow; _damage.Reset(DateTime.UtcNow);
@@ -753,6 +753,18 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         ctx.Combat.Suspend(); ModeHelpers.CancelAllSystems(ctx); BotInput.Cancel();
         ctx.Combat.SuppressPositioning = false; ctx.Combat.SuppressTargetedSkills = false;
     }
+    /// <summary>Three deaths in one instance without the bosses down: the map is a loss, a fresh one pays better.</summary>
+    private bool AbandonDeadlyMap(BotContext ctx)
+    {
+        if (Run.Deaths < 3 || Run.BossesCompleted) return false;
+        _log.Event(Run, "map.abandon_after_deaths", new { Run.Deaths, Run.Instance, bosses = Run.Bosses.Values.Count(b => b.Life == BossLife.Alive) });
+        var attempt = Run.AttemptId;
+        Supervisor.State.Run = new() { AttemptId = attempt, AttemptNumber = 1, Phase = AwakeningPhase.Prepare,
+            BuildMvid = Supervisor.Mvid, BuildFingerprint = Run.BuildFingerprint, BuildConfiguration = Run.BuildConfiguration,
+            PriorPortalIds = StrictMapRecipe.Portals(ctx.Game).Select(p => (long)p.Id).ToList() };
+        Supervisor.Save();
+        return true;
+    }
     private void Finish(BotContext ctx, AttemptOutcome outcome, string reason)
     {
         if (Run.Outcome != AttemptOutcome.None) return;
@@ -888,6 +900,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         { SetPhase(AwakeningPhase.OpenStash, "stash_before_attempt"); return; }
         if (Run.ActivationConfirmed)
         {
+            if (AbandonDeadlyMap(ctx)) { Status = "Abandoning the map after repeated deaths"; return; }
             var portals = StrictMapRecipe.Portals(ctx.Game).Where(x => Run.PortalIds.Contains(x.Id)).ToList();
             if (portals.Count > 0) { SetPhase(AwakeningPhase.EnterPortal, "retry_existing_map"); return; }
             // Portal entities stream in after the Hideout loads; after a death recovery allow a little longer
@@ -1563,7 +1576,21 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _mapRestockAttempted = true; ctx.MapDevice.Cancel(ctx.Game, ctx.Navigation);
             SetPhase(AwakeningPhase.RestockMap, "atlas_maps_empty_restock_from_Tmp"); return;
         }
-        if (result == MapDeviceResult.Failed) Finish(ctx, AttemptOutcome.OperationalFailure, "map_device:" + Status);
+        if (result == MapDeviceResult.Failed)
+        {
+            // 2026-09-23: "missing Horned Scarab of Awakening" stopped the loop although the fix is simply to buy or
+            // withdraw the material again. Re-index the stash and let Restock/Faustus handle it, at most 3 times.
+            if (Status.Contains("missing", StringComparison.OrdinalIgnoreCase) && _materialRetries < 3)
+            {
+                _materialRetries++;
+                ctx.MapDevice.Cancel(ctx.Game, ctx.Navigation);
+                _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue; _deviceMaterialPaths.Clear();
+                _indexStarted = false; ctx.StashIndex.Reset(); _restockTried = false; _materialIndex = 0; _withdrawing = false;
+                _log.Event(Run, "map_device.missing_material_retry", new { Status, retry = _materialRetries });
+                SetPhase(AwakeningPhase.IndexStash, "device_missing_material_reindex"); return;
+            }
+            Finish(ctx, AttemptOutcome.OperationalFailure, "map_device:" + Status);
+        }
     }
     private bool _mapRestockAttempted, _mapRestockStarted, _mapBossSkipped, _stashedForRestock;
     private static bool _mapStashDumped;
@@ -2039,9 +2066,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // sweeping and a spreading fire keeps growing, so the character has to stay in motion for the whole window.
     private static readonly (string Pattern, double Seconds)[] EvadeSkills =
     {
-        (@"CelestialBeam|ShaperBeam|Channel.*Beam", 2.2),   // The Shaper's beam (AtlasBossCelestialBeam)
+        (@"CelestialBeam|ShaperBeam|SpammableBeamBlast|Channel.*Beam", 2.2), // Shaper beam, Neglected Flame beam
+        (@"FragmentOfAngerSlam|GAFragment.*Slam", 1.6),     // Cardinal of Fear slam
         (@"HarnessMemory|Exarch|Searing|Meteor|FireBeam|AreaOfEffectFire", 1.8), // Exarch fire / Dread's fire pool
-        (@"BeamBomb|SpawnSlam|Slam|Mortar|Barrage", 1.1),   // Sirus bombs, Drox slam
+        (@"BeamBomb|SpawnSlam|Slam|Mortar|Barrage|IceShardProjectile", 1.1), // Sirus bombs, Drox/Baran slam, Veritania shards
+        (@"RuneDetonation|Detonat", 1.6),                   // Baran's runes detonate where they were planted
+        (@"DashToTarget|Charge|Leap", 0.9),                 // Baran/Synthete dashes land on the locked spot
         (@"Quicksand|Desecrate|GroundEffect", 1.4),
     };
     private static double EvadeSeconds(string skill, bool blinked)
@@ -2053,11 +2083,18 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private readonly Dictionary<string, DateTime> _castSeen = new();
     private void ConfigureThreat(BotContext ctx)
     {
+        // BotCore copies Settings.Threat into the system every tick, so the settings themselves are what must hold
+        // the pinnacle values (2026-09-23: the mode's own assignment was overwritten and no boss cast ever triggered).
+        var st = ctx.Settings.Threat;
+        if (!st.Enabled.Value) st.Enabled.Value = true;
+        if (!st.MonitorRares.Value) st.MonitorRares.Value = true;
+        if (st.ThreatRadius.Value < 90) st.ThreatRadius.Value = 90;          // pinnacle casts start far away
+        if (st.DodgeTriggerDistance.Value < 30) st.DodgeTriggerDistance.Value = 30; // their impact areas are wide
+        if (st.DodgeMaxProgress.Value > 0.35f) st.DodgeMaxProgress.Value = 0.35f;   // leave time to actually move
         var t = ctx.Threat;
-        t.Enabled = true; t.MonitorRares = true;
-        t.ThreatRadius = 90;            // pinnacle slams reach far outside the 60 default
-        t.DodgeTriggerDistance = 25;    // their impact areas are much wider than a rare's
-        t.DodgeMinProgress = 0.15f; t.DodgeMaxProgress = 0.45f;
+        t.Enabled = true; t.MonitorRares = true; t.ThreatRadius = Math.Max(90, st.ThreatRadius.Value);
+        t.DodgeTriggerDistance = Math.Max(30, st.DodgeTriggerDistance.Value);
+        t.DodgeMinProgress = st.DodgeMinProgress.Value; t.DodgeMaxProgress = Math.Min(0.35f, st.DodgeMaxProgress.Value);
     }
     /// <summary>Records which skills the pinnacle bosses actually cast, so the table can be tuned from real fights.</summary>
     private void LogBossCasts(BotContext ctx)
@@ -2149,11 +2186,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // grid (or a rare/unique within 8) → step away, at most every 2.5 s.
         var crowdNow = gc.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster && e.IsAlive && e.IsHostile && e.IsTargetable && !FrozenLegion(e))
             .Select(e => (e, d: Vector2.Distance(player, e.GridPosNum))).ToList();
-        var crowded = crowdNow.Count(x => x.d < 12) >= 4 || crowdNow.Any(x => x.d < 8 && x.e.Rarity is MonsterRarity.Rare or MonsterRarity.Unique);
+        // Volatile cores and the Archnemesis spirits delete a full Energy Shield when they pop next to the character.
+        var volatileNear = crowdNow.Any(x => x.d < 14 && Regex.IsMatch(x.e.RenderName ?? "", @"Volatile|Judgemental Spirit|Spirit of Fortune|Bearer", RegexOptions.IgnoreCase));
+        var crowded = volatileNear || crowdNow.Count(x => x.d < 12) >= 4 || crowdNow.Any(x => x.d < 8 && x.e.Rarity is MonsterRarity.Rare or MonsterRarity.Unique);
         // 2026-09-22: kiting every 2.5 s reset Spark's Intensity (lost while moving). Only kite a crowd that is hurting us.
         // 2026-09-22 06:12: during the Feared fight three rare Spirits/Totems stood 5–6 grid away and one hit took 4700 ES
         // to 0 without any earlier damage, so "hurting" never fired. In a pinnacle fight kite a close crowd pre-emptively.
-        var kite = crowded && (hurting || Run.Phase == AwakeningPhase.Fight) && !burst && inside.Count == 0 && (now - _lastKiteAt).TotalSeconds >= 2.5 && Run.Phase is not AwakeningPhase.MapBoss;
+        var kite = crowded && (hurting || volatileNear || Run.Phase == AwakeningPhase.Fight) && !burst && inside.Count == 0 && (now - _lastKiteAt).TotalSeconds >= 2.5 && Run.Phase is not AwakeningPhase.MapBoss;
         if (inside.Count == 0 && !burst && !kite) return false;
         if (kite) _lastKiteAt = now;
         var away = Vector2.Zero;
@@ -2401,11 +2440,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             var bossDistance = Vector2.Distance(ctx.Game.Player.GridPosNum, closest.GridPosNum);
             // Spark reaches ~179 grid, so there is nothing to gain from standing in melee range of a pinnacle boss —
             // that is where slams, beams and the Exarch's fire land. Keep a 30+ grid band.
-            if (bossDistance < 22 && (now - _bossBackOffAt).TotalSeconds > 3)
+            // 2026-09-23: every death was a one-shot from full Energy Shield (6266 → 0). With ~430 life the only
+            // reliable defence is not being where the hit lands, so Spark fights from 45+ grid (range is 179).
+            if (bossDistance < 45 && (now - _bossBackOffAt).TotalSeconds > 2.5)
             {
                 _bossBackOffAt = now;
                 var away = ctx.Game.Player.GridPosNum - closest.GridPosNum;
-                var to = ctx.Game.Player.GridPosNum + (away.Length() > 1 ? Vector2.Normalize(away) : new Vector2(1, 0)) * 18;
+                var to = ctx.Game.Player.GridPosNum + (away.Length() > 1 ? Vector2.Normalize(away) : new Vector2(1, 0)) * Math.Max(18f, 50f - bossDistance);
                 var walkable = ctx.Navigation.FindNearestWalkable(ctx.Game, to, 6) ?? to;
                 ctx.Combat.Suspend(); ctx.Navigation.Stop(ctx.Game); _destination = null;
                 _relocating = true; _moveAt = now; Navigate(ctx, walkable);
