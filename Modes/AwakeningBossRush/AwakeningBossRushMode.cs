@@ -662,10 +662,10 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 case AwakeningPhase.Restock: Restock(ctx); break;
                 case AwakeningPhase.MarketBuy: MarketBuy(ctx); break;
                 case AwakeningPhase.EnterPortal: EnterPortal(ctx); break;
-                case AwakeningPhase.Scout: if (!SafetyTick(ctx)) Scout(ctx); break;
-                case AwakeningPhase.Fight: if (!SafetyTick(ctx)) Fight(ctx, false); break;
-                case AwakeningPhase.Loot: if (!SafetyTick(ctx)) Loot(ctx); break;
-                case AwakeningPhase.MapBoss: if (!SafetyTick(ctx)) Fight(ctx, true); break;
+                case AwakeningPhase.Scout: if (!DodgeThreat(ctx) && !SafetyTick(ctx)) Scout(ctx); break;
+                case AwakeningPhase.Fight: if (!DodgeThreat(ctx) && !SafetyTick(ctx)) Fight(ctx, false); break;
+                case AwakeningPhase.Loot: if (!DodgeThreat(ctx) && !SafetyTick(ctx)) Loot(ctx); break;
+                case AwakeningPhase.MapBoss: if (!DodgeThreat(ctx) && !SafetyTick(ctx)) Fight(ctx, true); break;
                 case AwakeningPhase.Return: Return(ctx); break;
                 case AwakeningPhase.OpenStash: OpenStash(ctx); break;
                 case AwakeningPhase.ExternalStash: ExternalStash(ctx); break;
@@ -2027,6 +2027,91 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // opened) kept the scout "clearing (6–20)" with 39 no-damage repositions until the 300 s deadline.
     private static readonly Regex FrozenLegionPattern = new(@"LegionLeague|/Legion(?:Templar|EternalEmpire|Karui|Maraketh|Vaal)|MonsterChest(?:Eternal|Templar|Karui|Maraketh|Vaal)", RegexOptions.Compiled);
     private static bool FrozenLegion(Entity e) { try { return FrozenLegionPattern.IsMatch(e.Path ?? ""); } catch { return false; } }
+    // ── Pinnacle-boss dodging (user, 2026-09-23) ────────────────────────────────────────────────
+    // Nine of eleven deaths happened in the boss fight, most of them from a single hit while the
+    // character stood still to build Spark Intensity. ThreatSystem already reads every Unique/Rare
+    // monster's Actor: the skill being cast, the animation progress and the destination the cast
+    // locked onto at its start (it never updates mid-cast), so stepping sideways during the windup
+    // makes slams, mortars and beams miss. Shaper's beam and the Searing Exarch's spreading fire are
+    // exactly the "punishes standing still" kind these two rules cover.
+    private DateTime _dodgeUntil, _castLogAt, _bossBackOffAt, _esRetreatUntil;
+    // Skills seen in real fights (2026-09-23 logs) that need more than a single sidestep. A channelled beam keeps
+    // sweeping and a spreading fire keeps growing, so the character has to stay in motion for the whole window.
+    private static readonly (string Pattern, double Seconds)[] EvadeSkills =
+    {
+        (@"CelestialBeam|ShaperBeam|Channel.*Beam", 2.2),   // The Shaper's beam (AtlasBossCelestialBeam)
+        (@"HarnessMemory|Exarch|Searing|Meteor|FireBeam|AreaOfEffectFire", 1.8), // Exarch fire / Dread's fire pool
+        (@"BeamBomb|SpawnSlam|Slam|Mortar|Barrage", 1.1),   // Sirus bombs, Drox slam
+        (@"Quicksand|Desecrate|GroundEffect", 1.4),
+    };
+    private static double EvadeSeconds(string skill, bool blinked)
+    {
+        foreach (var (pattern, seconds) in EvadeSkills)
+            if (Regex.IsMatch(skill ?? "", pattern, RegexOptions.IgnoreCase)) return seconds;
+        return blinked ? 0.35 : 0.6;
+    }
+    private readonly Dictionary<string, DateTime> _castSeen = new();
+    private void ConfigureThreat(BotContext ctx)
+    {
+        var t = ctx.Threat;
+        t.Enabled = true; t.MonitorRares = true;
+        t.ThreatRadius = 90;            // pinnacle slams reach far outside the 60 default
+        t.DodgeTriggerDistance = 25;    // their impact areas are much wider than a rare's
+        t.DodgeMinProgress = 0.15f; t.DodgeMaxProgress = 0.45f;
+    }
+    /// <summary>Records which skills the pinnacle bosses actually cast, so the table can be tuned from real fights.</summary>
+    private void LogBossCasts(BotContext ctx)
+    {
+        if ((DateTime.UtcNow - _castLogAt).TotalMilliseconds < 500) return;
+        _castLogAt = DateTime.UtcNow;
+        try
+        {
+            var player = ctx.Game.Player.GridPosNum;
+            foreach (var mt in ctx.Threat.TrackedMonsters.Values)
+            {
+                if (!mt.HasCast || mt.Entity == null || string.IsNullOrEmpty(mt.SkillName)) continue;
+                if (mt.Entity.Rarity != MonsterRarity.Unique && !Run.Bosses.ContainsKey(mt.EntityId)) continue;
+                var key = mt.Entity.RenderName + "|" + mt.SkillName;
+                if (_castSeen.TryGetValue(key, out var at) && (DateTime.UtcNow - at).TotalSeconds < 20) continue;
+                _castSeen[key] = DateTime.UtcNow;
+                _log.Event(Run, "boss.cast", new { boss = mt.Entity.RenderName, skill = mt.SkillName, anim = mt.AnimationName,
+                    distance = Math.Round(Vector2.Distance(player, mt.GridPos)),
+                    destDistance = Math.Round(Vector2.Distance(player, mt.CastDestination)), mt.AnimationProgress });
+            }
+        }
+        catch { }
+    }
+    /// <summary>Steps out of a locked cast destination. True while the tick belongs to the dodge.</summary>
+    private bool DodgeThreat(BotContext ctx)
+    {
+        var now = DateTime.UtcNow;
+        ConfigureThreat(ctx);
+        LogBossCasts(ctx);
+        if (now < _dodgeUntil)
+        {
+            // Keep walking for the whole window (a swept beam only misses while the character keeps moving).
+            if (!ctx.Navigation.IsNavigating && !ctx.Navigation.IsPathfinding && _dodgeTarget != Vector2.Zero) Navigate(ctx, _dodgeTarget);
+            TravelSustain(ctx); Status = "Dodging " + _lastDodgeSkill; return true;
+        }
+        if (!ctx.Threat.DodgeUrgent || ctx.Threat.ThreatSource == null) return false;
+        var player = ctx.Game.Player.GridPosNum;
+        var dir = ctx.Threat.DodgeDirection;
+        if (dir.LengthSquared() < 0.01f) return false;
+        // Sidestep far enough to leave the impact area, and away from the locked destination.
+        var target = player + Vector2.Normalize(dir) * 22;
+        var walk = ctx.Navigation.FindNearestWalkable(ctx.Game, target, 6) ?? target;
+        _lastDodgeSkill = ctx.Threat.ThreatSkillName; _dodgeTarget = walk;
+        var blinked = TryEscapeBlink(ctx, walk);
+        ctx.Combat.Suspend(); ctx.Navigation.Stop(ctx.Game); _destination = null;
+        Navigate(ctx, walk);
+        _dodgeUntil = now.AddSeconds(EvadeSeconds(ctx.Threat.ThreatSkillName, blinked));
+        _damage.Reset(now); _bossPositionSince = now; _scoutPositionSince = now;
+        _log.Event(Run, "threat.dodge", new { skill = ctx.Threat.ThreatSkillName, boss = ctx.Threat.ThreatSource.RenderName,
+            progress = ctx.Threat.ThreatProgress, msLeft = ctx.Threat.ThreatTimeRemainingMs, blinked,
+            destDistance = Math.Round(Vector2.Distance(player, ctx.Threat.ThreatDestination)), x = walk.X, y = walk.Y });
+        return true;
+    }
+    private string _lastDodgeSkill = ""; private Vector2 _dodgeTarget;
     // Returns true when this tick was spent getting out of danger.
     private bool SafetyTick(BotContext ctx)
     {
@@ -2049,7 +2134,10 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var inside = hazards.Where(h =>
         {
             var ground = h.Kind.StartsWith("ground:", StringComparison.Ordinal);
-            if (ground && !hurting) return false;
+            // In a pinnacle fight the ground is the boss's (Exarch fire spreads in a heartbeat), so step out
+            // of it before it has taken a chunk; elsewhere only ground that is actually hurting counts.
+            var bossFight = Run.Phase is AwakeningPhase.Fight or AwakeningPhase.MapBoss;
+            if (ground && !hurting && !bossFight) return false;
             if (ground && Run.Phase == AwakeningPhase.Loot && healthy) return false;
             var margin = ground || h.Kind.StartsWith("bearer", StringComparison.Ordinal) ? 6 : 3;
             return Vector2.Distance(player, h.Pos) < h.Radius + margin;
@@ -2250,6 +2338,31 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         SetPhase(AwakeningPhase.Loot, "encounter_deaths_confirmed");
     }
     private double _bossHpSig = -1, _bossNoDamageSeconds; private DateTime _fightTickAt; private bool _approachLogged;
+    /// <summary>Backs out of boss range while the pool is low so Energy Shield can recharge. True while retreating.</summary>
+    private bool EnergyShieldRetreat(BotContext ctx)
+    {
+        var life = ctx.Game.Player.GetComponent<Life>();
+        float pool = (life?.CurHP ?? 0) + (life?.CurES ?? 0), max = (life?.MaxHP ?? 0) + (life?.MaxES ?? 0);
+        if (max <= 0) return false;
+        var fraction = pool / max;
+        var now = DateTime.UtcNow;
+        if (now < _esRetreatUntil && fraction < 0.85f)
+        {
+            var bossesNear = Run.Bosses.Values.Where(b => b.Life == BossLife.Alive).Select(b => new Vector2(b.X, b.Y)).ToList();
+            var far = bossesNear.Count == 0 || bossesNear.Min(p => Vector2.Distance(ctx.Game.Player.GridPosNum, p)) > 70;
+            if (!far) { TravelSustain(ctx); Status = $"ES recharge: backing out ({fraction:P0})"; return true; }
+            ctx.Combat.Suspend(); Status = $"ES recharge: waiting ({fraction:P0})"; return true;
+        }
+        if (fraction >= 0.45f || now < _esRetreatUntil) return false;
+        var center = EncounterCenter();
+        var away = ctx.Game.Player.GridPosNum - center;
+        var target = ctx.Game.Player.GridPosNum + (away.Length() > 1 ? Vector2.Normalize(away) : new Vector2(1, 0)) * 45;
+        var walk = ctx.Navigation.FindNearestWalkable(ctx.Game, target, 8) ?? target;
+        _esRetreatUntil = now.AddSeconds(5);
+        ctx.Combat.Suspend(); ctx.Navigation.Stop(ctx.Game); _destination = null; Navigate(ctx, walk);
+        _log.Event(Run, "fight.es_retreat", new { pool, max, fraction, x = walk.X, y = walk.Y });
+        return true;
+    }
     private void Fight(BotContext ctx, bool regular)
     {
         var now = DateTime.UtcNow;
@@ -2258,6 +2371,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             if (Run.MapBossKilled) { SetPhase(AwakeningPhase.Loot, "map_boss_dead"); return; }
         }
+        // 2026-09-23: this build lives on ~7k ES and 430 life. Energy Shield only recharges after a few seconds
+        // without a hit, so a low pool means leaving the bosses' range briefly instead of trading hits and dying.
+        if (!regular && EnergyShieldRetreat(ctx)) return;
         var alive = regular ? ctx.Game.EntityListWrapper.OnlyValidEntities.Where(e => Run.MapBossIds.Contains(e.Id) && e.IsAlive && e.IsTargetable).ToList()
             : ctx.Game.EntityListWrapper.OnlyValidEntities.Where(e => Run.Bosses.ContainsKey(e.Id) && e.IsAlive && e.IsTargetable).ToList();
         var closest = alive.OrderBy(e => Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum)).FirstOrDefault();
@@ -2283,6 +2399,19 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 SetPhase(AwakeningPhase.Loot, "boss_no_damage_skip"); return;
             }
             var bossDistance = Vector2.Distance(ctx.Game.Player.GridPosNum, closest.GridPosNum);
+            // Spark reaches ~179 grid, so there is nothing to gain from standing in melee range of a pinnacle boss —
+            // that is where slams, beams and the Exarch's fire land. Keep a 30+ grid band.
+            if (bossDistance < 22 && (now - _bossBackOffAt).TotalSeconds > 3)
+            {
+                _bossBackOffAt = now;
+                var away = ctx.Game.Player.GridPosNum - closest.GridPosNum;
+                var to = ctx.Game.Player.GridPosNum + (away.Length() > 1 ? Vector2.Normalize(away) : new Vector2(1, 0)) * 18;
+                var walkable = ctx.Navigation.FindNearestWalkable(ctx.Game, to, 6) ?? to;
+                ctx.Combat.Suspend(); ctx.Navigation.Stop(ctx.Game); _destination = null;
+                _relocating = true; _moveAt = now; Navigate(ctx, walkable);
+                _log.Event(Run, "fight.back_off", new { closest.RenderName, distance = Math.Round(bossDistance), x = walkable.X, y = walkable.Y });
+                return;
+            }
             if (_bossNoDamageSeconds >= 15 && bossDistance > 22)
             {
                 if (!_approachLogged) { _approachLogged = true; _log.Event(Run, "fight.no_damage_approach", new { seconds = _bossNoDamageSeconds, closest.RenderName, d = Math.Round(bossDistance) }); }
