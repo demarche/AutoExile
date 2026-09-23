@@ -422,14 +422,14 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _deviceStockChecked = false; _deviceStockFirstRead = DateTime.MinValue;
             _mapBankRunDone = false; _mapBankLogged = false; _mapTierStep = 0; _mapPage = 0; _mapWithdrawRetries = 0; _chaosStoreClicks = 0; _bossHpSig = -1; _bossNoDamageSeconds = 0; _fightTickAt = DateTime.MinValue;
             _guardianChecked = false; _guardianCasts = 0; _scrollsChecked = false;
-            _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false;
+            _mapRestockAttempted = false; _mapRestockStarted = false; _mapRestockTabIndex = 0; _marketTried = false; _marketStarted = false; _mapBossSkipped = false; _marketRetries = 0; _marketRetryAt = DateTime.MinValue;
             _defensiveClear = false;
             _lootDefenseActive = false; _lootDefenseSuppressedUntil = DateTime.MinValue;
             _uniqueEvidence.Clear();
             _scoutRepositionUntil = DateTime.MinValue;
             _deviceMaterialPaths.Clear();
             _materialIndex = 0; _withdrawing = false; _indexStarted = false; _lootId = 0;
-            _lootAttempts.Clear(); _unblockAttempts.Clear(); _scoutIgnored.Clear(); _scoutStalls.Clear(); _lootSkipped.Clear(); _lootInterrupted = false; _enRouteLoot = false; _pushIgnoredUntil.Clear(); _dropSiteReached = false; _restockTried = false; _listingChecked = false; _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
+            _lootAttempts.Clear(); _unblockAttempts.Clear(); _scoutIgnored.Clear(); _beastIgnored.Clear(); _beastId = 0; _scoutStalls.Clear(); _lootSkipped.Clear(); _lootInterrupted = false; _enRouteLoot = false; _pushIgnoredUntil.Clear(); _dropSiteReached = false; _restockTried = false; _listingChecked = false; _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
             _lastClock = Stopwatch.GetTimestamp(); _phaseAt = DateTime.UtcNow; _lastPosition = ctx.Game.Player.GridPosNum;
             _lastProgress = DateTime.UtcNow; _damage.Reset(DateTime.UtcNow);
             Run.BuildConfiguration = AwakeningJson.Serialize(AutoExile.WebServer.SettingsApi.SerializeFlat(ctx.Settings)
@@ -1226,17 +1226,22 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     // Chaos collected from Faustus lands in the inventory; with the stash open, Ctrl+right-click on a Chaos stack
     // moves every Chaos Orb in the inventory into the stash (user-verified).
-    private DateTime _chaosStoreAt; private int _chaosStoreClicks;
+    private DateTime _chaosStoreAt; private int _chaosStoreClicks, _chaosNoDrop, _chaosCarried = -1;
     private bool StoreInventoryChaos(BotContext ctx)
     {
         if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true) return false;
-        if (_chaosStoreClicks >= 3 || (DateTime.UtcNow - _chaosStoreAt).TotalSeconds < 1.5) return false;
+        // 2026-09-23 (user): the inventory was full of Chaos and withdrawals timed out. One Ctrl+right-click moves one
+        // stack, so keep clicking (up to 20) until no Chaos stack is left; two clicks without the count dropping mean
+        // the Currency tab is full.
+        if (_chaosStoreClicks >= 20 || (DateTime.UtcNow - _chaosStoreAt).TotalSeconds < 0.8) return false;
         try
         {
             var chaos = StashSystem.GetInventorySlotItems(ctx.Game)?.FirstOrDefault(i => i.Item?.Path == "Metadata/Items/Currency/CurrencyRerollRare");
-            if (chaos == null) { _chaosStoreClicks = 0; return false; }
+            if (chaos == null) { _chaosStoreClicks = 0; _chaosNoDrop = 0; _chaosCarried = -1; return false; }
             // Chaos still in the inventory after two store clicks: the Currency tab is full (5000 cap).
-            if (_chaosStoreClicks >= 2 && !_stashChaosFull) { _stashChaosFull = true; _log.Event(Run, "chaos.stash_full", new { inventory = AwakeningExchange.CountInMainInventory(ctx.Game, "Chaos Orb") }); }
+            var carried = AwakeningExchange.CountInMainInventory(ctx.Game, "Chaos Orb");
+            if (carried == _chaosCarried) _chaosNoDrop++; else { _chaosNoDrop = 0; _chaosCarried = carried; }
+            if (_chaosNoDrop >= 2) { if (!_stashChaosFull) { _stashChaosFull = true; _log.Event(Run, "chaos.stash_full", new { inventory = carried }); } _chaosStoreClicks = 20; return false; }
             if (!BotInput.CanAct) return true;
             var w = ctx.Game.Window.GetWindowRectangle(); var rc = chaos.GetClientRect();
             if (BotInput.CtrlRightClick(new Vector2(w.X + rc.Center.X, w.Y + rc.Center.Y)))
@@ -1405,6 +1410,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private void Withdraw(BotContext ctx)
     {
         ctx.Stash.ApplyIncubators = false;
+        if (!_withdrawing && StoreInventoryChaos(ctx)) return; // free the slots the materials need
+
         var inv = AwakeningGameReader.Inventory(ctx.Game);
         if (!inv.Valid) return;
         if (_withdrawing)
@@ -1541,6 +1548,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             if (ctx.Game.IngameState.IngameUi.StashElement?.IsVisible != true)
             { TryClickStashLabel(ctx); return; }
+            // 2026-09-23 (user): an inventory full of Chaos Orbs made "Timed out in phase: WithdrawItems" and the loop
+            // stopped. With the stash open, Ctrl+right-click moves every Chaos stack into it first.
+            if (StoreInventoryChaos(ctx)) return;
             ctx.Stash.ApplyIncubators = false;
             _mapRestockStarted = ctx.Stash.Start(withdrawTabName: MapRestockTabs[Math.Min(_mapRestockTabIndex, MapRestockTabs.Length - 1)], withdrawFragmentPath: "Metadata/Items/Maps/MapKeyTier16",
                 withdrawCount: 1, itemFilter: _ => false,
@@ -1700,9 +1710,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (_market.Succeeded) { _marketRetries = 0; _mapRestockAttempted = false; SetPhase(AwakeningPhase.OpenMap, "market_maps_bought"); return; }
         // 2026-09-22 (user): the loop must finish without a human. A failed search (too_many_searches, no acceptable
         // listing, timeouts) waits 10 s and searches again; only running out of chaos, or 8 failures in a row, stops.
-        if (_marketRetries < 8 && !_market.FailReason.Contains("chaos", StringComparison.OrdinalIgnoreCase))
+        // 2026-09-23: eight earlier failures had left the counter at its cap, so the next "no acceptable listing"
+        // stopped the loop outright. Retries never run out; the wait grows to 90 s and only a chaos shortage stops.
+        if (!_market.FailReason.Contains("chaos", StringComparison.OrdinalIgnoreCase))
         {
-            _marketRetries++; _marketRetryAt = DateTime.UtcNow.AddSeconds(10);
+            _marketRetries++; _marketRetryAt = DateTime.UtcNow.AddSeconds(Math.Min(10 + 10 * _marketRetries, 90));
             _log.Event(Run, "market.retry_scheduled", new { reason = _market.FailReason, retry = _marketRetries });
             return;
         }
@@ -1728,6 +1740,83 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         catch { if (Run.Invitation != InvitationDecision.Yes) Run.Invitation = InvitationDecision.Unknown; }
     }
+    // ── Valuable bestiary beasts (user, 2026-09-23) ─────────────────────────────────────────────
+    // The Beasts plugin keeps poe.ninja prices per beast display name in its settings file; the same
+    // display name is the monster's RenderName in the entity list. Beasts worth >= BeastMinChaos are
+    // killed when they are already in memory (on the way to the pinnacle bosses, or anywhere in the
+    // loaded area). The map is never searched for beasts that were not detected.
+    private const double BeastMinChaos = 50;
+    private static Dictionary<string, double> _beastPrices = new(StringComparer.OrdinalIgnoreCase);
+    private static DateTime _beastPricesAt = DateTime.MinValue;
+    private readonly HashSet<long> _beastIgnored = new();
+    private long _beastId; private DateTime _beastSince; private double _beastHp = -1; private DateTime _beastHpAt;
+    private void LoadBeastPrices()
+    {
+        if ((DateTime.UtcNow - _beastPricesAt).TotalMinutes < 10) return;
+        _beastPricesAt = DateTime.UtcNow;
+        try
+        {
+            var file = Path.Combine(AppContext.BaseDirectory, "config", "global", "Beasts_settings.json");
+            if (!File.Exists(file)) { _log.Event(Run, "beast.prices_missing", new { file }); return; }
+            using var doc = JsonDocument.Parse(File.ReadAllText(file));
+            if (!doc.RootElement.TryGetProperty("BeastPrices", out var prices)) { _log.Event(Run, "beast.prices_missing", new { file, property = "BeastPrices" }); return; }
+            var table = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            foreach (var p in prices.EnumerateObject())
+                if (p.Value.ValueKind == JsonValueKind.Number && p.Value.TryGetDouble(out var v) && v > 0) table[p.Name] = v;
+            _beastPrices = table;
+            _log.Event(Run, "beast.prices_loaded", new { count = table.Count, threshold = BeastMinChaos,
+                valuable = table.Where(kv => kv.Value >= BeastMinChaos).OrderByDescending(kv => kv.Value).Select(kv => kv.Key + ":" + kv.Value).ToArray() });
+        }
+        catch (Exception ex) { _log.Event(Run, "beast.prices_missing", new { error = ex.Message }); }
+    }
+    private double BeastValue(Entity e)
+    {
+        try { return e.Rarity == MonsterRarity.Rare && _beastPrices.TryGetValue(e.RenderName ?? "", out var v) ? v : 0; }
+        catch { return 0; }
+    }
+    private Entity? ValuableBeast(BotContext ctx, float radius)
+    {
+        LoadBeastPrices();
+        if (_beastPrices.Count == 0) return null;
+        var player = ctx.Game.Player.GridPosNum;
+        try
+        {
+            return ctx.Game.EntityListWrapper.OnlyValidEntities
+                .Where(e => e.Type == EntityType.Monster && e.IsAlive && e.IsTargetable && !_beastIgnored.Contains(e.Id)
+                    && BeastValue(e) >= BeastMinChaos && Vector2.Distance(player, e.GridPosNum) <= radius)
+                .OrderBy(e => Vector2.Distance(player, e.GridPosNum)).FirstOrDefault();
+        }
+        catch { return null; }
+    }
+    /// <summary>Kills an already-detected valuable beast. Returns true while the tick belongs to the hunt.</summary>
+    private bool HuntBeast(BotContext ctx, float radius)
+    {
+        var beast = ValuableBeast(ctx, radius);
+        if (beast == null) { if (_beastId != 0) { _log.Event(Run, "beast.lost", new { id = _beastId }); _beastId = 0; } return false; }
+        var now = DateTime.UtcNow;
+        if (_beastId != beast.Id)
+        {
+            _beastId = beast.Id; _beastSince = now; _beastHp = -1; _beastHpAt = now;
+            _log.Event(Run, "beast.target", new { beast.Id, beast.RenderName, chaos = BeastValue(beast),
+                distance = Vector2.Distance(ctx.Game.Player.GridPosNum, beast.GridPosNum) });
+        }
+        var hp = (double)(beast.GetComponent<Life>()?.CurHP ?? 0) + (beast.GetComponent<Life>()?.CurES ?? 0);
+        if (_beastHp < 0 || Math.Abs(hp - _beastHp) > 1) { _beastHp = hp; _beastHpAt = now; }
+        // Unreachable or immune (frozen beast, behind terrain): give it up for the rest of the map.
+        if ((now - _beastHpAt).TotalSeconds > 25 || (now - _beastSince).TotalSeconds > 90)
+        {
+            _beastIgnored.Add(beast.Id); _beastId = 0;
+            _log.Event(Run, "beast.given_up", new { beast.Id, beast.RenderName, hp, seconds = (now - _beastSince).TotalSeconds });
+            return false;
+        }
+        var distance = Vector2.Distance(ctx.Game.Player.GridPosNum, beast.GridPosNum);
+        if (distance > 45) { ctx.Combat.Suspend(); Navigate(ctx, beast.GridPosNum); Status = $"Beast: walking to {beast.RenderName} ({distance:0})"; return true; }
+        if (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding) { ctx.Navigation.Stop(ctx.Game); _destination = null; }
+        ctx.Combat.Profile.Enabled = true; ctx.Combat.SuppressPositioning = true; ctx.Combat.SuppressTargetedSkills = false;
+        ctx.Combat.Tick(ctx);
+        Status = $"Beast: killing {beast.RenderName} ({BeastValue(beast):0}c)"; Decision = "Valuable beast";
+        return true;
+    }
     private void Scout(BotContext ctx, bool lootDefense = false)
     {
         UpdateInvitation(ctx, Run.ActivationConfirmed);
@@ -1742,6 +1831,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             SetPhase(AwakeningPhase.Fight, "boss_priority_over_defensive_clear"); return;
         }
         if (now < _scoutRepositionUntil && (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding)) { TravelSustain(ctx); Status = "Scout repositioning toward stalled pack"; return; }
+        // A 50c+ beast that is already loaded is worth more than the seconds it costs; never search for one.
+        if (!lootDefense && HuntBeast(ctx, 200)) return;
         // Known drop site / boss position (e.g. after a death): head straight there. Only enemies close enough to hurt
         // (35 grids) are fought on the way, and a pack that takes no damage is walked past instead of chased.
         var dropSite = KnownDropSite();
@@ -1751,7 +1842,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var clearRadius = pushing ? 35f : 50f;
         // Stragglers that take no damage (captured beasts at 1 HP, immune crystals...) are ignored for the rest of the map.
         var enemies = ctx.Game.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster &&
-            e.IsAlive && e.IsHostile && e.IsTargetable && !_scoutIgnored.Contains(e.Id) &&
+            e.IsAlive && e.IsHostile && e.IsTargetable && !_scoutIgnored.Contains(e.Id) && !FrozenLegion(e) &&
             !(_pushIgnoredUntil.TryGetValue(e.Id, out var until) && until > now) &&
             (e.GetComponent<Life>()?.CurHP ?? 0) > 1 && Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum) < clearRadius).ToList();
         var nearby = enemies.Count;
@@ -1883,6 +1974,10 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             if (_hazardKinds.Add(h.Kind)) _log.Event(Run, "hazard.observed", new { h.Kind, h.Radius, x = h.Pos.X, y = h.Pos.Y });
         return list;
     }
+    // 2026-09-22 06:33–06:38: a Legion encounter's frozen soldiers and war chests (undamageable until the monolith is
+    // opened) kept the scout "clearing (6–20)" with 39 no-damage repositions until the 300 s deadline.
+    private static readonly Regex FrozenLegionPattern = new(@"LegionLeague|/Legion(?:Templar|EternalEmpire|Karui|Maraketh|Vaal)|MonsterChest(?:Eternal|Templar|Karui|Maraketh|Vaal)", RegexOptions.Compiled);
+    private static bool FrozenLegion(Entity e) { try { return FrozenLegionPattern.IsMatch(e.Path ?? ""); } catch { return false; } }
     // Returns true when this tick was spent getting out of danger.
     private bool SafetyTick(BotContext ctx)
     {
@@ -1915,7 +2010,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // 2026-09-21 death.context: the deaths were melee packs (Void Skulker / Carnage Chieftain / Seething Brine)
         // standing 4–15 grid from the Spark character, not ground. Kite before the burst: 4+ living enemies within 12
         // grid (or a rare/unique within 8) → step away, at most every 2.5 s.
-        var crowdNow = gc.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster && e.IsAlive && e.IsHostile && e.IsTargetable)
+        var crowdNow = gc.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster && e.IsAlive && e.IsHostile && e.IsTargetable && !FrozenLegion(e))
             .Select(e => (e, d: Vector2.Distance(player, e.GridPosNum))).ToList();
         var crowded = crowdNow.Count(x => x.d < 12) >= 4 || crowdNow.Any(x => x.d < 8 && x.e.Rarity is MonsterRarity.Rare or MonsterRarity.Unique);
         // 2026-09-22: kiting every 2.5 s reset Spark's Intensity (lost while moving). Only kite a crowd that is hurting us.
@@ -2397,6 +2492,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             SetPhase(AwakeningPhase.Scout, "en_route_loot_done"); return;
         }
         if (unresolved) { _quietAt = DateTime.MinValue; Status = "Loot memory still hydrating"; return; }
+        if (HuntBeast(ctx, 80)) { _quietAt = DateTime.MinValue; return; }
         foreach (var stale in _pendingValuables.Where(kv => kv.Value.Instance != Run.Instance).Select(kv => kv.Key).ToList()) _pendingValuables.Remove(stale);
         var pending = _pendingValuables.Where(kv => !_lootSkipped.Contains(kv.Key)).OrderBy(kv => Vector2.Distance(ctx.Game.Player.GridPosNum, kv.Value.Pos)).FirstOrDefault();
         if (pending.Value != null)

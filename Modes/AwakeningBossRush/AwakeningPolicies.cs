@@ -26,7 +26,9 @@ public static class AwakeningMapPolicy
         ("elemental_weakness", "Players are Cursed with Elemental Weakness", @"MapPlayerCurseElementalWeakness|Cursed with Elemental Weakness"),
         ("extra_lightning", "Monsters deal #% extra Physical Damage as Lightning", @"MapMonsterLightningDamage|extra Physical Damage as Lightning|extra Damage as Lightning"),
         // 2026-09-22 (user decision): Spark is a spell; suppression halves its damage (death on 04:41).
-        ("spell_suppress", "Monsters have +#% chance to Suppress Spell Damage", @"spell_suppression|Suppress Spell Damage")
+        ("spell_suppress", "Monsters have +#% chance to Suppress Spell Damage", @"spell_suppression|Suppress Spell Damage"),
+        // 2026-09-22 (user decision): every "Area has patches of ... Ground" map mod (death rate 2/2).
+        ("ground_patches", "Area has patches of # Ground", @"map_ground_effect_patches|map_ground_\w+_base_magnitude|patches of \w+ Ground")
     ];
 
     public static List<string> Rejections(MapObservation map)

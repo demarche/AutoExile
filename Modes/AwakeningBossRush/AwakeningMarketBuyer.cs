@@ -86,7 +86,9 @@ public sealed class AwakeningMarketBuyer
                 if (BotInput.CanAct && BotInput.PressKey(Keys.Return)) _keyAt = DateTime.UtcNow;
                 return;
             }
-            if (BotInput.CanAct && BotInput.PressKey(_keys.Peek())) { _keys.Dequeue(); _keyAt = DateTime.UtcNow; }
+            var next = _keys.Peek();
+            var sent = (next & Keys.Control) != 0 ? BotInput.CanAct && BotInput.PressCtrlKey(next & Keys.KeyCode) : BotInput.CanAct && BotInput.PressKey(next);
+            if (sent) { _keys.Dequeue(); _keyAt = DateTime.UtcNow; }
             return;
         }
         if (gc.IsLoading || (DateTime.UtcNow - _actionAt).TotalMilliseconds < 400 || !BotInput.CanAct) return;
@@ -175,6 +177,10 @@ public sealed class AwakeningMarketBuyer
         ("elemental_weakness", "PLAYERS ARE CURSED WITH ELEMENTAL WEAKNESS", "elemental weakness"),
         ("extra_lightning", "MONSTERS DEAL EXTRA PHYSICAL DAMAGE AS LIGHTNING", "damage as lightning|damage as extra lightning"),
         ("spell_suppress", "MONSTERS HAVE CHANCE TO SUPPRESS SPELL DAMAGE", "suppress spell damage"),
+        // 2026-09-22 (user decision): ground-patch maps killed 2 of 2 runs. Other patch kinds are still rejected by the policy.
+        ("ground_shocked", "AREA HAS PATCHES OF SHOCKED GROUND", "patches of shocked ground"),
+        ("ground_burning", "AREA HAS PATCHES OF BURNING GROUND", "patches of burning ground"),
+        ("ground_chilled", "AREA HAS PATCHES OF CHILLED GROUND", "patches of chilled ground"),
     };
     private void PlanFilters(Element market)
     {
@@ -211,6 +217,26 @@ public sealed class AwakeningMarketBuyer
         for (var i = 0; i < 50; i++) _keys.Enqueue(Keys.Back);
         foreach (var ch in text.ToUpperInvariant()) { _keys.Enqueue(ch == ' ' ? Keys.Space : (Keys)ch); _keys.Enqueue(Keys.Pause); }
         if (after.Length > 0) { _keys.Enqueue(Keys.None); foreach (var k in after) _keys.Enqueue(k); }
+    }
+    // 2026-09-22 (user): typing each NG query one key at a time with 250 ms gaps took ~15 s per rule. Paste it instead:
+    // the text goes to the Windows clipboard (STA thread) and is inserted with Ctrl+V.
+    private static bool SetClipboard(string text)
+    {
+        var ok = false;
+        var t = new Thread(() => { for (var i = 0; i < 5 && !ok; i++) { try { Clipboard.SetText(text); ok = true; } catch { Thread.Sleep(30); } } });
+        t.SetApartmentState(ApartmentState.STA); t.IsBackground = true; t.Start(); t.Join(800);
+        return ok;
+    }
+    private void PasteInto(GameController gc, Element field, string text)
+    {
+        if (!SetClipboard(text)) { TypeInto(gc, field, text); return; }
+        Click(gc, field);
+        _keys.Enqueue(Keys.None);
+        // The add-stat box is empty after each pick ("typed": "" in every log line); Ctrl+A + Back clears any leftover.
+        _keys.Enqueue(Keys.A | Keys.Control);
+        _keys.Enqueue(Keys.Back);
+        _keys.Enqueue(Keys.V | Keys.Control);
+        _keys.Enqueue(Keys.Pause);
     }
     private void TickFilters(GameController gc)
     {
@@ -332,8 +358,8 @@ public sealed class AwakeningMarketBuyer
                     }
                     if (_typingRule == rule.Id && ++_typeTries > 3) { _ruleTries[rule.Id] = 3; _typingRule = null; _log("market.not_filter_type_failed", new { rule.Id, typed }); return; }
                     if (_typingRule != rule.Id) { _typingRule = rule.Id; _typeTries = 0; }
-                    TypeInto(gc, input, rule.Query);
-                    _log("market.not_filter_type", new { rule.Id, typed });
+                    PasteInto(gc, input, rule.Query);
+                    _log("market.not_filter_type", new { rule.Id, typed, paste = true });
                     return;
                 }
                 _log("market.not_filters", new { present = entries.Select(e => e.Text).ToArray(),

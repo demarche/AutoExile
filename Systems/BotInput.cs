@@ -1701,6 +1701,34 @@ namespace AutoExile.Systems
             return true;
         }
 
+        /// <summary>Ctrl+key (Ctrl+V paste into UI text boxes). Returns false if gate is closed.</summary>
+        public static bool PressCtrlKey(Keys key)
+        {
+            if (!CanAct) { LogAction("PressCtrlKey", null, key, false); return false; }
+            SuspendMovement();
+            ReleaseAllKeys();
+            var hold = RandHold();
+            NextActionAt = DateTime.Now.AddMilliseconds(hold * 3 + ActionCooldownMs);
+            _ = DoPressCtrlKey(key, hold);
+            LogAction("PressCtrlKey", null, key, true);
+            return true;
+        }
+
+        private static async Task DoPressCtrlKey(Keys key, int holdMs)
+        {
+            try
+            {
+                await SendDelay().ConfigureAwait(false);
+                SendKeyDown(Keys.ControlKey, "ctrl");
+                await Task.Delay(holdMs).ConfigureAwait(false);
+                await SendDelay().ConfigureAwait(false);
+                SendKeyDown(key);
+                await Task.Delay(holdMs).ConfigureAwait(false);
+                SendKeyUp(key);
+            }
+            finally { SendKeyUp(Keys.ControlKey, "ctrl-cleanup"); }
+        }
+
         private static async Task DoPressShiftKey(Keys key, int holdMs)
         {
             try
