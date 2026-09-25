@@ -873,12 +873,15 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // restart the loop (max 3 per hour) instead of parking in AwaitingReview.
         if (_manualContinuous && outcome == AttemptOutcome.OperationalFailure && !Run.ActivationRequested && !Run.ActivationConfirmed &&
             Supervisor.StorageError.Length == 0 && ctx.Game.Area?.CurrentArea?.IsHideout == true &&
-            Regex.IsMatch(reason, @"^(withdraw_failed|withdraw_missing_material|phase_timeout:(Prepare|Withdraw|OpenStash|IndexStash|ExternalStash|OpenMap)|stash_index_failed|exception)"))
+            // material_not_found: a restock whose items were still in Faustus' collect area (full inventory). The retry
+            // starts with collect_faustus_orders, so the bought items arrive before the index runs again.
+            Regex.IsMatch(reason, @"^(withdraw_failed|withdraw_missing_material|material_not_found|phase_timeout:(Prepare|Withdraw|OpenStash|IndexStash|ExternalStash|OpenMap)|stash_index_failed|exception)"))
         {
             _logisticsRetries.RemoveAll(t => (DateTime.UtcNow - t).TotalMinutes > 60);
             if (_logisticsRetries.Count < 3)
             {
                 _logisticsRetries.Add(DateTime.UtcNow);
+                if (reason.StartsWith("material_not_found")) _forceCollect = true;
                 string Send(string action, string review = "") => Command(ctx, action, Guid.NewGuid().ToString("N"), Supervisor.Generation, review, Supervisor.Mvid);
                 var ack = Send("review", AwakeningJson.Serialize(new {
                     observations = "Hideout logistics failure before map activation: " + reason,
@@ -1533,7 +1536,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     // Chaos collected from Faustus lands in the inventory; with the stash open, Ctrl+right-click on a Chaos stack
     // moves every Chaos Orb in the inventory into the stash (user-verified).
-    private DateTime _chaosStoreAt, _chaosF3At; private int _chaosStoreClicks, _chaosNoDrop, _chaosCarried = -1; private bool _chaosF3Tried;
+    private DateTime _chaosStoreAt, _chaosF3At, _chaosTabKeyAt; private int _chaosStoreClicks, _chaosNoDrop, _chaosCarried = -1, _chaosTabKeys; private bool _chaosF3Tried;
     // 2026-09-23 04:47: a 20-Chaos stack sat on the mouse cursor ("Cursor1"). While something is held, every
     // Ctrl+click, F3 pass and withdrawal silently does nothing — that is why 300 Chaos never left the inventory and
     // the Tmp map withdrawals kept timing out. Put the held item down in a free inventory cell first.
@@ -1600,10 +1603,32 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         try
         {
             var chaos = StashSystem.GetInventorySlotItems(ctx.Game)?.FirstOrDefault(i => i.Item?.Path == "Metadata/Items/Currency/CurrencyRerollRare");
-            if (chaos == null) { _chaosStoreClicks = 0; _chaosNoDrop = 0; _chaosCarried = -1; _chaosF3Tried = false; return false; }
+            if (chaos == null) { _chaosStoreClicks = 0; _chaosNoDrop = 0; _chaosCarried = -1; _chaosF3Tried = false; _chaosTabKeys = 0; return false; }
             // 2026-09-23 04:27: the cooldown used to return false, so the caller carried on (withdraw, market) after
             // one click with 1180 Chaos still filling the inventory. While Chaos remains, the caller waits.
             if ((DateTime.UtcNow - _chaosStoreAt).TotalSeconds < 0.8) return true;
+            // 2026-09-26 03:33 JST: the stash reopened on the "Fragment" tab (the index ends there); Ctrl+click cannot put
+            // Chaos into a Fragment tab, so 1160 Chaos (58 cells) stayed in the inventory, Faustus could not hand over the
+            // bought Scarabs and the map purchase failed. Show the "Currency" tab (arrow keys) before clicking.
+            var stashEl = ctx.Game.IngameState.IngameUi.StashElement;
+            var visibleType = stashEl.VisibleStash?.InvType.ToString() ?? "";
+            if (!visibleType.Contains("Currency", StringComparison.OrdinalIgnoreCase) && _chaosTabKeys < 25)
+            {
+                var names = stashEl.AllStashNames;
+                var target = -1;
+                if (names != null)
+                    for (var i = 0; i < names.Count && target < 0; i++)
+                        if (names[i] != null && names[i].Trim().Equals("Currency", StringComparison.OrdinalIgnoreCase)) target = i;
+                var current = stashEl.IndexVisibleStash;
+                if (target >= 0 && current >= 0 && target != current)
+                {
+                    if ((DateTime.UtcNow - _chaosTabKeyAt).TotalMilliseconds < 350 || !BotInput.CanAct) return true;
+                    if (_chaosTabKeys == 0) _log.Event(Run, "chaos.switch_to_currency_tab", new { from = current, to = target, visibleType });
+                    BotInput.PressKey(target > current ? Keys.Right : Keys.Left);
+                    _chaosTabKeys++; _chaosTabKeyAt = DateTime.UtcNow; Status = "Showing the Currency tab to bank Chaos";
+                    return true;
+                }
+            }
             // Chaos still in the inventory after two store clicks: the Currency tab is full (5000 cap).
             var carried = AwakeningExchange.CountInMainInventory(ctx.Game, "Chaos Orb");
             if (carried == _chaosCarried) _chaosNoDrop++; else { _chaosNoDrop = 0; _chaosCarried = carried; }
@@ -1623,7 +1648,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             }
             if (!BotInput.CanAct) return true;
             var w = ctx.Game.Window.GetWindowRectangle(); var rc = chaos.GetClientRect();
-            if (BotInput.CtrlRightClick(new Vector2(w.X + rc.Center.X, w.Y + rc.Center.Y)))
+            // Alternate Ctrl+right-click with the standard Ctrl+left-click (stash transfer) so one of them always lands.
+            var chaosAt = new Vector2(w.X + rc.Center.X, w.Y + rc.Center.Y);
+            if (_chaosStoreClicks % 2 == 0 ? BotInput.CtrlRightClick(chaosAt) : BotInput.CtrlClick(chaosAt))
             {
                 _chaosStoreAt = DateTime.UtcNow; _chaosStoreClicks++;
                 _log.Event(Run, "chaos.stored", new { held = AwakeningExchange.CountHeld(ctx.Game, "Chaos Orb"), click = _chaosStoreClicks });
@@ -1636,11 +1663,13 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // until someone collects them. Visit him every 15 minutes while anything is listed or bid on, collect into the
     // inventory, then the re-index trip opens the stash and Ctrl+right-click banks the Chaos.
     private DateTime _lastCollectAt = DateTime.UtcNow;
+    private bool _forceCollect; // set by a material_not_found retry: collect Faustus' finished orders before re-indexing
     private bool PlanCollect(BotContext ctx)
     {
         if (!ctx.Settings.Awakening.Economy.AutoRestock.Value) return false;
         var pending = _listedThisSession.Count > 0 || _bidPending.Count > 0 || _divineOrderAt != DateTime.MinValue;
-        if (!pending || (DateTime.UtcNow - _lastCollectAt).TotalMinutes < 15) return false;
+        if (!_forceCollect && (!pending || (DateTime.UtcNow - _lastCollectAt).TotalMinutes < 15)) return false;
+        _forceCollect = false;
         _lastCollectAt = DateTime.UtcNow;
         _restockQueue.Clear();
         _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.Collect, "Chaos Orb", "Chaos Orb", 0));
@@ -1720,9 +1749,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var free = InventoryFreeCells(ctx);
         if (free >= 0 && free < 8 && !_stashedForRestock)
         {
+            // 2026-09-26 03:02 JST: the flags were set before closing the exchange panel, so the next tick skipped this
+            // block and bought 5 Scarabs (600c) with 0 free cells; the collect could not hand them over, the index then
+            // found no Scarab and the loop stopped for 30 min. Close the panel first, then commit to the stash trip.
+            if (ctx.Game.IngameState.IngameUi.CurrencyExchangePanel?.IsVisible == true) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
             _stashedForRestock = true; _restockBackToPrepare = true;
             _log.Event(Run, "restock.stash_before_faustus", new { free, chaos = AwakeningExchange.CountInMainInventory(ctx.Game, "Chaos Orb") });
-            if (ctx.Game.IngameState.IngameUi.CurrencyExchangePanel?.IsVisible == true) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); return; }
             SetPhase(AwakeningPhase.OpenStash, "stash_before_faustus"); return;
         }
         if (next.Kind is ExchangeKind.BuyAtAsk or ExchangeKind.BuyAtBid)
