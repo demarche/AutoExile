@@ -277,6 +277,18 @@ namespace AutoExile.WebServer
                         await ServeJson(resp, new { ok = true, deferred = Stats?.Snapshot.CurrentRun != null });
                         break;
 
+                    // Duo (2026-09-25): the Aurabot's AutoExile (another Windows session on this PC) pulls this
+                    // plugin's source from here with host.pull_source, so both sides always run the same code.
+                    case "/api/duo/source.zip" when method == "GET":
+                        if (!IPAddress.IsLoopback(req.RemoteEndPoint.Address)) { resp.StatusCode = 403; await WriteString(resp, "loopback only"); break; }
+                        {
+                            var bytes = await Task.Run(BuildSourceZip);
+                            resp.ContentType = "application/zip";
+                            resp.ContentLength64 = bytes.Length;
+                            await resp.OutputStream.WriteAsync(bytes);
+                        }
+                        break;
+
                     // Control
                     case "/api/control" when method == "POST":
                         await HandleControl(req, resp);
@@ -616,6 +628,19 @@ namespace AutoExile.WebServer
                 return;
             }
 
+            if (cmd.Action == "host.pull_source")
+            {
+                // Aurabot side: download the Carry's AutoExile source (value = URL, default the Carry on 9876), copy it over
+                // Plugins/Source/AutoExile and restart this ExileAPI so it recompiles. Loopback only.
+                if (!IPAddress.IsLoopback(req.RemoteEndPoint.Address))
+                { resp.StatusCode = 403; await ServeJson(resp, new { error = "host.pull_source is loopback-only" }); return; }
+                var (ok, output) = await PullSource(string.IsNullOrWhiteSpace(cmd.Value) ? "http://127.0.0.1:9876/api/duo/source.zip" : cmd.Value!);
+                if (ok) { ok = StartHostRestart(out var restart); output += "; " + restart; }
+                if (!ok) resp.StatusCode = 500;
+                await ServeJson(resp, new { ok, action = cmd.Action, output });
+                return;
+            }
+
             if (cmd.Action == "host.git_commit")
             {
                 // Commits the AutoExile source tree (Plugins/Source/AutoExile) with the given message. Loopback only.
@@ -629,6 +654,70 @@ namespace AutoExile.WebServer
 
             _commandQueue.Enqueue(cmd);
             await ServeJson(resp, new { ok = true, action = cmd.Action });
+        }
+
+        private static string SourceRoot()
+        {
+            var root = Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory;
+            return Path.Combine(root, "Plugins", "Source", "AutoExile");
+        }
+        private static readonly string[] SourceZipSkipDirs = { "bin", "obj", ".git", ".vs", "Dumps", "Logs", "Recordings", "AwakeningData", "RestorePoints", "Research" };
+        private static byte[] BuildSourceZip()
+        {
+            var src = SourceRoot();
+            using var ms = new MemoryStream();
+            using (var zip = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Create, true))
+            {
+                foreach (var file in Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories))
+                {
+                    var rel = Path.GetRelativePath(src, file);
+                    var parts = rel.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    if (parts.Take(parts.Length - 1).Any(d => SourceZipSkipDirs.Contains(d, StringComparer.OrdinalIgnoreCase))) continue;
+                    var info = new FileInfo(file);
+                    if (info.Length > 8_000_000 || rel.EndsWith(".last.txt", StringComparison.OrdinalIgnoreCase) || rel.Equals("Errors.txt", StringComparison.OrdinalIgnoreCase)) continue;
+                    var entry = zip.CreateEntry(rel.Replace('\\', '/'), System.IO.Compression.CompressionLevel.Fastest);
+                    using var es = entry.Open();
+                    using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    fs.CopyTo(es);
+                }
+            }
+            return ms.ToArray();
+        }
+        private static async Task<(bool Ok, string Output)> PullSource(string url)
+        {
+            try
+            {
+                using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+                var bytes = await http.GetByteArrayAsync(url);
+                var dest = SourceRoot();
+                int files = 0;
+                using var ms = new MemoryStream(bytes);
+                using var zip = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Read);
+                foreach (var entry in zip.Entries)
+                {
+                    if (string.IsNullOrEmpty(entry.Name)) continue;
+                    var target = Path.GetFullPath(Path.Combine(dest, entry.FullName.Replace('/', Path.DirectorySeparatorChar)));
+                    if (!target.StartsWith(Path.GetFullPath(dest), StringComparison.OrdinalIgnoreCase)) continue;
+                    Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                    using var es = entry.Open();
+                    using var fs = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None);
+                    await es.CopyToAsync(fs);
+                    files++;
+                }
+                // Mirror the C# sources: a stale .cs file that the Carry no longer has would break the compile.
+                var keep = new HashSet<string>(zip.Entries.Where(e => e.FullName.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+                    .Select(e => Path.GetFullPath(Path.Combine(dest, e.FullName.Replace('/', Path.DirectorySeparatorChar)))), StringComparer.OrdinalIgnoreCase);
+                int removed = 0;
+                foreach (var cs in Directory.EnumerateFiles(dest, "*.cs", SearchOption.AllDirectories))
+                {
+                    var rel = Path.GetRelativePath(dest, cs).Split(Path.DirectorySeparatorChar);
+                    if (rel.Take(rel.Length - 1).Any(d => SourceZipSkipDirs.Contains(d, StringComparer.OrdinalIgnoreCase))) continue;
+                    if (keep.Contains(Path.GetFullPath(cs))) continue;
+                    try { File.Delete(cs); removed++; } catch { }
+                }
+                return (true, $"pulled {files} files ({bytes.Length} bytes) from {url}; removed {removed} stale .cs");
+            }
+            catch (Exception ex) { return (false, "pull failed: " + ex.Message); }
         }
 
         private static (bool Ok, string Output) GitCommit(string message)
@@ -1199,6 +1288,7 @@ namespace AutoExile.WebServer
     public class BotStatusSnapshot
     {
         public object? Awakening { get; init; }
+        public object? Duo { get; init; }
         public bool Running { get; init; }
         public bool InGame { get; init; }
         public string Mode { get; init; } = "Idle";

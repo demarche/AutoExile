@@ -81,6 +81,10 @@ namespace AutoExile
 
         public FollowerSettings Follower { get; set; } = new FollowerSettings();
 
+        // --- Duo (Carry + Aurabot, 2026-09-25) ---
+
+        public DuoSettings Duo { get; set; } = new DuoSettings();
+
         // --- Blight (mode-specific) ---
 
         public BlightSettings Blight { get; set; } = new BlightSettings();
@@ -340,6 +344,41 @@ namespace AutoExile
 
             [Menu("Loot While Near Leader Only", "Only loot when within follow distance of leader (don't wander off to loot).")]
             public ToggleNode LootNearLeaderOnly { get; set; } = new ToggleNode(true);
+        }
+
+        /// <summary>
+        /// Carry ⇔ Aurabot link. The Carry (Awakening Boss Rush) switches to Duo behaviour by itself when the partner is
+        /// in the party and its link heartbeat is alive; otherwise it plays solo exactly as before.
+        /// </summary>
+        [Submenu(CollapsedByDefault = true)]
+        public class DuoSettings
+        {
+            [Menu("Enable Duo Link", "Open the UDP link between the Carry (port 9890) and the Aurabot (port 9891) on this PC.")]
+            public ToggleNode Enabled { get; set; } = new ToggleNode(true);
+
+            [Menu("Partner Name (Carry side)", "Aurabot character name. Duo behaviour starts only while this character is in the party and linked.")]
+            public TextNode PartnerName { get; set; } = new TextNode("DmarZ");
+
+            [Menu("Aura Radius", "Aura radius of the Aurabot in grid units. The Carry waits / the Aurabot closes in to stay inside it.")]
+            public RangeNode<int> AuraRadius { get; set; } = new RangeNode<int>(40, 10, 120);
+
+            [Menu("Leash Distance", "Carry pauses its own movement when the Aurabot is farther than this (grid units, in maps).")]
+            public RangeNode<int> LeashDistance { get; set; } = new RangeNode<int>(48, 15, 150);
+
+            [Menu("Leash Max Wait (s)", "Longest the Carry waits for the Aurabot at one time before moving on anyway.")]
+            public RangeNode<int> LeashMaxWaitSeconds { get; set; } = new RangeNode<int>(4, 0, 20);
+
+            [Menu("Soul Link Key (Aurabot)", "Key of the Soul Link skill on the Aurabot's skill bar.")]
+            public HotkeyNode SoulLinkKey { get; set; } = new HotkeyNode(Keys.W);
+
+            [Menu("Soul Link Recast (s)", "Aurabot recasts Soul Link this long after the last cast even if nothing reported a break (buff lasts ~8-10 s).")]
+            public RangeNode<int> SoulLinkRecastSeconds { get; set; } = new RangeNode<int>(6, 2, 12);
+
+            [Menu("Soul Link Range", "Aurabot only casts Soul Link when the Carry is within this distance (grid units).")]
+            public RangeNode<int> SoulLinkRange { get; set; } = new RangeNode<int>(45, 10, 120);
+
+            [Menu("Aurabot Lead", "How far along the Carry's announced route the Aurabot aims (grid units).")]
+            public RangeNode<int> AuraLead { get; set; } = new RangeNode<int>(10, 0, 40);
         }
 
         [Submenu(CollapsedByDefault = true)]

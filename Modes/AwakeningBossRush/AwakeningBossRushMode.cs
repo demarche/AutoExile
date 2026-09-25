@@ -177,7 +177,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // Called on the frame thread: background HTTP serialization must never enumerate live collections.
     public JsonElement Snapshot() => JsonSerializer.SerializeToElement(new { hostProcessId = Environment.ProcessId, hostExecutable = Environment.ProcessPath,
         shutdownRequested = _shutdownRequested, generation = Supervisor.Generation, loadedMvid = Supervisor.Mvid, armed = Supervisor.State.Armed,
-        phase = Run.Phase.ToString(), Status, Decision, manualContinuous = _manualContinuous, stopAfterMap = _stopAfterMap, run = Run, lastCommand = Supervisor.LastCommand,
+        phase = Run.Phase.ToString(), Status, Decision, duoActive = _duoActive, duoInParty = _duoInParty, leashWaits = _leashWaits, leashSeconds = Math.Round(_leashSeconds, 1), manualContinuous = _manualContinuous, stopAfterMap = _stopAfterMap, run = Run, lastCommand = Supervisor.LastCommand,
         phaseStartedUtc = _phaseAt,
         inspecting = _inspecting, inspectionStatus = _inspectionStatus,
         commandRequestId = _commandRequestId, commandResult = _commandResult, observedUtc = _observedUtc,
@@ -392,6 +392,16 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _log.Event(Run, "run.codex_retired", new { Run.Instance, reason = "explicit_fresh_map_request" });
             Supervisor.State.Run = new() { PriorPortalIds = StrictMapRecipe.Portals(ctx.Game).Select(p => (long)p.Id).ToList() };
             return Supervisor.RecordCommand(id, "fresh_map_ready");
+        }
+        if (action == "beast_trip")
+        {
+            // Itemise + list the valuable captured beasts now, then stop (no map is opened).
+            if (mvid != Supervisor.Mvid || ctx.Settings.Running.Value) return "rejected: stopped verified build required";
+            if (ctx.Game.Area?.CurrentArea?.IsHideout != true) return "rejected: hideout required";
+            _beastOnly = true; _beastTripAt = DateTime.MinValue; _beastSessionChecked = false;
+            ManualStart(ctx, "beast_trip");
+            if (!(_manualContinuous && ctx.Settings.Running.Value)) { _beastOnly = false; return "rejected: " + Status; }
+            return Supervisor.RecordCommand(id, "beast_trip_started");
         }
         if (action == "continuous")
         {
@@ -914,7 +924,118 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         catch { }
         _runLoot.Clear(); _runEscapes = 0;
     }
+    // ── Duo: Aurabot (2026-09-25, user) ─────────────────────────────────────────────────────────────────────────
+    // "Aurabot有りモード": entered automatically while the partner (Settings.Duo.PartnerName) is in the party and its
+    // DuoLink heartbeat is alive; otherwise everything runs solo exactly as before. The Carry tells the Aurabot where
+    // it is going (next waypoint), when to come / hold in the map / take the portal, and whether Soul Link is on it;
+    // in maps it pauses its own movement (bounded) when the Aurabot falls out of aura / link range.
+    private bool _duoActive, _duoInParty; private DateTime _duoPartyCheckAt, _duoLogAt;
+    private DateTime _leashSince = DateTime.MinValue, _leashCooldownUntil = DateTime.MinValue;
+    private int _leashWaits; private double _leashSeconds;
+    public bool DuoActive => _duoActive;
+    private static bool PartnerInParty(ExileCore.GameController gc, string name)
+    {
+        try { return gc.IngameState?.IngameUi?.PartyElement?.PlayerElements?.Any(p => string.Equals(p?.PlayerName, name, StringComparison.OrdinalIgnoreCase)) == true; }
+        catch { return false; }
+    }
+    private void UpdateDuo(BotContext ctx)
+    {
+        var d = ctx.Settings.Duo; var link = ctx.Duo; var now = DateTime.UtcNow;
+        var alive = d.Enabled.Value && link.Alive && link.Last?.Role == "aura" &&
+            string.Equals(link.Last.Name, d.PartnerName.Value, StringComparison.OrdinalIgnoreCase) && link.Last.Phase != "stopped";
+        if ((now - _duoPartyCheckAt).TotalSeconds >= 2) { _duoPartyCheckAt = now; _duoInParty = PartnerInParty(ctx.Game, d.PartnerName.Value); }
+        var was = _duoActive;
+        _duoActive = alive && _duoInParty;
+        if (was != _duoActive || (now - _duoLogAt).TotalMinutes >= 10)
+        {
+            _duoLogAt = now;
+            _log.Event(Run, "duo.mode", new { active = _duoActive, alive, inParty = _duoInParty, partner = link.Last?.Name, partnerPhase = link.Last?.Phase,
+                ageMs = double.IsInfinity(link.AgeMs) ? -1 : Math.Round(link.AgeMs), link.LastError, _leashWaits, leashSeconds = Math.Round(_leashSeconds, 1) });
+        }
+    }
+    private bool PartnerSameArea(BotContext ctx) =>
+        ctx.Duo.Last != null && ctx.Duo.Last.AreaHash == (long)(ctx.Game.IngameState?.Data?.CurrentAreaHash ?? 0);
+    private float PartnerDistance(BotContext ctx) =>
+        PartnerSameArea(ctx) ? Vector2.Distance(ctx.Game.Player.GridPosNum, ctx.Duo.Last!.Pos) : float.PositiveInfinity;
+    private static bool HasSoulLink(ExileCore.GameController gc)
+    {
+        try { return gc.Player.GetComponent<Buffs>()?.BuffsList?.Any(b => b?.Name != null && b.Name.StartsWith("soul_link", StringComparison.OrdinalIgnoreCase)) == true; }
+        catch { return false; }
+    }
+    /// <summary>
+    /// True while the Carry should hold its movement for the Aurabot: in the map, out of scouting fights, partner
+    /// farther than the leash (or not yet in the map right after entry). Each wait is capped (LeashMaxWaitSeconds)
+    /// and followed by an 8 s cooldown so a stuck Aurabot can never stall the run.
+    /// </summary>
+    private bool DuoLeashHold(BotContext ctx)
+    {
+        if (!_duoActive || !InMap(ctx)) { _leashSince = DateTime.MinValue; return false; }
+        if (Run.Phase is not (AwakeningPhase.Scout or AwakeningPhase.Loot or AwakeningPhase.MapBoss)) { _leashSince = DateTime.MinValue; return false; }
+        var now = DateTime.UtcNow;
+        if (now < _leashCooldownUntil) return false;
+        var d = ctx.Settings.Duo;
+        var justEntered = Run.EnteredUtc.HasValue && (now - Run.EnteredUtc.Value).TotalSeconds < 12;
+        var far = PartnerSameArea(ctx) ? PartnerDistance(ctx) > d.LeashDistance.Value : justEntered;
+        if (!far) { if (_leashSince != DateTime.MinValue) { _leashSeconds += (now - _leashSince).TotalSeconds; _leashSince = DateTime.MinValue; } return false; }
+        try { if (Hazards(ctx).Any(h => Vector2.Distance(ctx.Game.Player.GridPosNum, h.Pos) < h.Radius + 4)) return false; } catch { }
+        if (_leashSince == DateTime.MinValue) { _leashSince = now; _leashWaits++; _log.Event(Run, "duo.leash_wait", new { dist = PartnerDistance(ctx), sameArea = PartnerSameArea(ctx), Run.Phase }); }
+        if ((now - _leashSince).TotalSeconds > d.LeashMaxWaitSeconds.Value)
+        {
+            _leashSeconds += (now - _leashSince).TotalSeconds; _leashSince = DateTime.MinValue; _leashCooldownUntil = now.AddSeconds(8);
+            _log.Event(Run, "duo.leash_timeout", new { dist = PartnerDistance(ctx), sameArea = PartnerSameArea(ctx) });
+            return false;
+        }
+        Status = PartnerSameArea(ctx) ? $"Duo: waiting for the Aurabot ({PartnerDistance(ctx):0})" : "Duo: waiting for the Aurabot to enter";
+        return true;
+    }
+    private bool InMap(BotContext ctx) => ctx.Game.Area?.CurrentArea is { IsHideout: false, IsTown: false } a && a.Name != "The Menagerie";
+    /// <summary>Called by BotCore every 100 ms (even while stopped) to fill the Carry's datagram.</summary>
+    public void FillDuo(BotContext ctx, DuoPacket p)
+    {
+        UpdateDuo(ctx);
+        var gc = ctx.Game; var d = ctx.Settings.Duo;
+        p.Phase = ctx.Settings.Running.Value ? Run.Phase.ToString() : "stopped";
+        p.Fighting = Run.Phase is AwakeningPhase.Fight;
+        p.AuraRadius = d.AuraRadius.Value;
+        p.LinkOk = gc.Player != null && HasSoulLink(gc);
+        p.PartnerDist = float.IsInfinity(PartnerDistance(ctx)) ? -1 : PartnerDistance(ctx);
+        try
+        {
+            if (ctx.Navigation.IsNavigating && ctx.Navigation.Destination.HasValue && gc.Player != null)
+            {
+                var me = gc.Player.GridPosNum; var path = ctx.Navigation.CurrentNavPath; Vector2 dest = ctx.Navigation.Destination.Value;
+                for (var i = Math.Max(0, ctx.Navigation.CurrentWaypointIndex); path != null && i < path.Count; i++)
+                    if (Vector2.Distance(me, path[i].Position) >= 18) { dest = path[i].Position; break; }
+                p.HasDest = true; p.DestX = dest.X; p.DestY = dest.Y;
+            }
+        }
+        catch { }
+        var inMap = InMap(ctx);
+        if (!inMap && gc.Area?.CurrentArea?.IsHideout == true)
+        {
+            if (Run.Phase == AwakeningPhase.EnterPortal)
+            {
+                var portal = StrictMapRecipe.Portals(gc).Where(x => Run.PortalIds.Contains(x.Id)).OrderBy(x => x.DistancePlayer).FirstOrDefault();
+                p.Cmd = "portal";
+                if (portal != null) { p.HasPortal = true; p.PortalX = portal.GridPosNum.X; p.PortalY = portal.GridPosNum.Y; }
+            }
+            // The map is still ours (death retry pending): the Aurabot keeps its position in the map instead of
+            // spending a portal to come home and another to go back in.
+            else if (Run.ActivationConfirmed && !Run.BossesCompleted && Run.Outcome is AttemptOutcome.Death or AttemptOutcome.Timeout or AttemptOutcome.None
+                     && Run.Phase is AwakeningPhase.Return or AwakeningPhase.Prepare or AwakeningPhase.OpenMap or AwakeningPhase.Dormant)
+                p.Cmd = "hold_map";
+            else p.Cmd = "home";
+            return;
+        }
+        if (inMap)
+        {
+            if (_leashSince != DateTime.MinValue) p.Cmd = "come";
+            else if (!p.LinkOk && PartnerSameArea(ctx) && PartnerDistance(ctx) < d.SoulLinkRange.Value) p.Cmd = "link";
+            else p.Cmd = "follow";
+        }
+    }
     private readonly List<DateTime> _logisticsRetries = new();
+    private bool _beastOnly;
     private void StopContinuousLoop(string reason)
     {
         if (!_manualContinuous) return;
@@ -950,6 +1071,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private void Prepare(BotContext ctx)
     {
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && TickBeastSales(ctx)) return;
+        if (_beastOnly && !Run.ActivationRequested && !Run.ActivationConfirmed)
+        {
+            _beastOnly = false; _stopAfterMap = false; StopContinuousLoop("beast_trip_done");
+            Finish(ctx, AttemptOutcome.OperationalFailure, "beast_trip_done"); return;
+        }
         if (ctx.Game.Area?.CurrentArea?.IsHideout != true) { Status = "Waiting for hideout"; return; }
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && EnsureChaosKnown(ctx)) return;
         if (!Run.ActivationRequested && !Run.ActivationConfirmed && !_listingChecked && PlanListings(ctx)) return;
@@ -1102,7 +1228,16 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (AwakeningGameReader.ChatOpen(ctx.Game)) { if (BotInput.CanAct) BotInput.PressKey(Keys.Escape); Status = "Closing the chat box"; return; }
         if (CloseBlockingPanels(ctx)) return;
         ctx.Interaction.Tick(ctx.Game);
-        if (ctx.Interaction.IsBusy) return;
+        // 2026-09-24 07:55: the device interaction stayed "busy" for minutes (no click, no walk) and every retry timed
+        // out in "Opening Atlas". Give a device interaction 12 s, then cancel it and fall back to label/walk.
+        if (ctx.Interaction.IsBusy)
+        {
+            if (_deviceBusySince == DateTime.MinValue) _deviceBusySince = DateTime.UtcNow;
+            if ((DateTime.UtcNow - _deviceBusySince).TotalSeconds < 12) return;
+            _log.Event(Run, "prepare.device_interaction_stuck", new { ctx.Interaction.Status });
+            ctx.Interaction.Cancel(ctx.Game); ctx.Navigation.Stop(ctx.Game);
+        }
+        _deviceBusySince = DateTime.MinValue;
         var device = ctx.Game.EntityListWrapper.OnlyValidEntities.FirstOrDefault(e => e.IsTargetable &&
             e.Path.Contains("MappingDevice", StringComparison.OrdinalIgnoreCase));
         if (device == null) { Status = "Map device not found"; return; }
@@ -1185,6 +1320,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         return false;
     }
     private bool _walkingToDevice;
+    private DateTime _deviceBusySince = DateTime.MinValue;
     private int _deviceTries, _strayMapRecoveries;
     private DateTime _deviceClickAt, _hideoutSince;
     private static string? InventoryMaterialPath(BotContext ctx, string name)
@@ -2617,6 +2753,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     private void Navigate(BotContext ctx, Vector2 target)
     {
+        if (DuoLeashHold(ctx))
+        {
+            if (ctx.Navigation.IsNavigating) ctx.Navigation.Stop(ctx.Game);
+            _lastProgress = DateTime.UtcNow; _lastPosition = ctx.Game.Player.GridPosNum;
+            return;
+        }
         target = SafeDestination(ctx, target);
         TravelSustain(ctx);
         if (ctx.Navigation.IsPathfinding) return;

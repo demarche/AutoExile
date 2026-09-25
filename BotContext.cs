@@ -35,6 +35,9 @@ namespace AutoExile
         public required PerformanceTracker Perf { get; init; }
         public required StatsService Stats { get; init; }
 
+        /// <summary>Carry ⇔ Aurabot UDP link (Duo). Owned here so every mode can read the partner's latest packet.</summary>
+        public DuoLink Duo { get; } = new DuoLink();
+
         /// <summary>
         /// Minimap icons discovered from TileEntities. Updated periodically by BotCore.
         /// Covers ~2x network bubble range — mechanics visible before entity list loads them.

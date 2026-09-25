@@ -222,6 +222,12 @@ namespace AutoExile.Modes
                 }
             }
 
+            // Duo link (2026-09-25): the Carry's own AutoExile tells us where it is going and what it needs.
+            // When its packet is fresh, it drives movement/Soul Link; otherwise the memory-based follow below runs.
+            var duo = DuoCarry(ctx);
+            if (duo != null && TickDuo(ctx, gc, duo, playerGridPos, isHideout))
+                return;
+
             // Try to find the leader entity
             var leader = FindLeader(gc);
 
@@ -247,6 +253,196 @@ namespace AutoExile.Modes
                 else
                     TickQuestInteractables(ctx, gc, leader, playerGridPos);
             }
+        }
+
+        // ─── Duo (Carry ⇔ Aurabot link) ──────────────────────────────────────────────
+
+        private DateTime _lastLinkCast = DateTime.MinValue;
+        private int _linkCasts;
+        private DateTime _duoPortalAt = DateTime.MinValue, _duoHomeSince = DateTime.MinValue;
+        public int SoulLinkCasts => _linkCasts;
+
+        /// <summary>The Carry's latest datagram, when fresh and from our leader.</summary>
+        private DuoPacket? DuoCarry(BotContext ctx)
+        {
+            var link = ctx.Duo;
+            if (!ctx.Settings.Duo.Enabled.Value || !link.Alive || link.Last == null || link.Last.Role != "carry") return null;
+            if (!string.IsNullOrEmpty(LeaderName) && !string.Equals(link.Last.Name, LeaderName, StringComparison.OrdinalIgnoreCase)) return null;
+            return link.Last;
+        }
+
+        /// <summary>Fills the Aurabot's datagram (called by BotCore every 100 ms).</summary>
+        public void FillDuo(BotContext ctx, DuoPacket p, bool running)
+        {
+            p.Phase = running ? _state.ToString() : "stopped";
+            var since = (DateTime.Now - _lastLinkCast).TotalSeconds;
+            p.LinkLeftSec = (float)Math.Max(0, 8.0 - since);
+            p.LinkOk = since < 8.0;
+            p.AuraRadius = ctx.Settings.Duo.AuraRadius.Value;
+            var duo = DuoCarry(ctx);
+            if (duo != null && ctx.Game.Player != null && duo.AreaHash == (long)(ctx.Game.IngameState?.Data?.CurrentAreaHash ?? 0))
+                p.PartnerDist = Vector2.Distance(GetPlayerGrid(ctx.Game), duo.Pos);
+            else p.PartnerDist = -1;
+            p.Cmd = _decision;
+        }
+
+        /// <summary>
+        /// Duo-driven behaviour. Returns true when it handled this tick (movement decided), false to fall back to
+        /// the memory-based follow (e.g. leader in another area with no command for us).
+        /// </summary>
+        private bool TickDuo(BotContext ctx, GameController gc, DuoPacket duo, Vector2 playerGridPos, bool isHideout)
+        {
+            if (PumpChatKeys()) return true;
+            var sameArea = duo.AreaHash == (long)(gc.IngameState?.Data?.CurrentAreaHash ?? 0);
+            if (isHideout)
+            {
+                // Our own portal run (started below) must not be cancelled by the "hideout: idle near leader" rule.
+                if ((DateTime.Now - _duoPortalAt).TotalSeconds < 20 && _state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition)
+                {
+                    if (_state == FollowerState.NavigatingToTransition) TickTransitionArrival(ctx, gc);
+                    return true;
+                }
+                // The Carry is about to take the map portal: go in right away (another portal than the Carry's own —
+                // each map portal takes one entry) instead of waiting until the Carry has vanished.
+                if (sameArea && duo.Cmd == "portal" && FollowThroughTransitions
+                    && _state is not (FollowerState.NavigatingToTransition or FollowerState.ClickingTransition)
+                    && (DateTime.Now - _duoPortalAt).TotalSeconds > 6)
+                {
+                    var portals = FindAllPortals(gc).Where(e => e.Type != EntityType.TownPortal).ToList();
+                    if (portals.Count > 0)
+                    {
+                        var carryPortal = duo.HasPortal ? duo.Portal : duo.Pos;
+                        var others = portals.Where(e => Vector2.Distance(new Vector2(e.GridPosNum.X, e.GridPosNum.Y), carryPortal) > 3).ToList();
+                        var pick = (others.Count > 0 ? others : portals)
+                            .OrderBy(e => Vector2.Distance(playerGridPos, new Vector2(e.GridPosNum.X, e.GridPosNum.Y))).First();
+                        _duoPortalAt = DateTime.Now;
+                        ctx.Log($"Duo: Carry is entering the map — taking portal at ({pick.GridPosNum.X:F0},{pick.GridPosNum.Y:F0})");
+                        if (StartNavigationToEntity(ctx, gc, pick)) { _decision = "duo_portal"; return true; }
+                    }
+                }
+                // We are in a hideout but not the Carry's (e.g. our own after a /hideout): teleport to it.
+                if (!sameArea && !duo.InMap && duo.Area.Contains("Hideout", StringComparison.OrdinalIgnoreCase)
+                    && _state != FollowerState.TeleportingViaParty && TryTeleportViaPartyUI(ctx, gc))
+                { _decision = "duo_party_teleport_home"; return true; }
+                return false;
+            }
+
+            if (!sameArea)
+            {
+                // The Carry died / is re-entering the same map: keep our spot instead of spending portals.
+                if (duo.Cmd == "hold_map" && !duo.InMap)
+                {
+                    ctx.Navigation.Stop(gc);
+                    _status = $"Duo: holding in the map for {LeaderName}";
+                    _decision = "duo_hold_map";
+                    _duoHomeSince = DateTime.MinValue;
+                    return true;
+                }
+                // Map finished and the Carry is home: follow through its exit (default logic); if no exit is found
+                // within 6 s, use /hideout and let the party teleport bring us to the Carry's hideout.
+                if (duo.Cmd == "home" && !duo.InMap)
+                {
+                    if (_duoHomeSince == DateTime.MinValue) _duoHomeSince = DateTime.Now;
+                    if ((DateTime.Now - _duoHomeSince).TotalSeconds > 6 && _state == FollowerState.SearchingForLeader && BotInput.CanAct)
+                    {
+                        _duoHomeSince = DateTime.Now.AddSeconds(20); // don't spam
+                        ChatCommand("/hideout");
+                        _status = "Duo: map done — /hideout";
+                        _decision = "duo_home_chat";
+                        return true;
+                    }
+                }
+                return false;
+            }
+            _duoHomeSince = DateTime.MinValue;
+
+            // Same map as the Carry.
+            var leader = FindLeader(gc);
+            if (leader != null) TrySoulLink(ctx, gc, leader, duo, playerGridPos);
+            if (_state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition)
+            {
+                _state = FollowerState.Following; _transitionGridPos = null; _transitionEntityId = 0;
+                ctx.Navigation.Stop(gc); ctx.Interaction.Cancel(gc);
+            }
+            if (leader != null) { _lastLeaderPos = new Vector2(leader.GridPosNum.X, leader.GridPosNum.Y); _hasLastLeaderPos = true; }
+
+            var carry = duo.Pos;
+            var target = carry;
+            var lead = ctx.Settings.Duo.AuraLead.Value;
+            if (duo.HasDest && lead > 0)
+            {
+                var dir = duo.Dest - carry; var len = dir.Length();
+                if (len > 1) target = carry + dir / len * Math.Min(lead, len);
+            }
+            var aura = duo.AuraRadius > 0 ? duo.AuraRadius : ctx.Settings.Duo.AuraRadius.Value;
+            var followDist = Math.Min(FollowDistance, aura * 0.55f);
+            var stopDist = Math.Min(StopDistance, followDist * 0.5f);
+            var dist = Vector2.Distance(playerGridPos, carry);
+            var come = duo.Cmd == "come";
+            var should = come ? dist > stopDist : dist > followDist || (duo.HasDest && dist > stopDist + 4f);
+            if (!should)
+            {
+                ctx.Navigation.Stop(gc);
+                _state = FollowerState.NearLeader;
+                _status = $"Duo: near {LeaderName} ({dist:F0}/{aura:F0})";
+                _decision = "duo_near";
+                return true;
+            }
+            var hasLOS = ctx.Navigation.HasWalkableLOS(gc, playerGridPos, target);
+            var preferPath = ctx.Navigation.IsNavigating && (DateTime.Now - _lastPathStartTime).TotalMilliseconds < PathHysteresisMs;
+            if (hasLOS && !preferPath) ctx.Navigation.MoveToward(gc, target);
+            else if (ctx.Navigation.IsNavigating) ctx.Navigation.UpdateDestination(gc, target, driftThreshold: 10f);
+            else if (!hasLOS && dist < followDist * 1.5f) ctx.Navigation.MoveToward(gc, target);
+            else if (ctx.Navigation.NavigateTo(gc, target)) _lastPathStartTime = DateTime.Now;
+            _state = FollowerState.Following;
+            _status = $"Duo: following {LeaderName} ({dist:F0}/{aura:F0}{(come ? ", come" : "")})";
+            _decision = come ? "duo_come" : "duo_follow";
+            return true;
+        }
+
+        /// <summary>
+        /// Keep Soul Link on the Carry: recast after SoulLinkRecastSeconds, or sooner (2.5 s guard) when the Carry
+        /// reports the buff missing / asks for it. The cursor must be on the Carry, so only when it is on screen.
+        /// </summary>
+        private void TrySoulLink(BotContext ctx, GameController gc, Entity leader, DuoPacket duo, Vector2 playerGridPos)
+        {
+            var d = ctx.Settings.Duo;
+            var since = (DateTime.Now - _lastLinkCast).TotalSeconds;
+            var need = since > d.SoulLinkRecastSeconds.Value || ((duo.Cmd == "link" || !duo.LinkOk) && since > 2.5);
+            if (!need || !BotInput.CanAct) return;
+            var leaderGrid = new Vector2(leader.GridPosNum.X, leader.GridPosNum.Y);
+            if (Vector2.Distance(playerGridPos, leaderGrid) > d.SoulLinkRange.Value) return;
+            try
+            {
+                var sp = gc.IngameState.Camera.WorldToScreen(leader.GetComponent<Render>()?.PosNum ?? leader.BoundsCenterPosNum);
+                var w = gc.Window.GetWindowRectangle();
+                if (sp.X < 20 || sp.Y < 20 || sp.X > w.Width - 20 || sp.Y > w.Height - 20) return;
+                if (BotInput.CursorPressKey(new Vector2(w.X + sp.X, w.Y + sp.Y), d.SoulLinkKey.Value))
+                {
+                    _lastLinkCast = DateTime.Now; _linkCasts++;
+                    if (_linkCasts <= 3 || _linkCasts % 50 == 0) ctx.Log($"Duo: Soul Link cast #{_linkCasts} (carry linkOk={duo.LinkOk}, cmd={duo.Cmd})");
+                }
+            }
+            catch { }
+        }
+
+        private readonly Queue<System.Windows.Forms.Keys> _chatKeys = new();
+        private DateTime _chatKeyAt = DateTime.MinValue;
+        private void ChatCommand(string command)
+        {
+            _chatKeys.Clear();
+            _chatKeys.Enqueue(System.Windows.Forms.Keys.Return);
+            foreach (var ch in command.ToUpperInvariant())
+                _chatKeys.Enqueue(ch == '/' ? System.Windows.Forms.Keys.OemQuestion : (System.Windows.Forms.Keys)ch);
+            _chatKeys.Enqueue(System.Windows.Forms.Keys.Return);
+        }
+        /// <summary>One chat key per tick (BotInput gates key presses with a cooldown).</summary>
+        private bool PumpChatKeys()
+        {
+            if (_chatKeys.Count == 0) return false;
+            if ((DateTime.Now - _chatKeyAt).TotalMilliseconds < 120 || !BotInput.CanAct) return true;
+            if (BotInput.PressKey(_chatKeys.Peek())) { _chatKeys.Dequeue(); _chatKeyAt = DateTime.Now; }
+            return true;
         }
 
         private void OnAreaChanged(BotContext ctx)

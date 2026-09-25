@@ -46,7 +46,13 @@ public sealed class AwakeningBeastSeller
         Itemised = 0; ItemisedChaos = 0; FailReason = ""; _noEffect = 0; _chatRetries = 0;
         _homeArea = gc.Area?.CurrentArea?.Name ?? "";
         _startedAt = DateTime.UtcNow;
-        _log("beast.itemise_started", new { targets = _targets.Select(t => t.Name + ":" + t.Chaos).ToArray() });
+        // 2026-09-25 (verified live): Einhar stands in the Hideout and Ctrl+clicking him opens the same Bestiary /
+        // Captured Beasts pages. Skip the two loading screens of /menagerie + /hideout when he is here.
+        // 2026-09-25 (user): itemising only works with Einhar in the Menagerie; the Hideout Einhar's Bestiary shows the
+        // list but Ctrl+click does nothing (confirmed: "itemise_click_had_no_effect" twice in the Hideout). Always travel.
+        _stayedHome = false;
+        _log("beast.itemise_started", new { targets = _targets.Select(t => t.Name + ":" + t.Chaos).ToArray(), einharInHideout = _stayedHome });
+        if (_stayedHome) { Set(Step.WalkToEinhar, "walking to Einhar (Hideout)"); return; }
         Chat(gc, "menagerie"); Set(Step.GoMenagerie, "travelling to the Menagerie");
     }
     public void Reset() { _step = Step.Idle; _keys.Clear(); }
@@ -196,6 +202,7 @@ public sealed class AwakeningBeastSeller
         {
             _actionAt = DateTime.UtcNow;
             _keys.Enqueue(Keys.A | Keys.Control); _keys.Enqueue(Keys.Back); _keys.Enqueue(Keys.V | Keys.Control); _keys.Enqueue(Keys.None);
+            _hoverIdx = 0; _hovering = false;
             Set(Step.Scan, "looking for " + name);
         }
     }
@@ -227,14 +234,32 @@ public sealed class AwakeningBeastSeller
             }
         }
         catch { }
-        // Only entries fully inside the list viewport can be clicked; the tooltip names the beast type when readable.
-        var clickable = entries.Where(e => { var r = e.GetClientRect(); return lr.HasValue && r.Y >= lr.Value.Y - 2 && r.Bottom <= lr.Value.Bottom + 2; })
-            .Where(e => TypeMatches(e, target.Name)).ToList();
-        if (clickable.Count == 0)
+        // Only entries fully inside the list viewport can be clicked. The entry shows the beast's own (rare) name, e.g.
+        // "Painslasher"; its type ("- Primal Cystcaller -") is only in the hover tooltip (2026-09-25: an unverified
+        // multi-word match picked a Painslasher for Primal Cystcaller). Hover each candidate and read the tooltip first.
+        var inView = entries.Where(e => { var r = e.GetClientRect(); return lr.HasValue && r.Y >= lr.Value.Y - 2 && r.Bottom <= lr.Value.Bottom + 2; }).ToList();
+        if (_hoverIdx >= inView.Count)
         {
-            _log("beast.itemise_none", new { target.Name, visible = entries.Count });
-            _targetIndex++; Set(Step.Filter, "next beast"); return;
+            _log("beast.itemise_none", new { target.Name, visible = entries.Count, inView = inView.Count, hovered = _hoverIdx });
+            _hoverIdx = 0; _hovering = false; _targetIndex++; Set(Step.Filter, "next beast"); return;
         }
+        var cand = inView[_hoverIdx];
+        var candPortrait = cand.GetChildAtIndex(0) ?? cand;
+        if (!_hovering)
+        {
+            if (BotInput.MoveMouse(Abs(gc, candPortrait.GetClientRect().Center))) { _hovering = true; _hoverAt = DateTime.UtcNow; }
+            return;
+        }
+        if ((DateTime.UtcNow - _hoverAt).TotalMilliseconds < 350) return;
+        var tipName = HoverTypeName(gc, cand);
+        _hovering = false;
+        if (tipName.Length == 0 && (DateTime.UtcNow - _hoverAt).TotalMilliseconds < 1200) { _hovering = true; return; }
+        if (!string.Equals(Normalize(tipName), Normalize(target.Name), StringComparison.OrdinalIgnoreCase))
+        {
+            _log("beast.hover_skip", new { target.Name, beast = Text(cand.GetChildAtIndex(1)?.GetChildAtIndex(0)), type = tipName });
+            _hoverIdx++; return;
+        }
+        var clickable = new List<Element> { cand };
         _entry = clickable[0];
         _itemisedBefore = CountItemised(gc);
         // The beast tooltip reads "Ctrl + Left-click to Itemise Beast" (verified live 2026-09-23 on Black Mórrigan:
@@ -255,13 +280,23 @@ public sealed class AwakeningBeastSeller
         {
             Itemised++; ItemisedChaos += target.Chaos; _noEffect = 0;
             _log("beast.itemised", new { target.Name, target.Chaos, inventory = now });
-            Set(Step.Scan, "next " + target.Name); return; // same filter: take the next one of this type
+            _hovering = false; Set(Step.Scan, "next " + target.Name); return; // same filter: take the next one of this type
         }
         if ((DateTime.UtcNow - _stepAt).TotalSeconds < 2.5) return;
         _noEffect++;
         _log("beast.itemise_no_effect", new { target.Name, attempt = _noEffect, cursor = CursorHasItem(gc) });
         if (_noEffect >= 2) { GoHome(gc, "itemise_click_had_no_effect"); return; }
-        Set(Step.Scan, "retrying " + target.Name);
+        _hovering = false; Set(Step.Scan, "retrying " + target.Name);
+    }
+    private int _hoverIdx; private bool _hovering; private DateTime _hoverAt;
+    /// <summary>Beast type from the hover tooltip ("- Black Mórrigan -"): the entry's own tooltip, else any visible "- X -" text.</summary>
+    private static string HoverTypeName(GameController gc, Element entry)
+    {
+        string Clean(string? t) => (t ?? "").Trim().Trim('-').Trim();
+        try { var t = Clean(entry.Tooltip?.GetChildAtIndex(1)?.GetChildAtIndex(0)?.Text); if (t.Length > 0) return t; } catch { }
+        try { var t = Clean(entry.GetChildAtIndex(0)?.Tooltip?.GetChildAtIndex(1)?.GetChildAtIndex(0)?.Text); if (t.Length > 0) return t; } catch { }
+        var any = Find(gc.IngameState.IngameUi, e => { var x = Text(e); return e.IsVisible && x.Length > 4 && x.StartsWith("- ") && x.EndsWith(" -"); });
+        return Clean(Text(any));
     }
     private static bool TypeMatches(Element entry, string name)
     {
@@ -445,13 +480,22 @@ public sealed class AwakeningBeastSeller
         try { foreach (var c in e.Children) kids.Add(DumpTree(c, depth + 1)); } catch { }
         return new { t, r = $"{r.X:0},{r.Y:0},{r.Width:0},{r.Height:0}", v = e.IsVisible, c = kids };
     }
+    private bool _stayedHome;
     private void GoHome(GameController gc, string reason)
     {
         if (reason.Length > 0) FailReason = reason;
-        _log("beast.go_home", new { reason, Itemised });
+        _log("beast.go_home", new { reason, Itemised, _stayedHome });
         _keys.Clear();
         if (CapturedPanel(gc) != null || Find(gc.IngameState.IngameUi, e => e.IsVisible && Text(e) == "Bestiary" && e.GetClientRect().Y < 250) != null) _keys.Enqueue(Keys.Escape);
-        _chatRetries = 0; Chat(gc, "hideout"); Set(Step.GoHome, "returning with /hideout");
+        _chatRetries = 0;
+        if (_stayedHome && gc.Area?.CurrentArea?.Name != "The Menagerie")
+        {
+            // Never left the Hideout: close the Bestiary and finish now (2026-09-25: waiting on the GoHome step timed out).
+            _keys.Clear(); if (BotInput.CanAct) BotInput.PressKey(Keys.Escape);
+            _log("beast.itemise_done", new { Itemised, ItemisedChaos, reason = FailReason });
+            _step = FailReason.Length > 0 && Itemised == 0 ? Step.Failed : Step.Done; Status = $"Beasts: itemised {Itemised} ({ItemisedChaos:0}c)"; return;
+        }
+        Chat(gc, "hideout"); Set(Step.GoHome, "returning with /hideout");
     }
     private void Chat(GameController gc, string command)
     {

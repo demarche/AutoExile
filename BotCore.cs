@@ -534,6 +534,37 @@ namespace AutoExile
             }
         }
 
+        private DateTime _duoSentAt = DateTime.MinValue;
+        private void TickDuo()
+        {
+            try
+            {
+                var role = !Settings.Duo.Enabled.Value ? "" : _mode is FollowerMode ? "aura" : _mode == _awakeningMode ? "carry" : "";
+                if (role.Length == 0) { _ctx.Duo.Stop(); return; }
+                _ctx.Duo.Ensure(role);
+                _ctx.Duo.Poll();
+                if ((DateTime.UtcNow - _duoSentAt).TotalMilliseconds < 100) return;
+                _duoSentAt = DateTime.UtcNow;
+                var p = new DuoPacket();
+                var player = GameController.Player;
+                p.Name = player?.GetComponent<ExileCore.PoEMemory.Components.Player>()?.PlayerName ?? "";
+                p.Area = GameController.Area?.CurrentArea?.Name ?? "";
+                p.AreaHash = (long)(GameController.IngameState?.Data?.CurrentAreaHash ?? 0);
+                if (player != null)
+                {
+                    p.X = player.GridPosNum.X; p.Y = player.GridPosNum.Y;
+                    var life = player.GetComponent<ExileCore.PoEMemory.Components.Life>();
+                    if (life != null) { p.HpPct = (int)(life.HPPercentage * 100); p.EsPct = (int)(life.ESPercentage * 100); }
+                }
+                var area = GameController.Area?.CurrentArea;
+                p.InMap = area != null && !area.IsHideout && !area.IsTown;
+                if (_mode is FollowerMode follower) follower.FillDuo(_ctx, p, Settings.Running.Value);
+                else if (_mode == _awakeningMode) _awakeningMode?.FillDuo(_ctx, p);
+                _ctx.Duo.Send(p);
+            }
+            catch (Exception ex) { if ((DateTime.UtcNow - _duoSentAt).TotalSeconds > 30) LogMessage($"[Duo] {ex.Message}"); }
+        }
+
         public override Job Tick()
         {
             using var tickTrace = InputLatencyDiagnostics.Begin("Tick");
@@ -558,6 +589,9 @@ namespace AutoExile
             // Runs before all early returns so the dashboard stays live even when
             // POE is unfocused or an async action is in flight.
             using (InputLatencyDiagnostics.Begin("Tick.web-server")) TickWebServer();
+
+            // Duo link heartbeat (Carry ⇔ Aurabot): runs even while the game is unfocused or the bot is stopped.
+            TickDuo();
 
             // Update active-runtime accounting on every tick (even when POE is
             // unfocused) so the timer reflects real elapsed wall time accurately.
@@ -1239,6 +1273,7 @@ namespace AutoExile
                 {
                     Running = Settings.Running.Value,
                     Awakening = _awakeningMode?.Snapshot(),
+                    Duo = _ctx.Duo.Snapshot(),
                     InGame = GameController.InGame,
                     Mode = _mode?.Name ?? "Unknown",
                     Phase = phase,
@@ -1331,6 +1366,7 @@ namespace AutoExile
         public override void OnClose()
         {
             _awakeningMode?.Dispose();
+            try { _ctx?.Duo.Dispose(); } catch { }
             InputLatencyDiagnostics.Stop();
             if (_ctx != null) InputLatencyDiagnostics.Drain(_ctx.Log);
             BotInput.StopMovement();

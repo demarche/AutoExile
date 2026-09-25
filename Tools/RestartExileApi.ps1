@@ -13,7 +13,10 @@ $root = (Resolve-Path (Join-Path $pluginRoot '..\..\..')).Path
 $loader = Join-Path $root 'Loader.exe'
 $dll = Join-Path $root 'Plugins\Temp\AutoExile\AutoExile.dll'
 $errors = Join-Path $pluginRoot 'Errors.txt'
-$api = 'http://127.0.0.1:9876/api/status'
+# 2026-09-25: the Duo Aurabot's ExileAPI (another Windows session) serves its API on its own WebUiPort (9877).
+$apiPort = 9876
+try { $cfg = Get-Content (Join-Path $root 'config\global\AutoExile_settings.json') -Raw | ConvertFrom-Json; if ($cfg.WebUiPort.Value) { $apiPort = [int]$cfg.WebUiPort.Value } } catch { }
+$api = "http://127.0.0.1:$apiPort/api/status"
 
 $resultFile = Join-Path $PSScriptRoot 'RestartExileApi.last.txt'
 function Finish([int]$code, [string]$message) {
