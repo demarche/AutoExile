@@ -323,7 +323,9 @@ namespace AutoExile.Modes
                 // The Carry is about to take the map portal: go in right away (another portal than the Carry's own —
                 // each map portal takes one entry) instead of waiting until the Carry has vanished.
                 // User (2026-09-25): the last map portal belongs to the Carry — never take it.
-                var mapPortalsHere = FindAllPortals(gc).Count(e => e.Type != EntityType.TownPortal);
+                // 2026-09-26: Map Device portals are EntityType.TownPortal ("Town_Portals"). Filtering TownPortal out left
+                // the Aurabot with zero map portals in the Hideout, so it never entered (14 aura_enter_timeout on 09-25).
+                var mapPortalsHere = FindAllPortals(gc).Count;
                 if ((duo.InMap || (sameArea && duo.Cmd == "portal")) && (mapPortalsHere == 1 || (sameArea && duo.PortalsLeft == 1)))
                 {
                     if (_state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition) { ctx.Interaction.Cancel(gc); _transitionGridPos = null; _transitionEntityId = 0; }
@@ -335,7 +337,7 @@ namespace AutoExile.Modes
                     && _state is not (FollowerState.NavigatingToTransition or FollowerState.ClickingTransition)
                     && (DateTime.Now - _duoPortalAt).TotalSeconds > 6)
                 {
-                    var portals = FindAllPortals(gc).Where(e => e.Type != EntityType.TownPortal).ToList();
+                    var portals = FindAllPortals(gc);
                     if (portals.Count > 0)
                     {
                         var carryPortal = duo.HasPortal ? duo.Portal : duo.Pos;
@@ -1237,7 +1239,7 @@ namespace AutoExile.Modes
             if (portals.Count == 0)
                 return false;
             // Duo (user, 2026-09-25): the last map portal is reserved for the Carry.
-            if (ctx.Settings.Duo.Enabled.Value && portals.Count(e => e.Type != EntityType.TownPortal) <= 1)
+            if (ctx.Settings.Duo.Enabled.Value && portals.Count <= 1)
             {
                 _status = "Duo: last map portal is the Carry's"; _decision = "duo_last_portal_reserved";
                 return false;

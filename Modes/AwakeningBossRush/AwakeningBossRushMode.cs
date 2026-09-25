@@ -177,7 +177,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // Called on the frame thread: background HTTP serialization must never enumerate live collections.
     public JsonElement Snapshot() => JsonSerializer.SerializeToElement(new { hostProcessId = Environment.ProcessId, hostExecutable = Environment.ProcessPath,
         shutdownRequested = _shutdownRequested, generation = Supervisor.Generation, loadedMvid = Supervisor.Mvid, armed = Supervisor.State.Armed,
-        phase = Run.Phase.ToString(), Status, Decision, duoActive = _duoActive, duoInParty = _duoInParty, leashWaits = _leashWaits, leashSeconds = Math.Round(_leashSeconds, 1), manualContinuous = _manualContinuous, stopAfterMap = _stopAfterMap, run = Run, lastCommand = Supervisor.LastCommand,
+        phase = Run.Phase.ToString(), Status, Decision, duoActive = _duoActive, duoInParty = _duoInParty, leashWaits = _leashWaits, leashSeconds = Math.Round(_leashSeconds, 1), regroups = _regroups, regroupSeconds = Math.Round(_regroupSeconds, 1), manualContinuous = _manualContinuous, stopAfterMap = _stopAfterMap, run = Run, lastCommand = Supervisor.LastCommand,
         phaseStartedUtc = _phaseAt,
         inspecting = _inspecting, inspectionStatus = _inspectionStatus,
         commandRequestId = _commandRequestId, commandResult = _commandResult, observedUtc = _observedUtc,
@@ -1026,6 +1026,58 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         return true;
     }
     private bool InMap(BotContext ctx) => ctx.Game.Area?.CurrentArea is { IsHideout: false, IsTown: false } a && a.Name != "The Menagerie";
+    // ── Duo in boss fights (2026-09-26, user: "ビルド防御はAurabotありき… Aurabotの範囲外でボス戦しているため死んでいます") ──
+    // Fight never leashed: repositions, back-offs and ES retreats walked the Carry away from the Aurabot's auras and
+    // Soul Link. Now (only while Duo mode is active): (1) before engaging / while fighting, regroup with the Aurabot
+    // when it is outside 80% of the aura radius (bounded 8 s, then 6 s cooldown so a stuck partner never stalls the
+    // fight); (2) back-off and ES-retreat directions lean toward the Aurabot; (3) Spark repositions that would leave
+    // the aura are skipped.
+    private DateTime _regroupSince = DateTime.MinValue, _regroupCooldownUntil = DateTime.MinValue; private int _regroups; private double _regroupSeconds;
+    private bool DuoRegroup(BotContext ctx, DateTime now)
+    {
+        if (!_duoActive) return false;
+        var aura = ctx.Settings.Duo.AuraRadius.Value;
+        bool hold; Vector2? partner = null;
+        if (PartnerSameArea(ctx))
+        {
+            var dist = PartnerDistance(ctx);
+            hold = dist > aura * 0.8f && dist < 350;
+            partner = ctx.Duo.Last!.Pos;
+        }
+        else hold = Run.EnteredUtc.HasValue && (now - Run.EnteredUtc.Value).TotalSeconds < 15; // it is still coming through the portal
+        if (!hold || now < _regroupCooldownUntil)
+        {
+            if (_regroupSince != DateTime.MinValue) { _regroupSeconds += (now - _regroupSince).TotalSeconds; _regroupSince = DateTime.MinValue; }
+            return false;
+        }
+        try { if (Hazards(ctx).Any(h => Vector2.Distance(ctx.Game.Player.GridPosNum, h.Pos) < h.Radius + 4)) return false; } catch { }
+        if (_regroupSince == DateTime.MinValue)
+        {
+            _regroupSince = now; _regroups++;
+            _log.Event(Run, "duo.fight_regroup", new { dist = PartnerSameArea(ctx) ? Math.Round(PartnerDistance(ctx)) : -1, sameArea = PartnerSameArea(ctx), aura });
+        }
+        if ((now - _regroupSince).TotalSeconds > 8)
+        {
+            _regroupSeconds += (now - _regroupSince).TotalSeconds; _regroupSince = DateTime.MinValue; _regroupCooldownUntil = now.AddSeconds(6);
+            _log.Event(Run, "duo.fight_regroup_timeout", new { dist = PartnerSameArea(ctx) ? Math.Round(PartnerDistance(ctx)) : -1 });
+            return false;
+        }
+        ctx.Combat.Suspend(); _relocating = false;
+        if (partner.HasValue && Vector2.Distance(ctx.Game.Player.GridPosNum, partner.Value) > 12) Navigate(ctx, partner.Value);
+        else if (ctx.Navigation.IsNavigating) ctx.Navigation.Stop(ctx.Game);
+        Status = partner.HasValue ? $"Duo: regrouping with the Aurabot ({PartnerDistance(ctx):0}/{aura:0})" : "Duo: waiting for the Aurabot before the fight";
+        return true;
+    }
+    /// <summary>Unit direction "away from the threat", leaning toward the Aurabot when it is in this area.</summary>
+    private Vector2 DuoBiasedAway(BotContext ctx, Vector2 away)
+    {
+        var a = away.Length() > 1 ? Vector2.Normalize(away) : new Vector2(1, 0);
+        if (!_duoActive || !PartnerSameArea(ctx)) return a;
+        var toPartner = ctx.Duo.Last!.Pos - ctx.Game.Player.GridPosNum;
+        if (toPartner.Length() < 6) return a;
+        var b = a + Vector2.Normalize(toPartner) * 1.2f;
+        return b.Length() > 0.1f ? Vector2.Normalize(b) : a;
+    }
     /// <summary>Called by BotCore every 100 ms (even while stopped) to fill the Carry's datagram.</summary>
     public void FillDuo(BotContext ctx, DuoPacket p)
     {
@@ -1779,10 +1831,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 { Finish(ctx, AttemptOutcome.OperationalFailure, "supplies_exhausted:out_of_chaos"); return; }
                 // Buy what the chaos allows.
                 var affordable = (int)Math.Floor(chaos / Math.Max(1, next.MaxUnitChaos / 1.5));
-                if (affordable < next.Quantity) { _restockQueue.Dequeue(); _restockCurrent = next with { Quantity = Math.Max(1, affordable) }; _exchange.Start(_restockCurrent); return; }
+                if (affordable < next.Quantity) { _restockQueue.Dequeue(); _restockCurrent = next with { Quantity = Math.Max(1, affordable) }; _heldBeforeBuy = AwakeningExchange.CountHeld(ctx.Game, _restockCurrent.WantName); _exchange.Start(_restockCurrent); return; }
             }
         }
         _restockCurrent = _restockQueue.Dequeue();
+        _heldBeforeBuy = AwakeningExchange.CountHeld(ctx.Game, _restockCurrent.WantName);
         _exchange.Start(_restockCurrent);
     }
     private void RecordExchangeResult(BotContext ctx, string source)
@@ -1790,13 +1843,28 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var r = _exchange.Succeeded ? _exchangeLastRequest() : null;
         if (r == null || (r.Kind != ExchangeKind.ListAtAskMinus && _exchange.FilledWant <= 0)) return;
         if (r.Kind == ExchangeKind.BuyAtAsk)
-        { _ledger.Price(r.WantName, _exchange.UnitChaos, "faustus_ask"); _ledger.Purchase(r.WantName, _exchange.FilledWant, _exchange.UnitChaos, source); }
+        {
+            // 2026-09-26 (user: "Scarabはどこにも見当たりません。買っていない可能性があります"): FilledWant is the ordered
+            // quantity as soon as any "Order Completed" slot shows up; partial fills refund Chaos instead. Book what
+            // actually arrived (held after − held before), when that can be read.
+            var bought = _exchange.FilledWant;
+            try
+            {
+                var got = AwakeningExchange.CountHeld(ctx.Game, r.WantName) - _heldBeforeBuy;
+                if (source == "restock" && _heldBeforeBuy >= 0 && got >= 0 && got < bought)
+                { _log.Event(Run, "exchange.partial_fill", new { r.WantName, ordered = bought, received = got, unit = _exchange.UnitChaos }); bought = got; }
+            }
+            catch { }
+            _ledger.Price(r.WantName, _exchange.UnitChaos, "faustus_ask");
+            if (bought > 0) _ledger.Purchase(r.WantName, bought, _exchange.UnitChaos, source);
+        }
         else if (r.Kind == ExchangeKind.SellAtBid)
             _ledger.AddSale(r.HaveName, _exchange.PaidHave, _exchange.UnitChaos, "faustus_bid_" + source);
         else if (r.Kind == ExchangeKind.ListAtAskMinus)
             _ledger.Listing(r.HaveName, r.Quantity, _exchange.UnitChaos, source);
     }
     private ExchangeRequest? _exchangeLastRequest() => _exchange.Request;
+    private int _heldBeforeBuy = -1;
     private void Index(BotContext ctx)
     {
         // After a Faustus restock the stash is closed ("Stash closed — index scan aborted" stopped the loop): open it first.
@@ -2996,7 +3064,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (fraction >= 0.45f || now < _esRetreatUntil) return false;
         var center = EncounterCenter();
         var away = ctx.Game.Player.GridPosNum - center;
-        var target = ctx.Game.Player.GridPosNum + (away.Length() > 1 ? Vector2.Normalize(away) : new Vector2(1, 0)) * 45;
+        var target = ctx.Game.Player.GridPosNum + DuoBiasedAway(ctx, away) * 45;
         var walk = ctx.Navigation.FindNearestWalkable(ctx.Game, target, 8) ?? target;
         _esRetreatUntil = now.AddSeconds(5);
         ctx.Combat.Suspend(); ctx.Navigation.Stop(ctx.Game); _destination = null; Navigate(ctx, walk);
@@ -3018,6 +3086,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             : ctx.Game.EntityListWrapper.OnlyValidEntities.Where(e => Run.Bosses.ContainsKey(e.Id) && e.IsAlive && e.IsTargetable).ToList();
         var closest = alive.OrderBy(e => Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum)).FirstOrDefault();
         if (closest == null) { if (regular) Explore(ctx); else SetPhase(AwakeningPhase.Scout, "boss_not_observable"); return; }
+        // 2026-09-26 (user): the build relies on the Aurabot's auras/Soul Link; boss fights happened outside its range.
+        if (!regular && DuoRegroup(ctx, now)) return;
         if (Vector2.Distance(ctx.Game.Player.GridPosNum, closest.GridPosNum) > ctx.Settings.Build.CombatRange.Value)
         { Navigate(ctx, closest.GridPosNum); return; }
         if (!regular)
@@ -3047,7 +3117,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             {
                 _bossBackOffAt = now;
                 var away = ctx.Game.Player.GridPosNum - closest.GridPosNum;
-                var to = ctx.Game.Player.GridPosNum + (away.Length() > 1 ? Vector2.Normalize(away) : new Vector2(1, 0)) * Math.Max(18f, 50f - bossDistance);
+                var dir = DuoBiasedAway(ctx, away);
+                var to = ctx.Game.Player.GridPosNum + dir * Math.Max(18f, 50f - bossDistance);
                 var walkable = ctx.Navigation.FindNearestWalkable(ctx.Game, to, 6) ?? to;
                 ctx.Combat.Suspend(); ctx.Navigation.Stop(ctx.Game); _destination = null;
                 _relocating = true; _moveAt = now; Navigate(ctx, walkable);
@@ -3075,7 +3146,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             (!regular && (now - _bossPositionSince).TotalSeconds >= 3))
         {
             ctx.Combat.Suspend(); BotInput.ReleaseAllKeys();
-            if (ctx.Combat.TryGetOptimalRangedPosition(ctx, out var next) && Vector2.Distance(next, ctx.Game.Player.GridPosNum) > 8)
+            if (ctx.Combat.TryGetOptimalRangedPosition(ctx, out var next) && Vector2.Distance(next, ctx.Game.Player.GridPosNum) > 8
+                && !(_duoActive && PartnerSameArea(ctx) && Vector2.Distance(next, ctx.Duo.Last!.Pos) > ctx.Settings.Duo.AuraRadius.Value * 0.75f))
             {
                 _relocating = true; _moveAt = now; Navigate(ctx, next);
                 _log.Event(Run, "spark.reposition", new { reason = "boss_damage_or_position_deadline", next.X, next.Y }); return;

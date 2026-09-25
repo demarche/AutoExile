@@ -133,10 +133,44 @@ namespace AutoExile
         private bool _buffScanWaitingForCast;
         private const float BuffScanTimeoutSeconds = 8f;
 
+        // 2026-09-26 05:56:57 JST: the HUD stopped (web API gone, logs cut mid-line, no [ERR]) and the loop sat idle
+        // for an hour. Record managed crashes and a memory trail so the next one can be diagnosed: Plugins/Source/
+        // AutoExile/Diagnostics/crash.log (unhandled / unobserved exceptions, process exit) and memory.log (every 5 min).
+        private static System.Threading.Timer? _diagTimer;
+        private static bool _diagInstalled;
+        private void InstallCrashDiagnostics()
+        {
+            if (_diagInstalled) return;
+            _diagInstalled = true;
+            try
+            {
+                var dir = Path.Combine(DirectoryFullName, "Diagnostics");
+                Directory.CreateDirectory(dir);
+                var crash = Path.Combine(dir, "crash.log");
+                var memory = Path.Combine(dir, "memory.log");
+                void Write(string file, string line) { try { File.AppendAllText(file, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} pid={Environment.ProcessId} {line}{Environment.NewLine}"); } catch { } }
+                Write(crash, "started");
+                AppDomain.CurrentDomain.UnhandledException += (_, e) => Write(crash, $"UNHANDLED terminating={e.IsTerminating}: {e.ExceptionObject}");
+                System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, e) => Write(crash, $"UNOBSERVED task: {e.Exception}");
+                AppDomain.CurrentDomain.ProcessExit += (_, _) => Write(crash, "process exit");
+                _diagTimer = new System.Threading.Timer(_ =>
+                {
+                    try
+                    {
+                        using var p = System.Diagnostics.Process.GetCurrentProcess();
+                        Write(memory, $"ws={p.WorkingSet64 / 1048576}MB private={p.PrivateMemorySize64 / 1048576}MB managed={GC.GetTotalMemory(false) / 1048576}MB handles={p.HandleCount} threads={p.Threads.Count}");
+                    }
+                    catch { }
+                }, null, TimeSpan.FromSeconds(10), TimeSpan.FromMinutes(5));
+            }
+            catch { }
+        }
+
         public override bool Initialise()
         {
             Name = "AutoExile";
             Instance = this;
+            InstallCrashDiagnostics();
             LogLoadedAssemblyDiagnostics();
             _recorder.SetOutputDir(Path.Combine(DirectoryFullName, "Recordings"));
             _mavenRecorder.Initialize(DirectoryFullName);
