@@ -84,10 +84,41 @@ Write-Host "      killed $($procs.Count) process(es)."
 Write-Host '[2/4] Starting Loader.exe ...'
 Start-Process -FilePath $loader -WorkingDirectory $root | Out-Null
 
+# 2026-09-24 (user): the new Loader asks "Hud process is already running" -> answer はい (Yes); "Failed to create mutex"
+# exception boxes -> OK. Answered by posting WM_COMMAND to the dialogs of this session's Loader (works without focus).
+try {
+    Add-Type -Namespace AeDlg -Name W -MemberDefinition @"
+public delegate bool EnumProc(System.IntPtr h, System.IntPtr l);
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, System.IntPtr l);
+[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(System.IntPtr h, System.Text.StringBuilder s, int n);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr h, out uint pid);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr h);
+[DllImport("user32.dll")] public static extern bool PostMessage(System.IntPtr h, uint m, System.IntPtr w, System.IntPtr l);
+"@ -ErrorAction SilentlyContinue
+} catch { }
+function Answer-LoaderDialogs {
+    $ids = @(MyLoaders | ForEach-Object { [uint32]$_.Id })
+    if ($ids.Count -eq 0) { return }
+    $found = New-Object System.Collections.ArrayList
+    $cb = [AeDlg.W+EnumProc]{ param($h, $l)
+        $procId = [uint32]0; [AeDlg.W]::GetWindowThreadProcessId($h, [ref]$procId) | Out-Null
+        if ($ids -contains $procId -and [AeDlg.W]::IsWindowVisible($h)) {
+            $sb = New-Object System.Text.StringBuilder 256; [AeDlg.W]::GetWindowText($h, $sb, 256) | Out-Null
+            [void]$found.Add(@($h, $sb.ToString()))
+        }
+        return $true }
+    try { [AeDlg.W]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null } catch { return }
+    foreach ($w in $found) {
+        if ($w[1] -like 'Hud process is already running*') { [AeDlg.W]::PostMessage($w[0], 0x0111, [IntPtr]6, [IntPtr]::Zero) | Out-Null; Write-Host '      answered Yes: Hud process is already running' }
+        elseif ($w[1] -eq 'Exception') { [AeDlg.W]::PostMessage($w[0], 0x0111, [IntPtr]1, [IntPtr]::Zero) | Out-Null; Write-Host '      answered OK: Exception dialog' }
+    }
+}
+
 Write-Host '[3/4] Waiting for the plugin control API (compile + load) ...'
 $status = $null; $deadline = (Get-Date).AddSeconds($TimeoutSec)
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 2
+    try { Answer-LoaderDialogs } catch { }
     $status = Get-Status
     if ($status -and $status.awakening -and $status.awakening.loadedMvid -and $status.awakening.hostProcessId -ne $oldPid) { break }
     $status = $null

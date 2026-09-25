@@ -485,7 +485,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _uniqueEvidence.Clear();
             _scoutRepositionUntil = DateTime.MinValue;
             _deviceMaterialPaths.Clear();
-            _materialIndex = 0; _materialRetries = 0; _withdrawing = false; _indexStarted = false; _lootId = 0;
+            _materialIndex = 0; _materialRetries = 0; _withdrawing = false; _withdrawRetries = 0; _indexStarted = false; _lootId = 0;
             _lootAttempts.Clear(); _unblockAttempts.Clear(); _scoutIgnored.Clear(); _beastIgnored.Clear(); _beastId = 0; _scoutStalls.Clear(); _lootSkipped.Clear(); _lootInterrupted = false; _enRouteLoot = false; _pushIgnoredUntil.Clear(); _dropSiteReached = false; _restockTried = false; _listingChecked = false; _mapChecks.Clear(); _lootDecisions.Clear(); _unreadableLoot.Clear(); _missingVisits.Clear(); _destination = null; _relocating = false;
             _lastClock = Stopwatch.GetTimestamp(); _phaseAt = DateTime.UtcNow; _lastPosition = ctx.Game.Player.GridPosNum;
             _lastProgress = DateTime.UtcNow; _damage.Reset(DateTime.UtcNow);
@@ -844,6 +844,33 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         // A death is not a reason to stop the Insert loop: recover to the Hideout (below), then
         // Return() re-enters via ContinueAfterDeath() until the supplies are gone.
+        // 2026-09-23 23:00: an unattended night stopped on "withdraw_failed:Timed out in phase: OpenStash" in the Hideout
+        // (focus loss) and waited hours for a human. Hideout logistics failures before any map activation are safe to retry:
+        // restart the loop (max 3 per hour) instead of parking in AwaitingReview.
+        if (_manualContinuous && outcome == AttemptOutcome.OperationalFailure && !Run.ActivationRequested && !Run.ActivationConfirmed &&
+            Supervisor.StorageError.Length == 0 && ctx.Game.Area?.CurrentArea?.IsHideout == true &&
+            Regex.IsMatch(reason, @"^(withdraw_failed|withdraw_missing_material|phase_timeout:(Prepare|Withdraw|OpenStash|IndexStash|ExternalStash|OpenMap)|stash_index_failed|exception)"))
+        {
+            _logisticsRetries.RemoveAll(t => (DateTime.UtcNow - t).TotalMinutes > 60);
+            if (_logisticsRetries.Count < 3)
+            {
+                _logisticsRetries.Add(DateTime.UtcNow);
+                string Send(string action, string review = "") => Command(ctx, action, Guid.NewGuid().ToString("N"), Supervisor.Generation, review, Supervisor.Mvid);
+                var ack = Send("review", AwakeningJson.Serialize(new {
+                    observations = "Hideout logistics failure before map activation: " + reason,
+                    diagnosis = "Transient (focus loss / stash UI timing); no map was opened, nothing is at risk",
+                    changes = "None", validation = "Automatic retry " + _logisticsRetries.Count + "/3 per hour",
+                    nextAction = "Restart the attempt from Prepare" }));
+                if (!ack.StartsWith("rejected:") && !Supervisor.State.Armed) ack = Send("arm");
+                if (!ack.StartsWith("rejected:")) ack = Send("begin");
+                if (!ack.StartsWith("rejected:"))
+                {
+                    _log.Event(Run, "manual_loop.continued", new { reason = "logistics_retry:" + reason, retries = _logisticsRetries.Count });
+                    return;
+                }
+                Status = ack;
+            }
+        }
         var strayMap = reason == "unexpected_map_before_activation" && _strayMapRecoveries++ < 5;
         if (_manualContinuous && (outcome is (AttemptOutcome.Death or AttemptOutcome.Timeout) || strayMap) && ctx.Settings.Awakening.ContinueAfterDeath.Value && Supervisor.StorageError.Length == 0)
             _log.Event(Run, "manual_loop.death_recovery", new { reason, Run.Deaths, Run.Instance, Run.RevenueChaos });
@@ -887,6 +914,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         catch { }
         _runLoot.Clear(); _runEscapes = 0;
     }
+    private readonly List<DateTime> _logisticsRetries = new();
     private void StopContinuousLoop(string reason)
     {
         if (!_manualContinuous) return;
@@ -1606,6 +1634,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         foreach (var m in materials) _bidPending.Remove(m.Name);
         _log.Event(Run, "recipe.resolved", materials); SetPhase(AwakeningPhase.Withdraw, "withdraw_exact_recipe");
     }
+    private int _withdrawRetries;
     private void Withdraw(BotContext ctx)
     {
         ctx.Stash.ApplyIncubators = false;
@@ -1616,9 +1645,17 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (_withdrawing)
         {
             var result = ctx.Stash.Tick(ctx.Game, ctx.Navigation); Status = ctx.Stash.Status;
-            if (result == StashResult.Failed) { Finish(ctx, AttemptOutcome.OperationalFailure, "withdraw_failed:" + Status); return; }
+            if (result == StashResult.Failed)
+            {
+                // 2026-09-23 14:00: "Timed out in phase: OpenStash" (stash label off screen while the game lost focus)
+                // ended the session. Retry the withdrawal twice, then re-index the stash, before giving up.
+                ctx.Stash.Cancel(ctx.Game, ctx.Navigation); _withdrawing = false;
+                if (++_withdrawRetries <= 2) { _log.Event(Run, "withdraw.retry", new { Status, retry = _withdrawRetries }); _phaseAt = DateTime.UtcNow; return; }
+                if (_withdrawRetries <= 3) { _log.Event(Run, "withdraw.reindex", new { Status }); _indexStarted = false; ctx.StashIndex.Reset(); SetPhase(AwakeningPhase.IndexStash, "withdraw_failed_reindex"); return; }
+                Finish(ctx, AttemptOutcome.OperationalFailure, "withdraw_failed:" + Status); return;
+            }
             if (result != StashResult.Succeeded) return;
-            ctx.Stash.Cancel(ctx.Game, ctx.Navigation); _withdrawing = false;
+            ctx.Stash.Cancel(ctx.Game, ctx.Navigation); _withdrawing = false; _withdrawRetries = 0;
             inv = AwakeningGameReader.Inventory(ctx.Game);
             if (!inv.Valid || inv.Counts.GetValueOrDefault(Run.Recipe[_materialIndex].Path) < 1)
             { Finish(ctx, AttemptOutcome.OperationalFailure, "withdraw_missing_material"); return; }
