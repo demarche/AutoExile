@@ -31,6 +31,7 @@ public sealed class AwakeningExchange
     private readonly Action<string, object> _log;
     private readonly Queue<Keys> _keys = new();
     private int _fillAttempts, _collectClicks;
+    private bool _collectedWant;
     private int _orderWant, _orderHave;
     private string _searched = "";
     private int _placeClicks, _slotsBefore;
@@ -93,6 +94,12 @@ public sealed class AwakeningExchange
             case Step.CollectResult:
                 if (!CollectFinished(gc, panel!))
                 {
+                    // 2026-09-26 04:10 JST: the order's Chaos change ("168") showed up first; the bought Scarabs ("5") only
+                    // appeared a moment later, after Done. They stayed at Faustus, the index found none and a second
+                    // 745c order was placed. Wait (≤8 s) until a slot with the bought quantity has been collected.
+                    if (_request.Kind == ExchangeKind.BuyAtAsk && !_collectedWant && (DateTime.UtcNow - _stepAt).TotalSeconds < 8)
+                    { Status = "Faustus: waiting for the bought items to appear"; break; }
+                    if (_request.Kind == ExchangeKind.BuyAtAsk && !_collectedWant) _log("exchange.bought_items_not_seen", new { _request, _orderWant });
                     _log("exchange.done", new { _request, FilledWant, PaidHave, UnitChaos });
                     Set(Step.Done, $"bought/sold {FilledWant} {_request.WantName} for {PaidHave} {_request.HaveName}");
                 }
@@ -142,7 +149,11 @@ public sealed class AwakeningExchange
         var slots = FinishedSlots(panel);
         if (slots.Count == 0) return false;
         var (slot, count) = slots[0];
-        if (BotInput.CtrlRightClick(Abs(gc, slot.GetClientRect().Center))) { _actionAt = DateTime.UtcNow; _collectClicks++; _log("exchange.collect_click", new { count, rect = slot.GetClientRect().ToString() }); }
+        if (BotInput.CtrlRightClick(Abs(gc, slot.GetClientRect().Center)))
+        {
+            _actionAt = DateTime.UtcNow; _collectClicks++; _log("exchange.collect_click", new { count, rect = slot.GetClientRect().ToString() });
+            if (_step == Step.CollectResult && count == _orderWant.ToString()) _collectedWant = true;
+        }
         Status = "collecting a finished order"; return true;
     }
 
@@ -342,7 +353,7 @@ public sealed class AwakeningExchange
         { if ((DateTime.UtcNow - _stepAt).TotalSeconds > 2) Set(Step.Done, "order placed (fills later)"); return; }
         if (FinishedSlots(panel).Count == 0) { Status = "waiting for the order to fill"; return; }
         FilledWant = _orderWant; PaidHave = _orderHave;
-        _collectClicks = 0; Set(Step.CollectResult, "collecting");
+        _collectClicks = 0; _collectedWant = false; Set(Step.CollectResult, "collecting");
     }
 
     // ── helpers ──
