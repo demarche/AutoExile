@@ -2578,8 +2578,21 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var hint = ctx.Game.IngameState.Data.TileEntities?.FirstOrDefault(e => e?.Path != null && AwakeningBossTracker.Classify(e.Path, e.RenderName ?? "").HasValue
             && !Run.Visited.Any(p => Vector2.Distance(new(p[0], p[1]), e.GridPosNum) < 25));
         if (hint != null) { Navigate(ctx, hint.GridPosNum); return; }
+        // 2026-09-26 05:14 JST: Twisted group, 3 of 4 bosses DeadConfirmed, "rewritten" Missing; exploration was exhausted
+        // and the bot idled for 10+ minutes ("Exploration exhausted; no verified complete encounter"). After 90 s of
+        // exhausted exploration with only Missing bosses left, loot what died and finish the map.
+        if (!Run.BossesCompleted && _missingGiveUpAttempt != Run.AttemptId && _exhaustedSince != DateTime.MinValue
+            && (DateTime.UtcNow - _exhaustedSince).TotalSeconds > 90 && Run.Bosses.Count > 0
+            && Run.Bosses.Values.Any(b => b.Life == BossLife.DeadConfirmed)
+            && Run.Bosses.Values.All(b => b.Life is BossLife.DeadConfirmed or BossLife.Missing))
+        {
+            _missingGiveUpAttempt = Run.AttemptId;
+            _log.Event(Run, "scout.missing_boss_give_up", new { bosses = Run.Bosses.Values.Select(b => b.Member + ":" + b.Life).ToArray(), exhaustedSeconds = (DateTime.UtcNow - _exhaustedSince).TotalSeconds });
+        }
+        if (!Run.BossesCompleted && _missingGiveUpAttempt == Run.AttemptId) { CompleteBosses(ctx); return; }
         Explore(ctx);
     }
+    private DateTime _exhaustedSince = DateTime.MinValue; private string _missingGiveUpAttempt = "";
     private static bool IsBearer(Entity e)
     {
         if ((e.Path?.Contains("bearer", StringComparison.OrdinalIgnoreCase) ?? false) || (e.RenderName?.Contains("bearer", StringComparison.OrdinalIgnoreCase) ?? false)) return true;
@@ -2870,8 +2883,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         TravelSustain(ctx); ctx.Exploration.Update(ctx.Game.Player.GridPosNum);
         if (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding) return;
         var target = ctx.Exploration.GetNextExplorationTarget(ctx.Game.Player.GridPosNum);
-        if (target.HasValue) Navigate(ctx, target.Value);
-        else { Status = "Exploration exhausted; no verified complete encounter"; }
+        if (target.HasValue) { _exhaustedSince = DateTime.MinValue; Navigate(ctx, target.Value); }
+        else
+        {
+            if (_exhaustedSince == DateTime.MinValue) _exhaustedSince = DateTime.UtcNow;
+            Status = "Exploration exhausted; no verified complete encounter";
+        }
     }
     private void Navigate(BotContext ctx, Vector2 target)
     {

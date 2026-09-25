@@ -28,7 +28,12 @@ public static class AwakeningMapPolicy
         // 2026-09-22 (user decision): Spark is a spell; suppression halves its damage (death on 04:41).
         ("spell_suppress", "Monsters have +#% chance to Suppress Spell Damage", @"spell_suppression|Suppress Spell Damage"),
         // 2026-09-22 (user decision): every "Area has patches of ... Ground" map mod (death rate 2/2).
-        ("ground_patches", "Area has patches of # Ground", @"map_ground_effect_patches|map_ground_\w+_base_magnitude|patches of \w+ Ground")
+        ("ground_patches", "Area has patches of # Ground", @"map_ground_effect_patches|map_ground_\w+_base_magnitude|patches of \w+ Ground"),
+        // 2026-09-26 (autonomous improvement loop, user asleep; revert by deleting these two lines):
+        // 157 maps since 09-22 — "2 additional Projectiles": 45 maps, 2.09 deaths/map, net +41c vs 1.64 / +90c without.
+        ("multiple_projectiles", "Monsters fire # additional Projectiles", @"MapMonsterMultipleProjectiles|additional Projectiles"),
+        // Originator-influenced (Uber) T16s carry 9 harder mods: 2/2 failed (3 deaths each, -125c/map).
+        ("originator_uber", "Area is Influenced by the Originator's Memories", @"MapZanaInfluenced|MapUberMod|MapUberWeak|Originator.?s Memories")
     ];
 
     public static List<string> Rejections(MapObservation map)
