@@ -393,6 +393,16 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             Supervisor.State.Run = new() { PriorPortalIds = StrictMapRecipe.Portals(ctx.Game).Select(p => (long)p.Id).ToList() };
             return Supervisor.RecordCommand(id, "fresh_map_ready");
         }
+        if (action == "beast_list")
+        {
+            // List the itemised beasts already in the inventory at Faustus now (no Menagerie trip), then stop.
+            if (mvid != Supervisor.Mvid || ctx.Settings.Running.Value) return "rejected: stopped verified build required";
+            if (ctx.Game.Area?.CurrentArea?.IsHideout != true) return "rejected: hideout required";
+            _beastOnly = true; _beastTripAt = DateTime.UtcNow; _beastSessionChecked = true; _beastListAttemptAt = DateTime.MinValue;
+            ManualStart(ctx, "beast_list");
+            if (!(_manualContinuous && ctx.Settings.Running.Value)) { _beastOnly = false; return "rejected: " + Status; }
+            return Supervisor.RecordCommand(id, "beast_list_started");
+        }
         if (action == "beast_trip")
         {
             // Itemise + list the valuable captured beasts now, then stop (no map is opened).
@@ -2195,7 +2205,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                     LoadBeastPrices();
                     var name = AwakeningBeastSeller.CapturedName(item);
                     // A hair under poe.ninja so it sells quickly (Merchant listings are locked for a while once placed).
-                    return _beastPrices.TryGetValue(name, out var v) && v >= BeastMinChaos ? Math.Floor(v * 0.9) : 0;
+                    return _beastPrices.TryGetValue(name, out var v) && v >= BeastMinChaos ? Math.Max(1, Math.Floor(v) - 1) : 0; // user 2026-09-25: poe.ninja price - 1c
                 });
                 return true;
             }
@@ -2215,7 +2225,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             {
                 LoadBeastPrices();
                 var name = AwakeningBeastSeller.CapturedName(item);
-                return _beastPrices.TryGetValue(name, out var v) && v >= BeastMinChaos ? Math.Floor(v * 0.9) : 0;
+                return _beastPrices.TryGetValue(name, out var v) && v >= BeastMinChaos ? Math.Max(1, Math.Floor(v) - 1) : 0; // user 2026-09-25: poe.ninja price - 1c
             });
             return true;
         }

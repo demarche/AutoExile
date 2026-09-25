@@ -19,7 +19,7 @@ public sealed class AwakeningBeastSeller
 {
     public const string ItemisedPath = "Metadata/Items/Currency/CurrencyItemisedCapturedMonster";
     private enum Step { Idle, GoMenagerie, WalkToEinhar, OpenBestiary, OpenCaptured, Filter, Scan, Itemise, Verify, GoHome,
-        OpenShop, PickItem, SetPrice, CheckCurrency, PickCurrency, ClickList, ListVerify, Earnings, CollectEarnings, CloseShop, Done, Failed }
+        OpenShop, SelectTab, PickItem, SetPrice, CheckCurrency, PickCurrency, ClickList, ListVerify, Earnings, CollectEarnings, CloseShop, Done, Failed }
     private const string FaustusPath = "Metadata/NPC/League/Kalguur/VillageFaustusHideout";
     private Step _step = Step.Idle;
     private DateTime _stepAt, _startedAt, _actionAt, _keyAt;
@@ -68,7 +68,7 @@ public sealed class AwakeningBeastSeller
     public double ListedChaos { get; private set; }
     public void StartList(Func<Entity, double> priceOf)
     {
-        _priceOf = priceOf; _listTried.Clear(); Listed = 0; ListedChaos = 0; FailReason = ""; _keys.Clear(); _collectOnly = false; EarningsCollected = 0;
+        _priceOf = priceOf; _listTried.Clear(); _tabIdx = -1; _tabSwitches = 0; Listed = 0; ListedChaos = 0; FailReason = ""; _keys.Clear(); _collectOnly = false; EarningsCollected = 0;
         _startedAt = DateTime.UtcNow; Set(Step.OpenShop, "opening Faustus' shop");
         _log("shop.list_started", new { });
     }
@@ -109,6 +109,7 @@ public sealed class AwakeningBeastSeller
             case Step.Scan: TickScan(gc); return;
             case Step.Verify: TickVerify(gc); return;
             case Step.OpenShop: TickOpenShop(ctx); return;
+            case Step.SelectTab: TickSelectTab(gc); return;
             case Step.PickItem: TickPickItem(gc); return;
             case Step.SetPrice: TickSetPrice(gc); return;
             case Step.CheckCurrency: TickCheckCurrency(gc); return;
@@ -306,7 +307,7 @@ public sealed class AwakeningBeastSeller
         return name.Contains(' '); // one-word names ("Parasite") also match whole families: require the tooltip
     }
     private static string Normalize(string s) => s.Replace("ó", "o").Replace("Ó", "O").Trim().ToLowerInvariant();
-    private static bool IsListStep(Step s) => s is Step.OpenShop or Step.PickItem or Step.SetPrice or Step.CheckCurrency or Step.PickCurrency or Step.ClickList or Step.ListVerify or Step.Earnings or Step.CollectEarnings or Step.CloseShop;
+    private static bool IsListStep(Step s) => s is Step.OpenShop or Step.SelectTab or Step.PickItem or Step.SetPrice or Step.CheckCurrency or Step.PickCurrency or Step.ClickList or Step.ListVerify or Step.Earnings or Step.CollectEarnings or Step.CloseShop;
     private int _earningClicks; private bool _collectOnly;
     public int EarningsCollected { get; private set; }
     /// <summary>Visit the shop only to empty the "Earnings (Remove-only)" tab (sold listings pay out there).</summary>
@@ -354,7 +355,7 @@ public sealed class AwakeningBeastSeller
     private void TickOpenShop(BotContext ctx)
     {
         var gc = ctx.Game;
-        if (ShopPanel(gc) != null && gc.IngameState.IngameUi.InventoryPanel?.IsVisible == true) { ctx.Interaction.Cancel(gc); Set(Step.PickItem, "choosing an item"); return; }
+        if (ShopPanel(gc) != null && gc.IngameState.IngameUi.InventoryPanel?.IsVisible == true) { ctx.Interaction.Cancel(gc); Set(_collectOnly ? Step.PickItem : Step.SelectTab, "choosing the shop tab"); return; }
         var dialog = gc.IngameState.IngameUi.NpcDialog;
         if (dialog?.IsVisible == true)
         {
@@ -368,6 +369,59 @@ public sealed class AwakeningBeastSeller
         ctx.Interaction.InteractWithEntity(npc, ctx.Navigation, requireProximity: true);
         _actionAt = DateTime.UtcNow;
     }
+    // User (2026-09-25): list into Shop → "10c-" first, then the following tabs in order when one is full.
+    public string FirstTab { get; set; } = "10c";
+    private int _tabIdx = -1, _tabSwitches;
+    private List<Element> ShopTabs(GameController gc)
+    {
+        var tabs = new List<Element>();
+        var root = ShopPanel(gc)?.Parent;
+        var instant = root == null ? null : Find(root, e => e.IsVisible && Text(e) == "Instant");
+        if (instant == null) return tabs;
+        var y = instant.GetClientRect().Center.Y;
+        void Walk(Element e, int d)
+        {
+            if (d > 12) return;
+            IList<Element>? kids = null; try { kids = e.Children; } catch { }
+            if (kids == null) return;
+            foreach (var c in kids)
+            {
+                if (c == null || !c.IsVisible) continue;
+                var t = Text(c).Trim();
+                if (t.Length is > 0 and <= 12 && t != "+" && Math.Abs(c.GetClientRect().Center.Y - y) < 12) tabs.Add(c);
+                Walk(c, d + 1);
+            }
+        }
+        Walk(root!, 0);
+        return tabs.GroupBy(t => Text(t).Trim()).Select(g => g.First()).OrderBy(t => t.GetClientRect().X).ToList();
+    }
+    private void TickSelectTab(GameController gc)
+    {
+        if (ShopPanel(gc) == null) { Set(Step.OpenShop, "shop closed, reopening"); return; }
+        var tabs = ShopTabs(gc);
+        if (tabs.Count == 0) { _log("shop.tabs_not_found", new { }); Set(Step.PickItem, "choosing an item"); return; }
+        var names = tabs.Select(t => Text(t).Trim()).ToList();
+        if (_tabIdx < 0)
+        {
+            _tabIdx = names.FindIndex(n => n.StartsWith(FirstTab, StringComparison.OrdinalIgnoreCase));
+            if (_tabIdx < 0) _tabIdx = 0;
+        }
+        if (_tabSwitches > tabs.Count) { CloseShop("all_tabs_full"); return; }
+        var tab = tabs[_tabIdx % tabs.Count];
+        if (BotInput.Click(Abs(gc, tab.GetClientRect().Center)))
+        {
+            _actionAt = DateTime.UtcNow.AddMilliseconds(500);
+            _log("shop.tab_selected", new { tab = Text(tab).Trim(), tabs = names });
+            Set(Step.PickItem, "choosing an item");
+        }
+    }
+    /// <summary>The current tab would not take the item (no price dialog / listing not confirmed): try the next tab.</summary>
+    private void NextTab(string reason)
+    {
+        _tabIdx++; _tabSwitches++;
+        _log("shop.next_tab", new { reason, _tabIdx, _tabSwitches });
+        Set(Step.SelectTab, "next shop tab");
+    }
     private void TickPickItem(GameController gc)
     {
         if (PriceDialog(gc) != null) { Set(Step.SetPrice, "pricing"); return; }
@@ -379,14 +433,24 @@ public sealed class AwakeningBeastSeller
         _listTried.Add(item.Item.Id);
         if (price < 1) { _log("shop.no_price", new { name = MonsterName(item.Item) }); return; }
         _listPrice = (int)Math.Floor(price); _listItemId = item.Item.Id; _itemsBefore = CountItemised(gc);
-        // User (2026-09-23): items are put up at Faustus' Merchant with Ctrl+RIGHT-click (Ctrl+left-click did nothing).
-        if (BotInput.CtrlRightClick(Abs(gc, item.GetClientRect().Center)))
+        // Verified live 2026-09-25: Ctrl+LEFT-click on the orb with the Merchant open shows "Set Item Price"
+        // (Ctrl+right-click shows nothing).
+        if (BotInput.CtrlClick(Abs(gc, item.GetClientRect().Center)))
         { _actionAt = DateTime.UtcNow.AddMilliseconds(300); _log("shop.item_clicked", new { name = MonsterName(item.Item), price = _listPrice }); Set(Step.SetPrice, "waiting for the price dialog"); }
     }
     private void TickSetPrice(GameController gc)
     {
         var dialog = PriceDialog(gc);
-        if (dialog == null) { if ((DateTime.UtcNow - _stepAt).TotalSeconds > 4) { _log("shop.price_dialog_missing", new { }); Set(Step.PickItem, "next item"); } return; }
+        if (dialog == null)
+        {
+            if ((DateTime.UtcNow - _stepAt).TotalSeconds > 4)
+            {
+                _log("shop.price_dialog_missing", new { });
+                _listTried.Remove(_listItemId); // retry the same item in the next tab
+                NextTab("price_dialog_missing");
+            }
+            return;
+        }
         var field = PriceRow(dialog)?.GetChildAtIndex(0);
         var typed = Text(field).Trim();
         if (typed == _listPrice.ToString(System.Globalization.CultureInfo.InvariantCulture)) { Set(Step.CheckCurrency, "checking the currency"); return; }
@@ -423,6 +487,9 @@ public sealed class AwakeningBeastSeller
         var picker = PriceRow(dialog)?.GetChildAtIndex(1);
         var text = CurrencyText(picker);
         if (text.Contains("Chaos", StringComparison.OrdinalIgnoreCase)) { Set(Step.ClickList, "listing"); return; }
+        // 2026-09-25 (verified on screen twice): the picker opens on "Chaos Orb" by default, but its label is drawn
+        // without a readable Text (the dump shows no text under the picker). An empty picker = untouched default = Chaos.
+        if (text.Length == 0) { _log("shop.currency_default_chaos", new { }); Set(Step.ClickList, "listing"); return; }
         _log("shop.currency_unknown", new { text, dump = DumpTree(dialog) });
         // Not provably Chaos: open the picker once and choose "Chaos Orb"; never list in an unverified currency.
         if (picker != null && BotInput.Click(Abs(gc, picker.GetClientRect().Center))) { _actionAt = DateTime.UtcNow.AddMilliseconds(400); Set(Step.PickCurrency, "choosing Chaos Orb"); }
