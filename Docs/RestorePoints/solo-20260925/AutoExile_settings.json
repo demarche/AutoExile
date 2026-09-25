@@ -1,0 +1,2194 @@
+{
+  "Enable": {
+    "Value": true,
+    "AttachedHotkey": {
+      "ValueV2": {
+        "ControllerKey": "None",
+        "ControllerModifierKey": "None",
+        "Key": "None",
+        "Win": false
+      }
+    }
+  },
+  "Running": {
+    "Value": false,
+    "AttachedHotkey": {
+      "ValueV2": {
+        "ControllerKey": "None",
+        "ControllerModifierKey": "None",
+        "Key": "None",
+        "Win": false
+      }
+    }
+  },
+  "ToggleRunning": {
+    "Value": 45
+  },
+  "TestMapExplore": {
+    "Value": 116
+  },
+  "DumpGameState": {
+    "Value": 117
+  },
+  "DumpRecording": {
+    "Value": 118
+  },
+  "ScanTileSignatures": {
+    "Value": 119
+  },
+  "RecordGameplay": {
+    "Value": 120
+  },
+  "ActiveMode": {
+    "Value": "Awakening Boss Rush"
+  },
+  "ActionCooldownMs": {
+    "Value": 50
+  },
+  "ExtraLatencyMs": {
+    "Value": 30
+  },
+  "MaxClickAttempts": {
+    "Value": 5
+  },
+  "WebUiEnabled": {
+    "Value": true,
+    "AttachedHotkey": {
+      "ValueV2": {
+        "ControllerKey": "None",
+        "ControllerModifierKey": "None",
+        "Key": "None",
+        "Win": false
+      }
+    }
+  },
+  "WebUiPort": {
+    "Value": 9876
+  },
+  "WebUiNetworkAccess": {
+    "Value": true,
+    "AttachedHotkey": {
+      "ValueV2": {
+        "ControllerKey": "None",
+        "ControllerModifierKey": "None",
+        "Key": "None",
+        "Win": false
+      }
+    }
+  },
+  "AutoLevelGems": {
+    "Value": true,
+    "AttachedHotkey": {
+      "ValueV2": {
+        "ControllerKey": "None",
+        "ControllerModifierKey": "None",
+        "Key": "None",
+        "Win": false
+      }
+    }
+  },
+  "AutoApplyIncubators": {
+    "Value": true,
+    "AttachedHotkey": {
+      "ValueV2": {
+        "ControllerKey": "None",
+        "ControllerModifierKey": "None",
+        "Key": "None",
+        "Win": false
+      }
+    }
+  },
+  "DebugIncubatorOverlay": {
+    "Value": false,
+    "AttachedHotkey": {
+      "ValueV2": {
+        "ControllerKey": "None",
+        "ControllerModifierKey": "None",
+        "Key": "None",
+        "Win": false
+      }
+    }
+  },
+  "DebugPerfOverlay": {
+    "Value": false,
+    "AttachedHotkey": {
+      "ValueV2": {
+        "ControllerKey": "None",
+        "ControllerModifierKey": "None",
+        "Key": "None",
+        "Win": false
+      }
+    }
+  },
+  "InteractRadius": {
+    "Value": 20
+  },
+  "AreaSettleSeconds": {
+    "Value": 3.0
+  },
+  "Build": {
+    "BlinkRange": {
+      "Value": 15
+    },
+    "DashMinDistance": {
+      "Value": 48
+    },
+    "PathMergeThreshold": {
+      "Value": 4
+    },
+    "Skill1": {
+      "Key": {
+        "Value": 84
+      },
+      "Role": {
+        "Value": "Disabled"
+      },
+      "Priority": {
+        "Value": 5
+      },
+      "CanCrossTerrain": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "TargetFilter": {
+        "Value": "Any"
+      },
+      "MinNearbyEnemies": {
+        "Value": 0
+      },
+      "MaxTargetRange": {
+        "Value": 0
+      },
+      "OnlyWhenBuffMissing": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "OnlyOnLowLife": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "SummonRecast": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MinCastIntervalMs": {
+        "Value": 0
+      },
+      "RequireTargetable": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "IsChannel": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "BuffDebuffName": {
+        "Value": ""
+      }
+    },
+    "Skill2": {
+      "Key": {
+        "Value": 81
+      },
+      "Role": {
+        "Value": "MovementSkill"
+      },
+      "Priority": {
+        "Value": 5
+      },
+      "CanCrossTerrain": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "TargetFilter": {
+        "Value": "Any"
+      },
+      "MinNearbyEnemies": {
+        "Value": 0
+      },
+      "MaxTargetRange": {
+        "Value": 0
+      },
+      "OnlyWhenBuffMissing": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "OnlyOnLowLife": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "SummonRecast": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MinCastIntervalMs": {
+        "Value": 1000
+      },
+      "RequireTargetable": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "IsChannel": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "BuffDebuffName": {
+        "Value": ""
+      }
+    },
+    "Skill3": {
+      "Key": {
+        "Value": 87
+      },
+      "Role": {
+        "Value": "Enemy"
+      },
+      "Priority": {
+        "Value": 10
+      },
+      "CanCrossTerrain": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "TargetFilter": {
+        "Value": "Any"
+      },
+      "MinNearbyEnemies": {
+        "Value": 0
+      },
+      "MaxTargetRange": {
+        "Value": 0
+      },
+      "OnlyWhenBuffMissing": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "OnlyOnLowLife": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "SummonRecast": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MinCastIntervalMs": {
+        "Value": 0
+      },
+      "RequireTargetable": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "IsChannel": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "BuffDebuffName": {
+        "Value": ""
+      }
+    },
+    "Skill4": {
+      "Key": {
+        "Value": 69
+      },
+      "Role": {
+        "Value": "Disabled"
+      },
+      "Priority": {
+        "Value": 5
+      },
+      "CanCrossTerrain": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "TargetFilter": {
+        "Value": "Any"
+      },
+      "MinNearbyEnemies": {
+        "Value": 0
+      },
+      "MaxTargetRange": {
+        "Value": 0
+      },
+      "OnlyWhenBuffMissing": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "OnlyOnLowLife": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "SummonRecast": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MinCastIntervalMs": {
+        "Value": 0
+      },
+      "RequireTargetable": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "IsChannel": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "BuffDebuffName": {
+        "Value": ""
+      }
+    },
+    "Skill5": {
+      "Key": {
+        "Value": 82
+      },
+      "Role": {
+        "Value": "Disabled"
+      },
+      "Priority": {
+        "Value": 5
+      },
+      "CanCrossTerrain": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "TargetFilter": {
+        "Value": "Any"
+      },
+      "MinNearbyEnemies": {
+        "Value": 0
+      },
+      "MaxTargetRange": {
+        "Value": 0
+      },
+      "OnlyWhenBuffMissing": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "OnlyOnLowLife": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "SummonRecast": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MinCastIntervalMs": {
+        "Value": 0
+      },
+      "RequireTargetable": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "IsChannel": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "BuffDebuffName": {
+        "Value": ""
+      }
+    },
+    "Skill6": {
+      "Key": {
+        "Value": 4
+      },
+      "Role": {
+        "Value": "Disabled"
+      },
+      "Priority": {
+        "Value": 5
+      },
+      "CanCrossTerrain": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "TargetFilter": {
+        "Value": "Any"
+      },
+      "MinNearbyEnemies": {
+        "Value": 0
+      },
+      "MaxTargetRange": {
+        "Value": 0
+      },
+      "OnlyWhenBuffMissing": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "OnlyOnLowLife": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "SummonRecast": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MinCastIntervalMs": {
+        "Value": 0
+      },
+      "RequireTargetable": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "IsChannel": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "BuffDebuffName": {
+        "Value": ""
+      }
+    },
+    "Skill7": {
+      "Key": {
+        "Value": 2
+      },
+      "Role": {
+        "Value": "Disabled"
+      },
+      "Priority": {
+        "Value": 5
+      },
+      "CanCrossTerrain": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "TargetFilter": {
+        "Value": "Any"
+      },
+      "MinNearbyEnemies": {
+        "Value": 0
+      },
+      "MaxTargetRange": {
+        "Value": 0
+      },
+      "OnlyWhenBuffMissing": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "OnlyOnLowLife": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "SummonRecast": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MinCastIntervalMs": {
+        "Value": 0
+      },
+      "RequireTargetable": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "IsChannel": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "BuffDebuffName": {
+        "Value": ""
+      }
+    },
+    "Skill8": {
+      "Key": {
+        "Value": 0
+      },
+      "Role": {
+        "Value": "Disabled"
+      },
+      "Priority": {
+        "Value": 5
+      },
+      "CanCrossTerrain": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "TargetFilter": {
+        "Value": "Any"
+      },
+      "MinNearbyEnemies": {
+        "Value": 0
+      },
+      "MaxTargetRange": {
+        "Value": 0
+      },
+      "OnlyWhenBuffMissing": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "OnlyOnLowLife": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "SummonRecast": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MinCastIntervalMs": {
+        "Value": 0
+      },
+      "RequireTargetable": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "IsChannel": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "BuffDebuffName": {
+        "Value": ""
+      }
+    },
+    "BlacklistedEnemies": {
+      "Value": ""
+    },
+    "DefaultPositioning": {
+      "Value": "Melee"
+    },
+    "FightRange": {
+      "Value": 80
+    },
+    "CombatRange": {
+      "Value": 179
+    },
+    "GuardHpThreshold": {
+      "Value": 0.75
+    },
+    "GuardEsThreshold": {
+      "Value": 0.1
+    },
+    "VaalMinMonsters": {
+      "Value": 8
+    },
+    "SummonExpectedCount": {
+      "Value": 1
+    },
+    "FlasksEnabled": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "LifeFlaskSlot": {
+      "Value": 1
+    },
+    "LifeFlaskHpThreshold": {
+      "Value": 0.71
+    },
+    "ManaFlaskSlot": {
+      "Value": 5
+    },
+    "ManaFlaskManaThreshold": {
+      "Value": 0.51
+    },
+    "UtilityFlaskIntervalMs": {
+      "Value": 5000
+    }
+  },
+  "Loot": {
+    "SkipLowValueUniques": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "MinUniqueChaosValue": {
+      "Value": 10
+    },
+    "MinChaosPerSlot": {
+      "Value": 0
+    },
+    "BestFindsMinChaosValue": {
+      "Value": 100
+    },
+    "IgnoreQuestItems": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "FilterClusterJewels": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "MinClusterJewelChaosValue": {
+      "Value": 0
+    },
+    "FilterSkillGems": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "MinGemChaosValue": {
+      "Value": 10
+    },
+    "AlwaysLoot20QualityGems": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "FilterSynthesisedItems": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "SynthesisedWhitelist": {
+      "Value": "Onslaught,Explode,extra curse,Tailwind,Elusive,base Critical,maximum Power Charge,maximum Frenzy Charge,maximum Endurance Charge,Cooldown Recovery,additional Arrow,additional Projectile"
+    },
+    "MustLootUniques": {
+      "Value": "Megalomaniac,Voices"
+    },
+    "LabelToggleUnstick": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "LabelToggleCooldownSeconds": {
+      "Value": 5.0
+    },
+    "StashItemCooldownMs": {
+      "Value": 450
+    }
+  },
+  "Follower": {
+    "LeaderName": {
+      "Value": "DmarX"
+    },
+    "FollowDistance": {
+      "Value": 38
+    },
+    "StopDistance": {
+      "Value": 11
+    },
+    "FollowThroughTransitions": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "EnableCombat": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "EnableLoot": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "LootNearLeaderOnly": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    }
+  },
+  "Blight": {
+    "IgnoreCurrency": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "TowerBuildRadius": {
+      "Value": 90.0
+    },
+    "TowerBuildCooldownMs": {
+      "Value": 3000
+    },
+    "TowerClickCooldownMs": {
+      "Value": 200
+    },
+    "TowerApproachDistance": {
+      "Value": 25.0
+    },
+    "SweepDelayAfterTimerSeconds": {
+      "Value": 30.0
+    },
+    "SweepTimeoutSeconds": {
+      "Value": 180.0
+    },
+    "SweepPumpReturnSeconds": {
+      "Value": 30.0
+    },
+    "SweepPumpRadius": {
+      "Value": 80.0
+    },
+    "Chilling": {
+      "Priority": {
+        "Value": 5
+      },
+      "CanStack": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "RequiresNearbyTower": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "Tier3Branch": {
+        "Value": "None"
+      }
+    },
+    "Fireball": {
+      "Priority": {
+        "Value": 4
+      },
+      "CanStack": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "RequiresNearbyTower": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "Tier3Branch": {
+        "Value": "Left"
+      }
+    },
+    "Empowering": {
+      "Priority": {
+        "Value": 3
+      },
+      "CanStack": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "RequiresNearbyTower": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "Tier3Branch": {
+        "Value": "Left"
+      }
+    },
+    "Seismic": {
+      "Priority": {
+        "Value": 2
+      },
+      "CanStack": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "RequiresNearbyTower": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "Tier3Branch": {
+        "Value": "Left"
+      }
+    },
+    "Minion": {
+      "Priority": {
+        "Value": 0
+      },
+      "CanStack": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "RequiresNearbyTower": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "Tier3Branch": {
+        "Value": "Left"
+      }
+    },
+    "ShockNova": {
+      "Priority": {
+        "Value": 0
+      },
+      "CanStack": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "RequiresNearbyTower": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "Tier3Branch": {
+        "Value": "Left"
+      }
+    }
+  },
+  "Simulacrum": {
+    "MinWaveDelaySeconds": {
+      "Value": 4.0
+    },
+    "WaveTimeoutMinutes": {
+      "Value": 2.0
+    },
+    "StationaryChannelDuringWave": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "IntensityBuffName": {
+      "Value": "intensity"
+    },
+    "MinIntensityStacksBeforeReposition": {
+      "Value": 4
+    },
+    "KillRateDropRatio": {
+      "Value": 0.3
+    },
+    "DangerousStationaryEnemyCount": {
+      "Value": 20
+    },
+    "DangerousNoKillEscapeSeconds": {
+      "Value": 2.0
+    },
+    "MaxChannelPositionSeconds": {
+      "Value": 6.0
+    },
+    "EmergencySparkBelowEs": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "SimulacrumStock": {
+      "Value": 10
+    }
+  },
+  "Heist": {
+    "CompanionInteractKey": {
+      "Value": 86
+    },
+    "AlertThreshold": {
+      "Value": 70.0
+    },
+    "MaxChestDetour": {
+      "Value": 30.0
+    },
+    "OpenRewardChests": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "CompanionWaitTimeout": {
+      "Value": 30.0
+    },
+    "CompanionRetryDelay": {
+      "Value": 10.0
+    },
+    "RewardCurrency": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "RewardArmour": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "RewardWeapons": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "RewardGems": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "RewardDivinationCards": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "RewardUniques": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "RewardJewellery": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "RewardEssences": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "RewardFragments": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "RewardMaps": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "RewardJewels": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "RewardCorrupted": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    }
+  },
+  "Labyrinth": {
+    "Difficulty": {
+      "Value": "The Labyrinth"
+    },
+    "MaxRuns": {
+      "Value": 0
+    },
+    "MinExpectedProfit": {
+      "Value": 10
+    },
+    "OpenRewardChests": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "ZoneTimeoutSeconds": {
+      "Value": 120
+    },
+    "IzaroTimeoutSeconds": {
+      "Value": 60
+    },
+    "PreferSameType": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "KeepThreshold": {
+      "Value": 10
+    }
+  },
+  "Threat": {
+    "Enabled": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "MonitorRares": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "AutoDodge": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "ThreatRadius": {
+      "Value": 90
+    },
+    "DodgeTriggerDistance": {
+      "Value": 30
+    },
+    "DodgeDistance": {
+      "Value": 22
+    },
+    "DodgeMinProgress": {
+      "Value": 0.15
+    },
+    "DodgeMaxProgress": {
+      "Value": 0.35
+    },
+    "DodgeCooldownMs": {
+      "Value": 500
+    }
+  },
+  "Mechanics": {
+    "PostMechanicSettleSeconds": {
+      "Value": 5.0
+    },
+    "Ultimatum": {
+      "Mode": {
+        "Value": "Optional"
+      },
+      "ExitAfter": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "DoSurvive": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "DoKillEnemies": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "DoDefendAltar": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "DoStandInCircles": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MaxWaves": {
+        "Value": 10
+      },
+      "DangerThreshold": {
+        "Value": 30
+      },
+      "MinSecureValue": {
+        "Value": 0
+      },
+      "OrbitRadius": {
+        "Value": 50.0
+      },
+      "ModRanking": {
+        "DangerOverrides": {}
+      }
+    },
+    "Harvest": {
+      "Mode": {
+        "Value": "Optional"
+      },
+      "ExitAfter": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "PreferredColour": {
+        "Value": "Any"
+      },
+      "ColourPreferenceBonus": {
+        "Value": 1.5
+      },
+      "NormalWeight": {
+        "Value": 1
+      },
+      "MagicWeight": {
+        "Value": 3
+      },
+      "RareWeight": {
+        "Value": 10
+      },
+      "WildMultiplier": {
+        "Value": 1.0
+      },
+      "VividMultiplier": {
+        "Value": 1.0
+      },
+      "PrimalMultiplier": {
+        "Value": 1.0
+      },
+      "LootSweepSeconds": {
+        "Value": 3.0
+      }
+    },
+    "Wishes": {
+      "Mode": {
+        "Value": "Optional"
+      },
+      "ExitAfter": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "PreferredWish": {
+        "Value": "Any"
+      },
+      "LootSweepSeconds": {
+        "Value": 5.0
+      }
+    },
+    "Essence": {
+      "Mode": {
+        "Value": "Optional"
+      },
+      "ExitAfter": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MinEssenceTier": {
+        "Value": "Any"
+      },
+      "CorruptEssences": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "LootSweepSeconds": {
+        "Value": 3.0
+      }
+    },
+    "Ritual": {
+      "Mode": {
+        "Value": "Skip"
+      },
+      "ExitAfter": {
+        "Value": false,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "LootSweepSeconds": {
+        "Value": 3.0
+      }
+    },
+    "EldritchAltar": {
+      "Enabled": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MinScoreThreshold": {
+        "Value": 0
+      }
+    },
+    "Interactables": {
+      "Shrines": {
+        "Value": "Optional"
+      },
+      "Strongboxes": {
+        "Value": "Optional"
+      },
+      "DjinnCaches": {
+        "Value": "Optional"
+      },
+      "HeistCaches": {
+        "Value": "Optional"
+      },
+      "CraftingRecipes": {
+        "Value": "Optional"
+      },
+      "MemoryTears": {
+        "Value": "Optional"
+      }
+    }
+  },
+  "Farming": {
+    "FarmStrategy": {
+      "Value": "Stacked Deck"
+    },
+    "MapName": {
+      "Value": "有毒な下水道"
+    },
+    "MinPackDensity": {
+      "Value": 5
+    },
+    "DetourForRares": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "MaxDetourDistance": {
+      "Value": 60
+    },
+    "MinCoverage": {
+      "Value": 0.85
+    },
+    "WitnessType": {
+      "Value": "None"
+    },
+    "AtlasTreePreset": {
+      "Value": 0
+    },
+    "StackedDeck": {
+      "AlwaysBuyValue": {
+        "Value": 100
+      },
+      "MinBuyValue": {
+        "Value": 3
+      },
+      "RerollBuyThreshold": {
+        "Value": 50
+      },
+      "TributeReserve": {
+        "Value": 3000
+      },
+      "PreferredWish": {
+        "Value": "Coin of Power"
+      }
+    }
+  },
+  "Awakening": {
+    "AllowManualStart": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "ContinueAfterDeath": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "LootDefenseRadius": {
+      "Value": 30
+    },
+    "AtlasNodeOffset": {
+      "Value": 3
+    },
+    "ExarchChoiceIndex": {
+      "Value": 2
+    },
+    "MinStackChaos": {
+      "Value": 10.0
+    },
+    "TimeoutSeconds": {
+      "Value": 300
+    },
+    "MapCostChaos": {
+      "Value": 5.0
+    },
+    "SupplyTab": {
+      "Value": "Fragment"
+    },
+    "ExarchReadyCounter": {
+      "Value": 28
+    },
+    "ExarchSelectorPath": {
+      "Value": ""
+    },
+    "ExarchSelectedPath": {
+      "Value": ""
+    },
+    "NoDamageSeconds": {
+      "Value": 3.0
+    },
+    "LootSettleSeconds": {
+      "Value": 2.0
+    },
+    "MaxPriceAgeMinutes": {
+      "Value": 60
+    },
+    "ModCatalogValidated": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "BossCatalogValidated": {
+      "Value": true,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "Economy": {
+      "LedgerEnabled": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "StopIfNegativeAfterMaps": {
+        "Value": 20
+      },
+      "AutoRestock": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "ScarabTarget": {
+        "Value": 5
+      },
+      "SacrificeTarget": {
+        "Value": 20
+      },
+      "StopWhenOutOfChaos": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "SellWhenChaosShort": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "ListBelowChaos": {
+        "Value": 400
+      },
+      "ListUndercutChaos": {
+        "Value": 1.0
+      },
+      "AutoBuyMaps": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MapBuyCount": {
+        "Value": 10
+      },
+      "BankMapsInTmp": {
+        "Value": true,
+        "AttachedHotkey": {
+          "ValueV2": {
+            "ControllerKey": "None",
+            "ControllerModifierKey": "None",
+            "Key": "None",
+            "Win": false
+          }
+        }
+      },
+      "MapMaxUnitChaos": {
+        "Value": 50.0
+      },
+      "MapFollowUpOverChaos": {
+        "Value": 1.0
+      },
+      "MapMinQuantity": {
+        "Value": 115
+      },
+      "MapMinPackSize": {
+        "Value": 40
+      },
+      "MapMinAffixesEach": {
+        "Value": 4
+      }
+    }
+  },
+  "Boss": {
+    "BossType": {
+      "Value": "The Maven"
+    },
+    "FragmentStock": {
+      "Value": 20
+    },
+    "KeyDropChaosValue": {
+      "Value": 15
+    },
+    "FearDpsPosition": {
+      "Value": ""
+    }
+  },
+  "Run": {
+    "MaxDeaths": {
+      "Value": 4
+    },
+    "StashItemThreshold": {
+      "Value": 25
+    },
+    "LootSweepTimeoutSeconds": {
+      "Value": 4.9
+    },
+    "PortalKey": {
+      "Value": 70
+    },
+    "MaxRuntimeMinutes": {
+      "Value": 0
+    }
+  },
+  "Stash": {
+    "DumpTabName": {
+      "Value": ""
+    },
+    "FragmentTabName": {
+      "Value": "Delirium"
+    },
+    "MappingSuppliesTabName": {
+      "Value": ""
+    }
+  },
+  "MapRolling": {
+    "MinMapTier": {
+      "Value": 16
+    },
+    "DangerousMapMods": {
+      "Value": "MapElementalReflect,MapPhysicalReflect,MapNoRegen,MapCannotLeech"
+    },
+    "MinMapQuantity": {
+      "Value": 0
+    }
+  },
+  "MapDevice": {
+    "Slot1": {
+      "Value": "Divination Scarab of The Cloister"
+    },
+    "Slot2": {
+      "Value": "Divination Scarab of The Cloister"
+    },
+    "Slot3": {
+      "Value": "Divination Scarab of The Cloister"
+    },
+    "Slot4": {
+      "Value": "Divination Scarab of The Cloister"
+    },
+    "Slot5": {
+      "Value": "Divination Scarab of The Cloister"
+    }
+  },
+  "Faustus": {
+    "EnableFaustusRestock": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "ScarabRestockThreshold": {
+      "Value": 5
+    },
+    "SimulacrumRestockThreshold": {
+      "Value": 1
+    },
+    "FaustusPayCurrency": {
+      "Value": "Chaos Orb"
+    }
+  },
+  "Notifications": {
+    "EnableDiscordNotifications": {
+      "Value": false,
+      "AttachedHotkey": {
+        "ValueV2": {
+          "ControllerKey": "None",
+          "ControllerModifierKey": "None",
+          "Key": "None",
+          "Win": false
+        }
+      }
+    },
+    "DiscordWebhookUrl": {
+      "Value": ""
+    },
+    "NotificationKeywords": {
+      "Value": ""
+    },
+    "MinChaosValueNotification": {
+      "Value": 100
+    }
+  }
+}
