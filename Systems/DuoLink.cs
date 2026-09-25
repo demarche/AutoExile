@@ -158,6 +158,10 @@ public sealed class DuoPacket
     public int EsPct { get; set; }
     public float AuraRadius { get; set; }
     public float PartnerDist { get; set; }
+    /// <summary>Carry: map portals still open in the hideout (the last one is reserved for the Carry).</summary>
+    public int PortalsLeft { get; set; }
+    /// <summary>Carry: area hash of the map its current run owns (0 = none). The Aurabot only holds / waits in that map.</summary>
+    public long MapHash { get; set; }
 
     public Vector2 Pos => new(X, Y);
     public Vector2 Dest => new(DestX, DestY);

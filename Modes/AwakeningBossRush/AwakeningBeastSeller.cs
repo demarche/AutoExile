@@ -488,7 +488,8 @@ public sealed class AwakeningBeastSeller
         var text = CurrencyText(picker);
         if (text.Contains("Chaos", StringComparison.OrdinalIgnoreCase)) { Set(Step.ClickList, "listing"); return; }
         // 2026-09-25 (verified on screen twice): the picker opens on "Chaos Orb" by default, but its label is drawn
-        // without a readable Text (the dump shows no text under the picker). An empty picker = untouched default = Chaos.
+        // without a readable Text (the dump shows no text under the picker). User rule (2026-09-25): when the unit cannot
+        // be read from memory, treat it as chaos.
         if (text.Length == 0) { _log("shop.currency_default_chaos", new { }); Set(Step.ClickList, "listing"); return; }
         _log("shop.currency_unknown", new { text, dump = DumpTree(dialog) });
         // Not provably Chaos: open the picker once and choose "Chaos Orb"; never list in an unverified currency.

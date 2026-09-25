@@ -941,7 +941,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // in maps it pauses its own movement (bounded) when the Aurabot falls out of aura / link range.
     private bool _duoActive, _duoInParty; private DateTime _duoPartyCheckAt, _duoLogAt;
     private DateTime _leashSince = DateTime.MinValue, _leashCooldownUntil = DateTime.MinValue;
-    private int _leashWaits; private double _leashSeconds;
+    private int _leashWaits; private double _leashSeconds; private float _leashLastDist = float.MaxValue; private DateTime _leashDistAt;
     public bool DuoActive => _duoActive;
     private static bool PartnerInParty(ExileCore.GameController gc, string name)
     {
@@ -980,18 +980,26 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private bool DuoLeashHold(BotContext ctx)
     {
         if (!_duoActive || !InMap(ctx)) { _leashSince = DateTime.MinValue; return false; }
-        if (Run.Phase is not (AwakeningPhase.Scout or AwakeningPhase.Loot or AwakeningPhase.MapBoss)) { _leashSince = DateTime.MinValue; return false; }
+        // Loot is not leashed: the monsters are dead and waiting there only costs time.
+        if (Run.Phase is not (AwakeningPhase.Scout or AwakeningPhase.MapBoss)) { _leashSince = DateTime.MinValue; return false; }
         var now = DateTime.UtcNow;
         if (now < _leashCooldownUntil) return false;
         var d = ctx.Settings.Duo;
         var justEntered = Run.EnteredUtc.HasValue && (now - Run.EnteredUtc.Value).TotalSeconds < 12;
         var far = PartnerSameArea(ctx) ? PartnerDistance(ctx) > d.LeashDistance.Value : justEntered;
+        // A partner hundreds of units behind cannot catch up in a few seconds: don't stall for it (it re-paths to us).
+        if (PartnerSameArea(ctx) && PartnerDistance(ctx) > 350) far = false;
         if (!far) { if (_leashSince != DateTime.MinValue) { _leashSeconds += (now - _leashSince).TotalSeconds; _leashSince = DateTime.MinValue; } return false; }
         try { if (Hazards(ctx).Any(h => Vector2.Distance(ctx.Game.Player.GridPosNum, h.Pos) < h.Radius + 4)) return false; } catch { }
-        if (_leashSince == DateTime.MinValue) { _leashSince = now; _leashWaits++; _log.Event(Run, "duo.leash_wait", new { dist = PartnerDistance(ctx), sameArea = PartnerSameArea(ctx), Run.Phase }); }
-        if ((now - _leashSince).TotalSeconds > d.LeashMaxWaitSeconds.Value)
+        if (_leashSince == DateTime.MinValue) { _leashSince = now; _leashWaits++; _leashLastDist = PartnerDistance(ctx); _leashDistAt = now; _log.Event(Run, "duo.leash_wait", new { dist = PartnerDistance(ctx), sameArea = PartnerSameArea(ctx), Run.Phase }); }
+        // 2026-09-25 Duo map 1: 4 s waits ended with the Aurabot still 100-250 behind; keep waiting while it is
+        // visibly closing in (up to 3x the max wait), stop when it stalls.
+        var waited = (now - _leashSince).TotalSeconds;
+        var closing = PartnerSameArea(ctx) && _leashLastDist - PartnerDistance(ctx) > 3;
+        if (PartnerSameArea(ctx) && (now - _leashDistAt).TotalSeconds >= 1) { _leashLastDist = PartnerDistance(ctx); _leashDistAt = now; }
+        if (waited > d.LeashMaxWaitSeconds.Value && (!closing || waited > d.LeashMaxWaitSeconds.Value * 3))
         {
-            _leashSeconds += (now - _leashSince).TotalSeconds; _leashSince = DateTime.MinValue; _leashCooldownUntil = now.AddSeconds(8);
+            _leashSeconds += (now - _leashSince).TotalSeconds; _leashSince = DateTime.MinValue; _leashCooldownUntil = now.AddSeconds(4);
             _log.Event(Run, "duo.leash_timeout", new { dist = PartnerDistance(ctx), sameArea = PartnerSameArea(ctx) });
             return false;
         }
@@ -1009,6 +1017,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         p.AuraRadius = d.AuraRadius.Value;
         p.LinkOk = gc.Player != null && HasSoulLink(gc);
         p.PartnerDist = float.IsInfinity(PartnerDistance(ctx)) ? -1 : PartnerDistance(ctx);
+        // Map owned by the current run: its hash once entered, -1 while freshly opened (nobody knows the hash yet).
+        p.MapHash = Run.Instance != 0 ? (long)Run.Instance : Run.ActivationConfirmed ? -1 : 0;
         try
         {
             if (ctx.Navigation.IsNavigating && ctx.Navigation.Destination.HasValue && gc.Player != null)
@@ -1028,6 +1038,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 var portal = StrictMapRecipe.Portals(gc).Where(x => Run.PortalIds.Contains(x.Id)).OrderBy(x => x.DistancePlayer).FirstOrDefault();
                 p.Cmd = "portal";
                 if (portal != null) { p.HasPortal = true; p.PortalX = portal.GridPosNum.X; p.PortalY = portal.GridPosNum.Y; }
+                p.PortalsLeft = StrictMapRecipe.Portals(gc).Count(x => Run.PortalIds.Contains(x.Id));
             }
             // The map is still ours (death retry pending): the Aurabot keeps its position in the map instead of
             // spending a portal to come home and another to go back in.
@@ -1035,10 +1046,14 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                      && Run.Phase is AwakeningPhase.Return or AwakeningPhase.Prepare or AwakeningPhase.OpenMap or AwakeningPhase.Dormant)
                 p.Cmd = "hold_map";
             else p.Cmd = "home";
+            if (p.PortalsLeft == 0) try { p.PortalsLeft = StrictMapRecipe.Portals(gc).Count(x => Run.PortalIds.Contains(x.Id)); } catch { }
             return;
         }
         if (inMap)
         {
+            // User (2026-09-25): while the Carry is still in its entry grace period the Aurabot stands still too, and
+            // starts moving when the Carry moves (grace over).
+            if (Run.Phase == AwakeningPhase.Scout && DateTime.UtcNow < _graceUntil) { p.Cmd = "grace"; p.HasHold = true; p.HoldX = p.X; p.HoldY = p.Y; return; }
             if (_leashSince != DateTime.MinValue) p.Cmd = "come";
             else if (!p.LinkOk && PartnerSameArea(ctx) && PartnerDistance(ctx) < d.SoulLinkRange.Value) p.Cmd = "link";
             else p.Cmd = "follow";
@@ -1330,6 +1345,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         return false;
     }
     private bool _walkingToDevice;
+    private long _sweepId; private DateTime _sweepSince;
     private DateTime _deviceBusySince = DateTime.MinValue;
     private int _deviceTries, _strayMapRecoveries;
     private DateTime _deviceClickAt, _hideoutSince;
@@ -2155,8 +2171,22 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (ctx.Interaction.IsBusy) return;
         var portal = StrictMapRecipe.Portals(ctx.Game).Where(x => Run.PortalIds.Contains(x.Id)).OrderBy(x => x.DistancePlayer).FirstOrDefault();
         if (portal == null) { Status = "Waiting for recorded portal"; return; }
+        // Duo (2026-09-25, map 3/4): the Carry died within 10-30 s of entering, before the Aurabot (10-20 s behind)
+        // was in. Let the Aurabot go first (it gets "portal" from FillDuo) and enter once its auras are in the map.
+        var portalsLeft = StrictMapRecipe.Portals(ctx.Game).Count(x => Run.PortalIds.Contains(x.Id));
+        if (_duoActive && ctx.Duo.Last is { } aura && !aura.InMap && portalsLeft > 1
+            && aura.AreaHash == (long)(ctx.Game.IngameState?.Data?.CurrentAreaHash ?? 0)) // only when it is here with us
+        {
+            if (_duoEnterWaitSince == DateTime.MinValue) { _duoEnterWaitSince = DateTime.UtcNow; _log.Event(Run, "duo.aura_enters_first", new { auraPhase = aura.Phase }); }
+            if ((DateTime.UtcNow - _duoEnterWaitSince).TotalSeconds < 25) { Status = "Duo: the Aurabot enters first"; _phaseAt = DateTime.UtcNow; return; }
+            _log.Event(Run, "duo.aura_enter_timeout", new { auraPhase = aura.Phase, aura.Area });
+        }
+        else if (_duoEnterWaitSince != DateTime.MinValue)
+            _log.Event(Run, "duo.aura_entered", new { waited = Math.Round((DateTime.UtcNow - _duoEnterWaitSince).TotalSeconds, 1) });
+        _duoEnterWaitSince = DateTime.MinValue;
         ctx.Interaction.InteractWithEntity(portal, ctx.Navigation, requireProximity: false, requireVerified: true);
     }
+    private DateTime _duoEnterWaitSince = DateTime.MinValue;
     private void UpdateInvitation(BotContext ctx, bool selected)
     {
         try
@@ -3209,7 +3239,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if ((DateTime.UtcNow - _quietAt).TotalSeconds < ctx.Settings.Awakening.LootSettleSeconds.Value) return;
         // After the quiet metadata-complete scan, 60 grids is well inside the entity bubble.
         // Do not require walking onto corpses beyond rocks when their surrounding loot is already observable.
-        foreach (var nearby in Run.Bosses.Values.Where(b => b.Life == BossLife.DeadConfirmed && Vector2.Distance(ctx.Game.Player.GridPosNum, new(b.X, b.Y)) < 25))
+        // 2026-09-25: with the Awakening pack (8+ bosses) walking onto every corpse took 5+ minutes of Loot. Items are
+        // in the entity list far beyond 60 grids, and this runs only after the quiet (metadata-complete) scan.
+        foreach (var nearby in Run.Bosses.Values.Where(b => b.Life == BossLife.DeadConfirmed && Vector2.Distance(ctx.Game.Player.GridPosNum, new(b.X, b.Y)) < 60))
             if (!Run.LootSweptBosses.Contains(nearby.Id))
             {
                 Run.LootSweptBosses.Add(nearby.Id);
@@ -3220,6 +3252,14 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             .OrderBy(b => Vector2.Distance(ctx.Game.Player.GridPosNum, new(b.X, b.Y))).FirstOrDefault();
         if (sweep != null)
         {
+            // 2026-09-25: "The Deceitful God" corpse spot was never reached (3+ minutes). Give each spot 25 s.
+            if (_sweepId != sweep.Id) { _sweepId = sweep.Id; _sweepSince = DateTime.UtcNow; }
+            if ((DateTime.UtcNow - _sweepSince).TotalSeconds > 25)
+            {
+                Run.LootSweptBosses.Add(sweep.Id);
+                _log.Event(Run, "loot.boss_swept", new { sweep.Id, sweep.Name, distance = Vector2.Distance(ctx.Game.Player.GridPosNum, new(sweep.X, sweep.Y)), reason = "sweep_timeout_25s" });
+                return;
+            }
             Navigate(ctx, new(sweep.X, sweep.Y)); _quietAt = DateTime.MinValue; Status = "Checking boss drop location: " + sweep.Name; return;
         }
         if (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding) ctx.Navigation.Stop(ctx.Game);

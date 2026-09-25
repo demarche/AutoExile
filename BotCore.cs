@@ -560,6 +560,7 @@ namespace AutoExile
                 p.InMap = area != null && !area.IsHideout && !area.IsTown;
                 if (_mode is FollowerMode follower) follower.FillDuo(_ctx, p, Settings.Running.Value);
                 else if (_mode == _awakeningMode) _awakeningMode?.FillDuo(_ctx, p);
+                if (player != null && !player.IsAlive) p.Phase = "dead";
                 _ctx.Duo.Send(p);
             }
             catch (Exception ex) { if ((DateTime.UtcNow - _duoSentAt).TotalSeconds > 30) LogMessage($"[Duo] {ex.Message}"); }
@@ -1894,6 +1895,10 @@ namespace AutoExile
                         if (revivePanel?.IsVisible == true)
                         {
                             var atCheckpoint = revivePanel.ResurrectAtCheckpoint;
+                            // 2026-09-26: the Duo Aurabot lay dead in a map for hours (Soul Link kills it with the Carry)
+                            // because only "at checkpoint" was ever clicked. After 6 s, fall back to "in town".
+                            if ((atCheckpoint?.IsVisible != true || (DateTime.Now - _deathTime).TotalSeconds > 6) && revivePanel.ResurrectInTown?.IsVisible == true)
+                                atCheckpoint = revivePanel.ResurrectInTown;
                             if (atCheckpoint?.IsVisible == true)
                             {
                                 var rect = atCheckpoint.GetClientRect();

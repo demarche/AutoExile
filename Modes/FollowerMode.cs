@@ -154,6 +154,7 @@ namespace AutoExile.Modes
                 {
                     OnAreaChanged(ctx);
                 }
+                _areaEnteredAt = DateTime.Now;
                 _lastAreaName = currentArea;
             }
 
@@ -225,8 +226,22 @@ namespace AutoExile.Modes
             // Duo link (2026-09-25): the Carry's own AutoExile tells us where it is going and what it needs.
             // When its packet is fresh, it drives movement/Soul Link; otherwise the memory-based follow below runs.
             var duo = DuoCarry(ctx);
+            if (duo != null) { _lastDuo = duo; _lastDuoAt = DateTime.Now; }
             if (duo != null && TickDuo(ctx, gc, duo, playerGridPos, isHideout))
                 return;
+            // 2026-09-25: the Carry died, and during its loading screen (no datagrams) the memory-based follow took the
+            // exit portal, so "hold_map" came too late and the Aurabot was locked out of the map (portals spent).
+            // While the link went quiet less than 30 s ago, stay in the map instead of following an exit.
+            if (duo == null && !isHideout && _lastDuo != null && (DateTime.Now - _lastDuoAt).TotalSeconds < 30
+                && ctx.Settings.Duo.Enabled.Value && FindLeader(gc) == null)
+            {
+                if (_state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition) { ctx.Interaction.Cancel(gc); _transitionGridPos = null; _transitionEntityId = 0; }
+                ctx.Navigation.Stop(gc);
+                _state = FollowerState.NearLeader;
+                _status = $"Duo: link quiet — holding in the map ({(DateTime.Now - _lastDuoAt).TotalSeconds:0}s)";
+                _decision = "duo_quiet_hold";
+                return;
+            }
 
             // Try to find the leader entity
             var leader = FindLeader(gc);
@@ -259,14 +274,17 @@ namespace AutoExile.Modes
 
         private DateTime _lastLinkCast = DateTime.MinValue;
         private int _linkCasts;
-        private DateTime _duoPortalAt = DateTime.MinValue, _duoHomeSince = DateTime.MinValue;
+        private DuoPacket? _lastDuo; private DateTime _lastDuoAt = DateTime.MinValue; private DateTime _areaEnteredAt = DateTime.Now;
+        private DateTime _duoPortalAt = DateTime.MinValue, _duoHomeSince = DateTime.MinValue, _duoRepathAt = DateTime.MinValue;
         public int SoulLinkCasts => _linkCasts;
 
         /// <summary>The Carry's latest datagram, when fresh and from our leader.</summary>
         private DuoPacket? DuoCarry(BotContext ctx)
         {
             var link = ctx.Duo;
-            if (!ctx.Settings.Duo.Enabled.Value || !link.Alive || link.Last == null || link.Last.Role != "carry") return null;
+            // 2026-09-25: the Carry's datagrams pause for 2-5 s while its tick is busy; falling back to the memory-based
+            // follow in those gaps made the Aurabot dash off. Keep driving from the Carry's own data for up to 6 s.
+            if (!ctx.Settings.Duo.Enabled.Value || link.Last == null || link.AgeMs > 6000 || link.Last.Role != "carry") return null;
             if (!string.IsNullOrEmpty(LeaderName) && !string.Equals(link.Last.Name, LeaderName, StringComparison.OrdinalIgnoreCase)) return null;
             return link.Last;
         }
@@ -304,6 +322,15 @@ namespace AutoExile.Modes
                 }
                 // The Carry is about to take the map portal: go in right away (another portal than the Carry's own —
                 // each map portal takes one entry) instead of waiting until the Carry has vanished.
+                // User (2026-09-25): the last map portal belongs to the Carry — never take it.
+                var mapPortalsHere = FindAllPortals(gc).Count(e => e.Type != EntityType.TownPortal);
+                if ((duo.InMap || (sameArea && duo.Cmd == "portal")) && (mapPortalsHere == 1 || (sameArea && duo.PortalsLeft == 1)))
+                {
+                    if (_state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition) { ctx.Interaction.Cancel(gc); _transitionGridPos = null; _transitionEntityId = 0; }
+                    ctx.Navigation.Stop(gc); _state = FollowerState.NearLeader;
+                    _status = $"Duo: last map portal is the Carry's ({mapPortalsHere} here)"; _decision = "duo_last_portal_reserved";
+                    return true;
+                }
                 if (sameArea && duo.Cmd == "portal" && FollowThroughTransitions
                     && _state is not (FollowerState.NavigatingToTransition or FollowerState.ClickingTransition)
                     && (DateTime.Now - _duoPortalAt).TotalSeconds > 6)
@@ -329,9 +356,22 @@ namespace AutoExile.Modes
 
             if (!sameArea)
             {
-                // The Carry died / is re-entering the same map: keep our spot instead of spending portals.
-                if (duo.Cmd == "hold_map" && !duo.InMap)
+                // We went in first and the Carry is on its way (it is at the portal): stand still at the entrance.
+                var ourHash = (long)(gc.IngameState?.Data?.CurrentAreaHash ?? 0);
+                // A map from an earlier run is stale: go home. A freshly opened map (-1) counts only if we just entered.
+                var inCarrysMap = (duo.MapHash != 0 && duo.MapHash == ourHash) || (duo.MapHash == -1 && (DateTime.Now - _areaEnteredAt).TotalSeconds < 90);
+                if (duo.Cmd == "portal" && !duo.InMap && inCarrysMap)
                 {
+                    ctx.Navigation.Stop(gc); _state = FollowerState.NearLeader;
+                    _status = "Duo: in first — waiting at the entrance for the Carry"; _decision = "duo_wait_entry";
+                    _duoHomeSince = DateTime.MinValue;
+                    return true;
+                }
+                // The Carry died / is re-entering the same map: keep our spot instead of spending portals.
+                if (duo.Cmd == "hold_map" && !duo.InMap && inCarrysMap)
+                {
+                    if (_state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition)
+                    { ctx.Interaction.Cancel(gc); _transitionGridPos = null; _transitionEntityId = 0; _state = FollowerState.NearLeader; }
                     ctx.Navigation.Stop(gc);
                     _status = $"Duo: holding in the map for {LeaderName}";
                     _decision = "duo_hold_map";
@@ -340,13 +380,18 @@ namespace AutoExile.Modes
                 }
                 // Map finished and the Carry is home: follow through its exit (default logic); if no exit is found
                 // within 6 s, use /hideout and let the party teleport bring us to the Carry's hideout.
-                if (duo.Cmd == "home" && !duo.InMap)
+                // Any other command while the Carry is home (map done, or it is already opening the next map with
+                // "portal"): we are left in an old map — get home the same way (2026-09-25: stuck "Searching" in Dunes).
+                // 2026-09-25 night: the Aurabot sat for hours in an old Dunes instance while the Carry ran new maps
+                // (Carry "in a map", just not ours). Any area other than the Carry's, outside our hideout: go to the
+                // Carry's hideout directly with "/hideout <name>" (its map portals are there).
+                if (!isHideout)
                 {
                     if (_duoHomeSince == DateTime.MinValue) _duoHomeSince = DateTime.Now;
-                    if ((DateTime.Now - _duoHomeSince).TotalSeconds > 6 && _state == FollowerState.SearchingForLeader && BotInput.CanAct)
+                    if ((DateTime.Now - _duoHomeSince).TotalSeconds > (duo.Cmd == "home" ? 6 : 4) && _state is FollowerState.SearchingForLeader or FollowerState.NearLeader or FollowerState.Following && BotInput.CanAct)
                     {
                         _duoHomeSince = DateTime.Now.AddSeconds(20); // don't spam
-                        ChatCommand("/hideout");
+                        ChatCommand("/hideout " + LeaderName);
                         _status = "Duo: map done — /hideout";
                         _decision = "duo_home_chat";
                         return true;
@@ -359,6 +404,13 @@ namespace AutoExile.Modes
             // Same map as the Carry.
             var leader = FindLeader(gc);
             if (leader != null) TrySoulLink(ctx, gc, leader, duo, playerGridPos);
+            // The Carry's entry grace period: nobody moves until it starts (user, 2026-09-25).
+            if (duo.Cmd == "grace")
+            {
+                ctx.Navigation.Stop(gc); _state = FollowerState.NearLeader;
+                _status = "Duo: Carry grace period — holding"; _decision = "duo_grace_hold";
+                return true;
+            }
             if (_state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition)
             {
                 _state = FollowerState.Following; _transitionGridPos = null; _transitionEntityId = 0;
@@ -388,12 +440,28 @@ namespace AutoExile.Modes
                 _decision = "duo_near";
                 return true;
             }
-            var hasLOS = ctx.Navigation.HasWalkableLOS(gc, playerGridPos, target);
-            var preferPath = ctx.Navigation.IsNavigating && (DateTime.Now - _lastPathStartTime).TotalMilliseconds < PathHysteresisMs;
+            // 2026-09-25 first Duo map: re-targeting every tick (the Carry moves fast) restarted the async A* before it
+            // could finish, so the Aurabot stood still 645 units behind. Far away: aim at the Carry itself and re-path
+            // at most every 1.5 s / 25 units; close: every 0.7 s / 12 units.
+            var far = dist > followDist * 2;
+            if (far) target = carry;
+            var now = DateTime.Now;
+            var hasLOS = dist < 70 && ctx.Navigation.HasWalkableLOS(gc, playerGridPos, target);
+            var preferPath = ctx.Navigation.IsNavigating && (now - _lastPathStartTime).TotalMilliseconds < PathHysteresisMs;
             if (hasLOS && !preferPath) ctx.Navigation.MoveToward(gc, target);
-            else if (ctx.Navigation.IsNavigating) ctx.Navigation.UpdateDestination(gc, target, driftThreshold: 10f);
+            else if (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding)
+            {
+                var navDest = ctx.Navigation.Destination;
+                if (!ctx.Navigation.IsPathfinding && (!navDest.HasValue || Vector2.Distance(navDest.Value, target) > (far ? 25 : 12))
+                    && (now - _duoRepathAt).TotalMilliseconds > (far ? 1500 : 700))
+                { ctx.Navigation.UpdateDestination(gc, target, driftThreshold: far ? 25f : 12f); _duoRepathAt = now; }
+            }
             else if (!hasLOS && dist < followDist * 1.5f) ctx.Navigation.MoveToward(gc, target);
-            else if (ctx.Navigation.NavigateTo(gc, target)) _lastPathStartTime = DateTime.Now;
+            else if ((now - _duoRepathAt).TotalMilliseconds > 500)
+            {
+                if (ctx.Navigation.NavigateTo(gc, target)) _lastPathStartTime = now;
+                _duoRepathAt = now;
+            }
             _state = FollowerState.Following;
             _status = $"Duo: following {LeaderName} ({dist:F0}/{aura:F0}{(come ? ", come" : "")})";
             _decision = come ? "duo_come" : "duo_follow";
@@ -428,20 +496,53 @@ namespace AutoExile.Modes
 
         private readonly Queue<System.Windows.Forms.Keys> _chatKeys = new();
         private DateTime _chatKeyAt = DateTime.MinValue;
+        private int _chatFailures;
         private void ChatCommand(string command)
         {
             _chatKeys.Clear();
+            // 2026-09-26: typed key codes never produced a working "/hideout <name>" on the Aurabot's session (likely the
+            // Japanese IME). Paste the command from the clipboard instead: Enter, Ctrl+A, Ctrl+V, Enter.
+            var pasted = false;
+            try
+            {
+                var t = new System.Threading.Thread(() => { for (var i = 0; i < 5 && !pasted; i++) { try { System.Windows.Forms.Clipboard.SetText(command); pasted = true; } catch { System.Threading.Thread.Sleep(30); } } });
+                t.SetApartmentState(System.Threading.ApartmentState.STA); t.IsBackground = true; t.Start(); t.Join(800);
+            }
+            catch { }
             _chatKeys.Enqueue(System.Windows.Forms.Keys.Return);
-            foreach (var ch in command.ToUpperInvariant())
-                _chatKeys.Enqueue(ch == '/' ? System.Windows.Forms.Keys.OemQuestion : (System.Windows.Forms.Keys)ch);
+            _chatKeys.Enqueue(System.Windows.Forms.Keys.None); // wait for the chat box
+            if (pasted)
+            {
+                _chatKeys.Enqueue(System.Windows.Forms.Keys.A | System.Windows.Forms.Keys.Control);
+                _chatKeys.Enqueue(System.Windows.Forms.Keys.V | System.Windows.Forms.Keys.Control);
+            }
+            else
+                foreach (var ch in command.ToUpperInvariant())
+                    _chatKeys.Enqueue(ch == '/' ? System.Windows.Forms.Keys.OemQuestion : ch == ' ' ? System.Windows.Forms.Keys.Space : (System.Windows.Forms.Keys)ch);
             _chatKeys.Enqueue(System.Windows.Forms.Keys.Return);
         }
         /// <summary>One chat key per tick (BotInput gates key presses with a cooldown).</summary>
         private bool PumpChatKeys()
         {
             if (_chatKeys.Count == 0) return false;
-            if ((DateTime.Now - _chatKeyAt).TotalMilliseconds < 120 || !BotInput.CanAct) return true;
-            if (BotInput.PressKey(_chatKeys.Peek())) { _chatKeys.Dequeue(); _chatKeyAt = DateTime.Now; }
+            var k = _chatKeys.Peek();
+            if (k == System.Windows.Forms.Keys.None)
+            {
+                // Proceed once the chat box is open; give up after 3 s (a stray Enter is harmless).
+                var open = false;
+                try { open = AutoExile.Modes.AwakeningBossRush.AwakeningGameReader.ChatOpen(BotCore.Instance!.GameController); } catch { }
+                // 2026-09-25 night: on the Aurabot's ExileAPI build the chat-open probe never reports true, and giving up
+                // left it stranded. Continue after 800 ms whether or not the probe sees the chat box.
+                if (open || (DateTime.Now - _chatKeyAt).TotalMilliseconds > 800)
+                {
+                    _chatKeys.Dequeue(); _chatKeyAt = DateTime.Now;
+                    if (!open) _chatFailures++;
+                }
+                return true;
+            }
+            if ((DateTime.Now - _chatKeyAt).TotalMilliseconds < 150 || !BotInput.CanAct) return true;
+            var sent = (k & System.Windows.Forms.Keys.Control) != 0 ? BotInput.PressCtrlKey(k & System.Windows.Forms.Keys.KeyCode) : BotInput.PressKey(k);
+            if (sent) { _chatKeys.Dequeue(); _chatKeyAt = DateTime.Now; }
             return true;
         }
 
@@ -1135,6 +1236,12 @@ namespace AutoExile.Modes
             var portals = FindAllPortals(gc);
             if (portals.Count == 0)
                 return false;
+            // Duo (user, 2026-09-25): the last map portal is reserved for the Carry.
+            if (ctx.Settings.Duo.Enabled.Value && portals.Count(e => e.Type != EntityType.TownPortal) <= 1)
+            {
+                _status = "Duo: last map portal is the Carry's"; _decision = "duo_last_portal_reserved";
+                return false;
+            }
 
             // Try to get leader's current zone from party UI
             var leaderZone = GetLeaderZoneFromPartyUI(gc);
