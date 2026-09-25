@@ -817,7 +817,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     /// <summary>Three deaths in one instance without the bosses down: the map is a loss, a fresh one pays better.</summary>
     private bool AbandonDeadlyMap(BotContext ctx)
     {
-        if (Run.Deaths < 3 || Run.BossesCompleted) return false;
+        // Build report (2026-09-23) top idea #1: 5 of 11 maps that reached 3 deaths still paid off (~230c) after. Keep
+        // going up to 5 deaths while bosses have been found; give up at 3 only when none was ever found.
+        if (Run.BossesCompleted) return false;
+        var limit = Run.Bosses.Count > 0 ? 5 : 3;
+        if (Run.Deaths < limit) return false;
         _log.Event(Run, "map.abandon_after_deaths", new { Run.Deaths, Run.Instance, bosses = Run.Bosses.Values.Count(b => b.Life == BossLife.Alive) });
         var attempt = Run.AttemptId;
         Supervisor.State.Run = new() { AttemptId = attempt, AttemptNumber = 1, Phase = AwakeningPhase.Prepare,
@@ -892,10 +896,22 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             }
         }
         var strayMap = reason == "unexpected_map_before_activation" && _strayMapRecoveries++ < 5;
-        if (_manualContinuous && (outcome is (AttemptOutcome.Death or AttemptOutcome.Timeout) || strayMap) && ctx.Settings.Awakening.ContinueAfterDeath.Value && Supervisor.StorageError.Length == 0)
+        // 2026-09-26 01:52 JST: after 4 deaths the bosses died, 103c of loot was picked up and then the character left the
+        // map mid-loot (the loot lay on the entry portals at 217,790; a move click probably hit a portal). The loop parked in AwaitingReview for 15 min with the map
+        // still open. Treat it like a death: back in the Hideout, re-enter the same map (remaining portals) and finish.
+        _leftMapRecoveries.RemoveAll(t => (DateTime.UtcNow - t).TotalMinutes > 60);
+        var leftMap = reason == "left_map_before_objective_complete" && _leftMapRecoveries.Count < 6;
+        if (leftMap) _leftMapRecoveries.Add(DateTime.UtcNow);
+        if (_manualContinuous && (outcome is (AttemptOutcome.Death or AttemptOutcome.Timeout) || strayMap || leftMap) && ctx.Settings.Awakening.ContinueAfterDeath.Value && Supervisor.StorageError.Length == 0)
             _log.Event(Run, "manual_loop.death_recovery", new { reason, Run.Deaths, Run.Instance, Run.RevenueChaos });
         else StopContinuousLoop(outcome + ":" + reason);
-        if (Supervisor.StorageError.Length == 0 && ((outcome is AttemptOutcome.Death or AttemptOutcome.Timeout) || reason is "unexpected_map_before_activation" or "wrong_instance_on_reentry") && ctx.Game.Area?.CurrentArea?.IsHideout != true)
+        if (Supervisor.StorageError.Length == 0 && _manualContinuous && leftMap)
+        {
+            // Already in the Hideout (or loading into it): Return() waits for the hideout to load, then ContinueAfterDeath().
+            Run.RecoveryRequired = true; SetPhase(AwakeningPhase.Return, "recover_after_left_map");
+            ctx.Settings.Running.Value = true; _lastRunning = true;
+        }
+        else if (Supervisor.StorageError.Length == 0 && ((outcome is AttemptOutcome.Death or AttemptOutcome.Timeout) || reason is "unexpected_map_before_activation" or "wrong_instance_on_reentry") && ctx.Game.Area?.CurrentArea?.IsHideout != true)
         {
             Run.RecoveryRequired = true; SetPhase(AwakeningPhase.Return, "recover_after_" + outcome);
             ctx.Settings.Running.Value = true; _lastRunning = true;
@@ -1060,6 +1076,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
     }
     private readonly List<DateTime> _logisticsRetries = new();
+    private readonly List<DateTime> _leftMapRecoveries = new();
     private bool _beastOnly;
     private void StopContinuousLoop(string reason)
     {
@@ -1074,7 +1091,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private void ContinueAfterDeath(BotContext ctx)
     {
         if (!_manualContinuous) return;
-        if ((Run.Outcome is not (AttemptOutcome.Death or AttemptOutcome.Timeout) && Run.Reason != "unexpected_map_before_activation") || !ctx.Settings.Awakening.ContinueAfterDeath.Value || Supervisor.StorageError.Length > 0 ||
+        if ((Run.Outcome is not (AttemptOutcome.Death or AttemptOutcome.Timeout) && Run.Reason is not ("unexpected_map_before_activation" or "left_map_before_objective_complete")) ||!ctx.Settings.Awakening.ContinueAfterDeath.Value || Supervisor.StorageError.Length > 0 ||
             ctx.Game.Area?.CurrentArea?.IsHideout != true)
         { StopContinuousLoop("death_continue_not_allowed"); return; }
         string Send(string action, string review = "") => Command(ctx, action, Guid.NewGuid().ToString("N"), Supervisor.Generation, review, Supervisor.Mvid);
@@ -2215,6 +2232,33 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private static int _merchantListings; private static DateTime _merchantCollectAt = DateTime.UtcNow;
     private DateTime _beastListAttemptAt = DateTime.MinValue;
     private const double BeastTripMinChaos = 150;
+    private bool _beastStateLoaded, _beastStateLoadedFromDisk;
+    private string BeastStatePath => Path.Combine(_directory, "beast-state.json");
+    private void LoadBeastState()
+    {
+        if (_beastStateLoaded) return;
+        _beastStateLoaded = true;
+        try
+        {
+            if (!File.Exists(BeastStatePath)) return;
+            using var doc = JsonDocument.Parse(File.ReadAllText(BeastStatePath));
+            var r = doc.RootElement;
+            _beastTripAt = DateTime.Parse(r.GetProperty("lastTripUtc").GetString()!, null, System.Globalization.DateTimeStyles.RoundtripKind);
+            _pendingBeastChaos = Math.Max(_pendingBeastChaos, r.GetProperty("pendingChaos").GetDouble());
+            _pendingBeasts = Math.Max(_pendingBeasts, r.GetProperty("pendingBeasts").GetInt32());
+            _beastStateLoadedFromDisk = true;
+        }
+        catch { }
+    }
+    private void SaveBeastState()
+    {
+        try
+        {
+            Directory.CreateDirectory(_directory);
+            File.WriteAllText(BeastStatePath, JsonSerializer.Serialize(new { lastTripUtc = _beastTripAt.ToString("o"), pendingChaos = _pendingBeastChaos, pendingBeasts = _pendingBeasts }));
+        }
+        catch { }
+    }
     /// <summary>Hideout step between maps: itemise valuable captured beasts in the Menagerie (Ctrl+right-click in
     /// Einhar's Bestiary) and list them at Faustus' Merchant in the same trip. Batched: only when the estimated
     /// captured value reaches BeastTripMinChaos (≈ 40 s trip vs one map ≈ 250 s), plus one check per session.</summary>
@@ -2268,13 +2312,19 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _beasts.StartCollect(); return true;
         }
         if (ctx.Game.Area?.CurrentArea?.IsHideout != true || !ctx.Settings.Running.Value) return false;
+        LoadBeastState();
         if ((DateTime.UtcNow - _beastTripAt).TotalMinutes < 20) return false;
-        if (_beastSessionChecked && _pendingBeastChaos < BeastTripMinChaos) return false;
+        // 2026-09-26: every plugin restart made a Menagerie trip (the "once per session" check reset with it) and found
+        // nothing. The last trip and the value captured since are now kept on disk; trip when enough value is waiting,
+        // or after 3 h with anything waiting (user: beast timing may float with cost/benefit).
+        var due = _pendingBeastChaos >= BeastTripMinChaos || (_pendingBeastChaos >= BeastMinChaos && (DateTime.UtcNow - _beastTripAt).TotalHours >= 3)
+                  || (!_beastStateLoadedFromDisk && !_beastSessionChecked);
+        if (!due) return false;
         if (InventoryFreeCells(ctx) < 4) return false;
         LoadBeastPrices();
         var valuable = _beastPrices.Where(kv => kv.Value >= BeastMinChaos).Select(kv => (kv.Key, kv.Value)).ToList();
         if (valuable.Count == 0) return false;
-        _beastSessionChecked = true; _beastTripAt = DateTime.UtcNow; _pendingBeastChaos = 0; _pendingBeasts = 0;
+        _beastSessionChecked = true; _beastTripAt = DateTime.UtcNow; _pendingBeastChaos = 0; _pendingBeasts = 0; SaveBeastState();
         CancelInput(ctx);
         _beasts.Start(ctx.Game, valuable);
         return true;
@@ -2328,7 +2378,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 // A hunted beast that disappears at low HP was killed (Einhar captures it): count it for the Menagerie trip.
                 var killed = _beastHpFraction >= 0 && _beastHpFraction < 0.2;
                 _log.Event(Run, killed ? "beast.killed" : "beast.lost", new { id = _beastId, name = _beastName, chaos = _beastChaos, hp = _beastHpFraction });
-                if (killed) { _pendingBeastChaos += _beastChaos; _pendingBeasts++; }
+                if (killed) { _pendingBeastChaos += _beastChaos; _pendingBeasts++; SaveBeastState(); }
                 _beastId = 0;
             }
             return false;
