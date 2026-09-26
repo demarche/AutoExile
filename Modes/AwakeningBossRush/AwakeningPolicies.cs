@@ -1,4 +1,4 @@
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 
 namespace AutoExile.Modes.AwakeningBossRush;
 
@@ -55,7 +55,14 @@ public static class AwakeningLootPolicy
         @"Maven.?s Chisel|Cartographer.?s Chisel|Crescent Splinter|Maven.?s Writ|Maven.?s Invitation|Incandescent Invitation|MavenChisel|CurrencyMapQuality|Maven(?:Fragment|Key)|MavenInvitation|CurrencyMaven|QuestItemMaven|SearingExarch.*Key",
         RegexOptions.IgnoreCase);
     public static bool ShouldLoot(string name, string path, double? stackChaos, double threshold = 5) =>
-        Mandatory(name, path) || (stackChaos.HasValue && double.IsFinite(stackChaos.Value) && stackChaos.Value >= threshold);
+        Mandatory(name, path) || HighValue(name, path, stackChaos) || (stackChaos.HasValue && double.IsFinite(stackChaos.Value) && stackChaos.Value >= threshold);
+    // User 2026-09-26: "divine以上の価値があるカレンシーやフラグメントは、ピナクルボスのドロップ物と同列に、必ず拾う対象に".
+    // Divine Orb (and Mirrors) by name/path, plus any currency or fragment stack worth at least one Divine (poe.ninja).
+    public static double DivineChaos = 150;
+    public static bool HighValue(string name, string path, double? stackChaos) =>
+        Regex.IsMatch(name + " " + path, @"Divine Orb|Mirror of Kalandra|Mirror Shard|CurrencyModValues|CurrencyDuplicate", RegexOptions.IgnoreCase)
+        || (stackChaos is { } v && double.IsFinite(v) && v >= DivineChaos * 0.95
+            && (path.Contains("/Currency/", StringComparison.OrdinalIgnoreCase) || path.Contains("/MapFragments/", StringComparison.OrdinalIgnoreCase)));
     public static bool StashComplete(InventoryObservation inventory) => inventory.Valid && inventory.OutsideReservedColumn == 0;
     public static bool PickupConfirmed(InventoryObservation inventory, string path, int before, int quantity, bool stillOnGround) =>
         inventory.Valid && quantity > 0 && !stillOnGround && inventory.Counts.GetValueOrDefault(path) >= before + quantity;

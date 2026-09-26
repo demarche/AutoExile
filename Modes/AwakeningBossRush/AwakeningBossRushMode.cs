@@ -126,7 +126,10 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     private readonly HashSet<long> _lootSkipped = new();
     private bool _lootInterrupted, _enRouteLoot;
     private DateTime _enRouteScanAt = DateTime.MinValue;
-    public const double EnRouteMinChaos = 10, EnRouteRadius = 60;
+    public const double EnRouteMinChaos = 10, EnRouteRadius = 60, EnRouteRadiusMax = 130;
+    // Valuable/must-take drops are fetched from farther away: the longer one moves on, the harder they are to get back.
+    private static double EnRouteRadiusFor(string name, string path, double? value) =>
+        AwakeningLootPolicy.HighValue(name, path, value) || AwakeningLootPolicy.Mandatory(name, path) || (value ?? 0) >= 50 ? EnRouteRadiusMax : EnRouteRadius;
     private DateTime _lootDefenseStarted, _lootDefenseSuppressedUntil;
     private DateTime _scoutRepositionUntil;
     private DateTime _scoutPositionSince;
@@ -3059,16 +3062,37 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         return null;
     }
     // Drops worth at least EnRouteMinChaos (or mandatory Maven items) within EnRouteRadius, checked once a second.
-    private bool EnRouteLootAvailable(BotContext ctx)
+    private DateTime _divinePriceAt = DateTime.MinValue;
+    private void RefreshDivinePrice(BotContext ctx)
+    {
+        if ((DateTime.UtcNow - _divinePriceAt).TotalSeconds < 60) return;
+        _divinePriceAt = DateTime.UtcNow;
+        try { var dv = ctx.NinjaPrice.GetPrice("Divine Orb", NinjaPriceCategory.Currency).MinChaosValue; if (dv > 1) AwakeningLootPolicy.DivineChaos = dv; } catch { }
+    }
+    private bool DropGrabIsSafe(BotContext ctx)
+    {
+        try
+        {
+            var me = ctx.Game.Player.GridPosNum;
+            if (Run.Bosses.Values.Any(b => b.Life == BossLife.Alive && Vector2.Distance(me, new(b.X, b.Y)) < 70)) return false;
+            if (ctx.Game.EntityListWrapper.OnlyValidEntities.Any(e => e.Type == EntityType.Monster && e.IsAlive && e.IsHostile && e.IsTargetable
+                && Vector2.Distance(me, e.GridPosNum) < 35)) return false;
+            var life = ctx.Game.Player.GetComponent<Life>();
+            float pool = (life?.CurHP ?? 0) + (life?.CurES ?? 0), max = (life?.MaxHP ?? 0) + (life?.MaxES ?? 0);
+            return max > 0 && pool / max >= 0.75f;
+        }
+        catch { return false; }
+    }
+    private bool EnRouteLootAvailable(BotContext ctx, bool fightWindow = false, bool recordOnly = false)
     {
         var now = DateTime.UtcNow;
         if ((now - _enRouteScanAt).TotalSeconds < 1) return false;
-        _enRouteScanAt = now;
+        _enRouteScanAt = now; RefreshDivinePrice(ctx);
         var player = ctx.Game.Player.GridPosNum;
         var threshold = Math.Max(EnRouteMinChaos, ctx.Settings.Awakening.MinStackChaos.Value);
         foreach (var e in GroundItems(ctx))
         {
-            if (Vector2.Distance(player, e.GridPosNum) > EnRouteRadius || Run.LootReceipts.Contains(Run.Instance + ":" + e.Id) || _lootSkipped.Contains(e.Id)) continue;
+            if (Run.LootReceipts.Contains(Run.Instance + ":" + e.Id) || _lootSkipped.Contains(e.Id)) continue;
             try
             {
                 var item = e.GetComponent<WorldItem>()?.ItemEntity;
@@ -3076,9 +3100,20 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 var name = AwakeningGameReader.Name(ctx.Game, item);
                 var price = ctx.NinjaPrice.GetPrice(ctx.Game, item);
                 double? value = price.MatchCount > 0 && price.MinChaosValue > 0 ? price.MinChaosValue : null;
+                // Must-take drops seen anywhere in the loaded area are remembered, so the Loot phase walks back for them
+                // even when they have left the entity list by then.
+                if ((AwakeningLootPolicy.HighValue(name, item.Path, value) || AwakeningLootPolicy.Mandatory(name, item.Path)) && !_pendingValuables.ContainsKey(e.Id))
+                {
+                    _pendingValuables[e.Id] = new PendingValuable { Instance = Run.Instance, Name = name, Chaos = value ?? 0, Pos = e.GridPosNum };
+                    _log.Event(Run, "loot.must_take_seen", new { e.Id, name, item.Path, stackChaos = value, x = e.GridPosNum.X, y = e.GridPosNum.Y, distance = Vector2.Distance(player, e.GridPosNum) });
+                }
+                if (recordOnly || Vector2.Distance(player, e.GridPosNum) > EnRouteRadiusFor(name, item.Path, value)) continue;
+                // During a boss fight only must-take / Divine-class drops are worth a detour, and only away from live bosses.
+                if (fightWindow && !(AwakeningLootPolicy.HighValue(name, item.Path, value) || AwakeningLootPolicy.Mandatory(name, item.Path) || (value ?? 0) >= 50)) continue;
+                if (fightWindow && Run.Bosses.Values.Any(b => b.Life == BossLife.Alive && Vector2.Distance(e.GridPosNum, new(b.X, b.Y)) < 70)) continue;
                 if (AwakeningLootPolicy.ShouldLoot(name, item.Path, value, threshold))
                 {
-                    _log.Event(Run, "loot.en_route", new { e.Id, name, stackChaos = value, distance = Vector2.Distance(player, e.GridPosNum) });
+                    _log.Event(Run, "loot.en_route", new { e.Id, name, stackChaos = value, distance = Vector2.Distance(player, e.GridPosNum), fightWindow });
                     return true;
                 }
             }
@@ -3224,6 +3259,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // 2026-09-23: this build lives on ~7k ES and 430 life. Energy Shield only recharges after a few seconds
         // without a hit, so a low pool means leaving the bosses' range briefly instead of trading hits and dying.
         if (!regular && EnergyShieldRetreat(ctx)) return;
+        // User 2026-09-26: "比較的安全と判断できる場合は、ドロップしたら速やかにlootしましょう". Relatively safe = no live
+        // boss within 70 of us, no hostile within 35, Life+ES at least 75%: fetch valuable drops now (Loot returns to
+        // Scout, which goes straight back to the fight).
+        var grabSafe = !regular && DropGrabIsSafe(ctx);
+        if (!regular && EnRouteLootAvailable(ctx, fightWindow: true, recordOnly: !grabSafe) && grabSafe)
+        { ctx.Navigation.Stop(ctx.Game); _destination = null; _enRouteLoot = true; SetPhase(AwakeningPhase.Loot, "en_route_valuable_drop_fight"); return; }
         var alive = regular ? ctx.Game.EntityListWrapper.OnlyValidEntities.Where(e => Run.MapBossIds.Contains(e.Id) && e.IsAlive && e.IsTargetable).ToList()
             : ctx.Game.EntityListWrapper.OnlyValidEntities.Where(e => Run.Bosses.ContainsKey(e.Id) && e.IsAlive && e.IsTargetable).ToList();
         var closest = alive.OrderBy(e => Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum)).FirstOrDefault();
@@ -3397,6 +3438,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     }
     private void Loot(BotContext ctx)
     {
+        RefreshDivinePrice(ctx);
         if (_enRouteLoot && Run.Bosses.Values.Any(b => b.Life == BossLife.Alive && Vector2.Distance(ctx.Game.Player.GridPosNum, new(b.X, b.Y)) < ctx.Settings.Build.CombatRange.Value))
         { ctx.Interaction.Cancel(ctx.Game); _lootId = 0; _enRouteLoot = false; SetPhase(AwakeningPhase.Scout, "boss_interrupts_en_route_loot"); return; }
         if (LootDefense(ctx)) return;
@@ -3450,7 +3492,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 // Gone from the ground (picked into a split stack, 06:13): no need to walk back for it later.
                 if (!stillOnGround) _pendingValuables.Remove(_lootId);
                 ctx.Interaction.Cancel(ctx.Game); _lootAttempts[_lootId] = _lootAttempts.GetValueOrDefault(_lootId) + 1;
-                if (_lootAttempts[_lootId] >= 3)
+                if (_lootAttempts[_lootId] >= (AwakeningLootPolicy.Mandatory(_lootName, _lootPath) || AwakeningLootPolicy.HighValue(_lootName, _lootPath, _lootPrice) ? 8 : 3))
                 {
                     // Hourly rate: one stubborn item must not end the map. Record it and move on.
                     _lootSkipped.Add(_lootId); Run.UnresolvedLoot.Add(_lootName);
@@ -3467,7 +3509,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         foreach (var e in GroundItems(ctx))
         {
             if (Run.LootReceipts.Contains(Run.Instance + ":" + e.Id) || _lootSkipped.Contains(e.Id)) continue;
-            if (_enRouteLoot && Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum) > EnRouteRadius) continue;
+            if (_enRouteLoot && Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum) > EnRouteRadiusMax) continue;
             try
             {
                 var item = e.GetComponent<WorldItem>()?.ItemEntity;
@@ -3475,6 +3517,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 var name = AwakeningGameReader.Name(ctx.Game, item);
                 var price = ctx.NinjaPrice.GetPrice(ctx.Game, item);
                 double? value = price.MatchCount > 0 && price.MinChaosValue > 0 ? price.MinChaosValue : null;
+                if (_enRouteLoot && Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum) > EnRouteRadiusFor(name, item.Path, value)) continue;
                 var take = AwakeningLootPolicy.ShouldLoot(name, item.Path, value, _enRouteLoot ? Math.Max(EnRouteMinChaos, ctx.Settings.Awakening.MinStackChaos.Value) : ctx.Settings.Awakening.MinStackChaos.Value);
                 if (_lootDecisions.Add(e.Id + ":" + value + ":" + take))
                     _log.Event(Run, "loot.valued", new { e.Id, name, item.Path, stack = AwakeningGameReader.Quantity(item), stackChaos = value,
