@@ -37,7 +37,35 @@ public sealed class AwakeningMarketBuyer
     private string _seller = "", _homeArea = "";
     private long _homeHash, _sellerHash;
     private static readonly Dictionary<string, DateTime> DeadSellers = new();
-    public static string? DumpDirectory; private static int _travelDumps;
+    public static string? DumpDirectory; private static int _clientTails;
+    private static string? _clientLogPath;
+    /// <summary>Last lines of Path of Exile's logs/Client.txt (system/chat messages such as why a hideout visit failed).</summary>
+    private static string[] ClientLogTail(int lines)
+    {
+        if (_clientLogPath == null)
+        {
+            foreach (var p in System.Diagnostics.Process.GetProcesses())
+            {
+                try
+                {
+                    if (!p.ProcessName.StartsWith("PathOfExile", StringComparison.OrdinalIgnoreCase)) continue;
+                    var dir = Path.GetDirectoryName(p.MainModule!.FileName)!;
+                    foreach (var name in new[] { "LatestClient.txt", "Client.txt" })
+                    { var f = Path.Combine(dir, "logs", name); if (File.Exists(f)) { _clientLogPath = f; break; } }
+                    if (_clientLogPath != null) break;
+                }
+                catch { }
+            }
+            _clientLogPath ??= "";
+        }
+        if (_clientLogPath.Length == 0) return new[] { "Client.txt not found" };
+        using var fs = new FileStream(_clientLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var take = (int)Math.Min(fs.Length, 16000);
+        fs.Seek(-take, SeekOrigin.End);
+        var buf = new byte[take]; var read = fs.Read(buf, 0, take);
+        var text = System.Text.Encoding.UTF8.GetString(buf, 0, read);
+        return text.Split('\n').Select(x => x.TrimEnd('\r')).Where(x => x.Length > 0).TakeLast(lines).ToArray();
+    }
     private double _firstPrice;
     private int _gridCountBefore = -1, _pendingIndex = -1, _failedClicks, _searches, _mapsBefore;
     private double _pendingPrice;
@@ -79,7 +107,8 @@ public sealed class AwakeningMarketBuyer
             _log("market.travel_failed", new { seller = _seller });
             // 03:38-03:48 every travel failed (7/7), 04:23 two of the same sellers arrived in 6-9 s: the failures come in
             // waves on our side. Dump the visible UI for the first few so the blocker (a dialog? a message?) can be seen.
-            if (_travelDumps < 4 && DumpDirectory != null) { _travelDumps++; try { _log("market.travel_failed_ui", new { file = AwakeningUiInspector.Dump(gc, DumpDirectory, "travelfail", maxDepth: 6) }); } catch { } }
+            // 04:47 UI dumps showed no dialog at all; the reason is a chat/system line. Log the game's Client.txt tail.
+            if (_clientTails < 12) { _clientTails++; try { _log("market.travel_failed_client", new { seller = _seller, lines = ClientLogTail(25) }); } catch (Exception ex) { _log("market.travel_failed_client", new { error = ex.Message }); } }
             _skippedSellers.Add(_seller); DeadSellers[_seller] = DateTime.UtcNow; Set(Step.Search, "travel failed, next seller"); return;
         }
         var limit = _step switch { Step.Arrive => 30, Step.Home => 60, Step.Buy => 180, _ => 25 };
