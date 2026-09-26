@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using ExileCore;
 using ExileCore.PoEMemory;
 using ExileCore.Shared.Attributes;
@@ -86,8 +86,42 @@ public sealed class AwakeningLedger
         Append(_economyFile, new { utc = DateTime.UtcNow, type = "invest", item, quantity, unitChaos, total = quantity * unitChaos, source });
     }
     // Purchases are price history (what supplies really cost); Invest is booked when a map consumes them.
-    public void Purchase(string item, int quantity, double unitChaos, string source) =>
+    public void Purchase(string item, int quantity, double unitChaos, string source)
+    {
+        if (quantity > 0 && unitChaos > 0) { LoadLastPaid(); lock (_gate) _lastPaid![item] = unitChaos; }
         Append(_economyFile, new { utc = DateTime.UtcNow, type = "purchase", item, quantity, unitChaos, total = quantity * unitChaos, source });
+    }
+    // User 2026-09-26: "farmするのに必要なものについて、最後の価格を記憶しておき" — last unit price actually paid per item
+    // (Faustus Scarabs/Sacrifices, market maps), rebuilt from economy.jsonl after a restart.
+    private Dictionary<string, double>? _lastPaid;
+    public double? LastPaid(string item) { LoadLastPaid(); lock (_gate) return _lastPaid!.TryGetValue(item, out var v) ? v : null; }
+    private void LoadLastPaid()
+    {
+        if (_lastPaid != null) return;
+        var map = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (File.Exists(_economyFile))
+                using (var fs = new FileStream(_economyFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var sr = new StreamReader(fs))
+                {
+                    string? line;
+                    while ((line = sr.ReadLine()) != null)
+                    {
+                        if (!line.Contains("\"purchase\"")) continue;
+                        try
+                        {
+                            using var doc = JsonDocument.Parse(line); var r = doc.RootElement;
+                            var item = r.GetProperty("item").GetString(); var unit = r.GetProperty("unitChaos").GetDouble();
+                            if (item != null && unit > 0 && r.TryGetProperty("quantity", out var q) && q.GetInt32() > 0) map[item] = unit;
+                        }
+                        catch { }
+                    }
+                }
+        }
+        catch { }
+        lock (_gate) _lastPaid ??= map;
+    }
     // A listing is not income until it fills; it is recorded so fills can be matched later (Profit is booked on sale).
     public void Listing(string item, int quantity, double unitChaos, string source) =>
         Append(_economyFile, new { utc = DateTime.UtcNow, type = "listing", item, quantity, unitChaos, total = quantity * unitChaos, source });

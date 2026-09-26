@@ -280,7 +280,7 @@ namespace AutoExile.Modes
         private DateTime _lastLinkCast = DateTime.MinValue;
         private int _linkCasts;
         private DuoPacket? _lastDuo; private DateTime _lastDuoAt = DateTime.MinValue; private DateTime _areaEnteredAt = DateTime.Now;
-        private DateTime _duoPortalAt = DateTime.MinValue, _duoHomeSince = DateTime.MinValue, _duoRepathAt = DateTime.MinValue, _duoDirectUntil = DateTime.MinValue;
+        private DateTime _duoPortalAt = DateTime.MinValue, _duoHomeSince = DateTime.MinValue, _duoRepathAt = DateTime.MinValue, _duoDirectUntil = DateTime.MinValue, _duoLeaveAt = DateTime.MinValue;
         public int SoulLinkCasts => _linkCasts;
 
         /// <summary>The Carry's latest datagram, when fresh and from our leader.</summary>
@@ -360,6 +360,15 @@ namespace AutoExile.Modes
                     if (_state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition) { ctx.Interaction.Cancel(gc); _transitionGridPos = null; _transitionEntityId = 0; }
                     ctx.Navigation.Stop(gc); _state = FollowerState.NearLeader;
                     _status = $"Duo: {LeaderName} is on an errand ({duo.Phase}) — waiting in the hideout"; _decision = "duo_errand_wait";
+                    return true;
+                }
+                // Home first while the Carry is still on its way out of the finished map ("leave"): wait here — never
+                // follow it back into the map it is leaving.
+                if (duo.Cmd == "leave")
+                {
+                    if (_state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition) { ctx.Interaction.Cancel(gc); _transitionGridPos = null; _transitionEntityId = 0; }
+                    ctx.Navigation.Stop(gc); _state = FollowerState.NearLeader;
+                    _status = $"Duo: home — {LeaderName} is leaving the map"; _decision = "duo_leave_wait";
                     return true;
                 }
                 // Our own portal run (started below) must not be cancelled by the "hideout: idle near leader" rule.
@@ -489,6 +498,20 @@ namespace AutoExile.Modes
                 ctx.Navigation.Stop(gc); _state = FollowerState.NearLeader;
                 _status = "Duo: Carry grace period — holding"; _decision = "duo_grace_hold";
                 return true;
+            }
+            // User 2026-09-26: map done → leave in parallel with the Carry (it sends "leave" while heading home): take the
+            // nearest portal (the map's own, or the Carry's town portal next to it) right away.
+            if (duo.Cmd == "leave")
+            {
+                if (_state == FollowerState.NavigatingToTransition) { TickTransitionArrival(ctx, gc); _decision = "duo_leave_portal"; return true; }
+                if (_state == FollowerState.ClickingTransition) return true;
+                var exits = FindAllPortals(gc).Where(e => Vector2.Distance(playerGridPos, new Vector2(e.GridPosNum.X, e.GridPosNum.Y)) < 160)
+                    .OrderBy(e => Vector2.Distance(playerGridPos, new Vector2(e.GridPosNum.X, e.GridPosNum.Y))).ToList();
+                if (exits.Count > 0 && (DateTime.Now - _duoLeaveAt).TotalSeconds > 3)
+                {
+                    _duoLeaveAt = DateTime.Now;
+                    if (StartNavigationToEntity(ctx, gc, exits[0])) { _status = "Duo: map done — leaving with the Carry"; _decision = "duo_leave_portal"; return true; }
+                }
             }
             if (_state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition)
             {

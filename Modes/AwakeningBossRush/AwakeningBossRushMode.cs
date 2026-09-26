@@ -606,7 +606,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 var raw = gc.IngameState.Data.RawPathfindingData;
                 if (raw != null) ctx.Exploration.Initialize(raw, gc.IngameState.Data.RawTerrainTargetingData, gc.Player.GridPosNum, ctx.Settings.Build.BlinkRange.Value);
                 ctx.MapDevice.Cancel(gc, ctx.Navigation); _damage.Reset(now);
-                SetPhase(AwakeningPhase.Scout, "entered_expected_map"); _graceUntil = DateTime.UtcNow.AddSeconds(Run.Deaths > 0 ? 2.5 : 1.2);
+                SetPhase(AwakeningPhase.Scout, "entered_expected_map"); _graceUntil = DateTime.UtcNow.AddSeconds(Run.Deaths > 0 ? 2.5 : 1.2); _duoEntryAt = DateTime.UtcNow; _duoEntryWaitLogged = false;
                 _log.Event(Run, "attempt.entered", new { Run.AttemptNumber, Run.Instance });
             }
             if (inMap && Run.EnteredUtc.HasValue && ((now - _sampleAt).TotalMilliseconds >= 250 || !gc.Player.IsAlive))
@@ -1210,6 +1210,10 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         }
         if (inMap)
         {
+            // User 2026-09-26: "map終わってcarryがhideoutに戻ったら、並列でaurabotも直ちに戻ると良いです" — the map is done and
+            // the Carry is heading home: the Aurabot takes the nearest portal right away instead of waiting for "home".
+            if (Run.Phase == AwakeningPhase.Return && Run.BossesCompleted && Run.Outcome == AttemptOutcome.None && gc.Player?.IsAlive == true)
+            { p.Cmd = "leave"; return; }
             // User (2026-09-25): while the Carry is still in its entry grace period the Aurabot stands still too, and
             // starts moving when the Carry moves (grace over).
             if (Run.Phase == AwakeningPhase.Scout && DateTime.UtcNow < _graceUntil) { p.Cmd = "grace"; p.HasHold = true; p.HoldX = p.X; p.HoldY = p.Y; return; }
@@ -1540,6 +1544,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var economy = ctx.Settings.Awakening.Economy;
         _restockTried = true; _restockQueue.Clear(); _restockSales = 0;
         var skipped = new List<string>();
+        double chaos = 0, budgetUsed = 0; var chaosKnown = false;
+        try { chaosKnown = AwakeningExchange.HeldBreakdown(ctx.Game, "Chaos Orb").Count > 0; if (chaosKnown) chaos = AwakeningExchange.CountHeld(ctx.Game, "Chaos Orb"); } catch { }
         foreach (var name in MaterialNames)
         {
             var target = name.StartsWith("Horned") ? economy.ScarabTarget.Value : economy.SacrificeTarget.Value;
@@ -1553,6 +1559,22 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             if (need <= 0) continue;
             var category = name.StartsWith("Horned") ? NinjaPriceCategory.Scarab : NinjaPriceCategory.Fragment;
             var ninja = ctx.NinjaPrice.GetPrice(name, category).MinChaosValue;
+            // User 2026-09-26: "scarabはやはり5個ほどの単位で買う…最後の価格を記憶しておき、現在の所持chaosから破綻しない分だけ買う".
+            // Price each unit at the last price actually paid (poe.ninja until one is known) and keep one more map's worth
+            // of everything else (other materials + a market map) plus 50c in reserve.
+            if (chaosKnown)
+            {
+                double Unit(string n, double fallback) => _ledger.LastPaid(n) ?? fallback;
+                var unit = Unit(name, ninja > 0 ? ninja : 150);
+                var reserve = MaterialNames.Where(n => n != name).Sum(n => Unit(n, ctx.NinjaPrice.GetPrice(n, n.StartsWith("Horned") ? NinjaPriceCategory.Scarab : NinjaPriceCategory.Fragment).MinChaosValue))
+                              + Unit("Map (Tier 16)", 15) + 50;
+                var affordable = (int)Math.Floor(Math.Max(0, chaos - reserve - budgetUsed) / Math.Max(0.01, unit));
+                var qty = Math.Min(need, affordable);
+                if (qty <= 0 && chaos - budgetUsed >= unit) qty = 1; // one is still better than stopping the farm
+                _log.Event(Run, "restock.budget", new { name, held, need, unit, lastPaid = _ledger.LastPaid(name), ninja, chaos, reserve, budgetUsed, qty });
+                if (qty <= 0) { skipped.Add(name + ":unaffordable"); continue; }
+                need = qty; budgetUsed += qty * unit;
+            }
             // Safety cap: never pay more than 1.5x the poe.ninja price (+1c slack for sub-chaos fragments; 300c when unknown).
             // 2026-09-22: Sacrifice at Dusk at 0.20c vs a 0.17c cap stopped the loop.
             _restockQueue.Enqueue(new ExchangeRequest(ExchangeKind.BuyAtAsk, name, "Chaos Orb", need, ninja > 0 ? Math.Max(ninja * 1.5, ninja + 1) : 300));
@@ -2379,7 +2401,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         // Duo (2026-09-25, map 3/4): the Carry died within 10-30 s of entering, before the Aurabot (10-20 s behind)
         // was in. Let the Aurabot go first (it gets "portal" from FillDuo) and enter once its auras are in the map.
         var portalsLeft = StrictMapRecipe.Portals(ctx.Game).Count(x => Run.PortalIds.Contains(x.Id));
-        if (_duoActive && ctx.Duo.Last is { } aura && !aura.InMap && portalsLeft > 1
+        // 2026-09-26 (user): enter together instead — the Carry waits in its grace period inside the map (Scout).
+        if (DuoAuraEntersFirst && _duoActive && ctx.Duo.Last is { } aura && !aura.InMap && portalsLeft > 1
             && aura.AreaHash == (long)(ctx.Game.IngameState?.Data?.CurrentAreaHash ?? 0)) // only when it is here with us
         {
             if (_duoEnterWaitSince == DateTime.MinValue) { _duoEnterWaitSince = DateTime.UtcNow; _log.Event(Run, "duo.aura_enters_first", new { auraPhase = aura.Phase }); }
@@ -2392,6 +2415,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         ctx.Interaction.InteractWithEntity(portal, ctx.Navigation, requireProximity: false, requireVerified: true);
     }
     private DateTime _duoEnterWaitSince = DateTime.MinValue;
+    private const bool DuoAuraEntersFirst = false;
     private void UpdateInvitation(BotContext ctx, bool selected)
     {
         try
@@ -2619,15 +2643,27 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // Grace period (user, 2026-09-23): a freshly entered character is untouchable until it acts. Spend the first
     // second(s) standing still while the entity list streams in, so bosses, beasts, drops and incoming casts are known
     // before the first step — longer on a re-entry after a death, where the pinnacle fight is already live.
-    private DateTime _graceUntil;
+    private DateTime _graceUntil, _duoEntryAt = DateTime.MinValue, _duoPartnerInAt = DateTime.MinValue; private bool _duoEntryWaitLogged;
     private void Scout(BotContext ctx, bool lootDefense = false)
     {
         UpdateInvitation(ctx, Run.ActivationConfirmed);
         var now = DateTime.UtcNow;
+        // User 2026-09-26: "マップに入るときも、同時に入るとよいでしょう。grace periodがあるので、動いたりアクションしなければ、
+        // お互いがマップ入場するまで安全に待てます". Both take the portal at once; the Carry keeps its grace (no move, no
+        // action) until the Aurabot is in this area too (+1.5 s for its auras/Soul Link), at most 20 s.
+        if (!lootDefense && _duoActive && ctx.Duo.Last != null && (now - _duoEntryAt).TotalSeconds < 20)
+        {
+            if (!PartnerSameArea(ctx)) { _duoPartnerInAt = DateTime.MinValue; _graceUntil = now.AddSeconds(0.5); }
+            else if (_duoPartnerInAt == DateTime.MinValue) { _duoPartnerInAt = now; _graceUntil = new DateTime(Math.Max(_graceUntil.Ticks, now.AddSeconds(1.5).Ticks), DateTimeKind.Utc);
+                if (!_duoEntryWaitLogged) { _duoEntryWaitLogged = true; _log.Event(Run, "duo.entered_together", new { waited = Math.Round((now - _duoEntryAt).TotalSeconds, 1) }); } }
+        }
         if (!lootDefense && now < _graceUntil)
         {
             ctx.Combat.Suspend();
-            if (Run.Deaths == 0 && (Run.Bosses.Count > 0 || ValuableBeast(ctx, 200) != null)) _graceUntil = now; // enough is known: go
+            if (ctx.Navigation.IsNavigating) ctx.Navigation.Stop(ctx.Game);
+            var partnerIn = !_duoActive || ctx.Duo.Last == null || (PartnerSameArea(ctx) && _duoPartnerInAt != DateTime.MinValue && (now - _duoPartnerInAt).TotalSeconds >= 1.5) || (now - _duoEntryAt).TotalSeconds >= 20;
+            if (Run.Deaths == 0 && partnerIn && (Run.Bosses.Count > 0 || ValuableBeast(ctx, 200) != null)) _graceUntil = now; // enough is known: go
+            if (!partnerIn) { Status = "Grace period: waiting for the Aurabot to enter"; return; }
             Status = "Grace period: reading the area"; return;
         }
         if (!lootDefense && Run.BossesCompleted && AwakeningBossTracker.Complete(Run))
