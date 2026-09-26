@@ -436,6 +436,13 @@ namespace AutoExile.Modes
                 // Carry's hideout directly with "/hideout <name>" (its map portals are there).
                 if (!isHideout)
                 {
+                    // 2026-09-26 05:36-06:10: stuck 35 min in a spent Dunes (no portals left, "/hideout" never worked), the
+                    // Carry ran 6 maps solo and died 15 times. The Carry is in its hideout: use the party panel's
+                    // teleport button (works from any area to a member in a hideout; HandleTeleportConfirm clicks OK).
+                    if (!duo.InMap && duo.Area.Contains("Hideout", StringComparison.OrdinalIgnoreCase)
+                        && _state is not (FollowerState.NavigatingToTransition or FollowerState.ClickingTransition or FollowerState.TeleportingViaParty or FollowerState.WaitingForLoad)
+                        && TryTeleportViaPartyUI(ctx, gc))
+                    { _status = "Duo: stale map — party teleport to the Carry's hideout"; _decision = "duo_stale_party_tp"; return true; }
                     // 2026-09-26 07:55: "/hideout" did not get the Aurabot out of a leftover Dunes (chat input unreliable
                     // in its session). After one chat attempt in this area, walk into the map's own portal instead: map
                     // portals lead back to the Carry's hideout, where its new map portals are.
