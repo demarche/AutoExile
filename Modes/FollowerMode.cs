@@ -548,7 +548,9 @@ namespace AutoExile.Modes
         {
             var d = ctx.Settings.Duo;
             var since = (DateTime.Now - _lastLinkCast).TotalSeconds;
-            var need = since > d.SoulLinkRecastSeconds.Value || ((duo.Cmd == "link" || !duo.LinkOk) && since > 2.5);
+            // User 2026-09-26: while linked the Aurabot runs at the Carry's speed — relink as soon as the Carry reports it
+            // missing (1.2 s guard instead of 2.5 s).
+            var need = since > d.SoulLinkRecastSeconds.Value || ((duo.Cmd == "link" || !duo.LinkOk) && since > 1.2);
             if (!need || !BotInput.CanAct) return;
             var leaderGrid = new Vector2(leader.GridPosNum.X, leader.GridPosNum.Y);
             if (Vector2.Distance(playerGridPos, leaderGrid) > d.SoulLinkRange.Value) return;

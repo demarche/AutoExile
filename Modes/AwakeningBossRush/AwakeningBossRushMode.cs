@@ -947,11 +947,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                 mapName = Run.Map?.Name, quantity = Run.Map?.Quantity, mods = Run.Map?.Mods.Select(m => new { m.Id, m.Text }).ToArray(),
                 group = Run.Bosses.Values.Select(b => b.Group).Distinct().ToArray(), bosses = Run.Bosses.Values.Select(b => new { b.Member, life = b.Life.ToString() }).ToArray(),
                 Run.Deaths, Run.OperatingSeconds, Run.ElapsedSeconds, Run.PhaseSeconds, revenue = Run.RevenueChaos, cost = Run.CostChaos,
-                loot = _runLoot.ToArray(), escapes = _runEscapes, hazards = _hazardKinds.ToArray(), Run.UnresolvedLoot
+                loot = _runLoot.ToArray(), escapes = _runEscapes, hazards = _hazardKinds.ToArray(), Run.UnresolvedLoot,
+                duoDeaths = _runDuoDeaths.ToArray(), fightInAuraSeconds = Math.Round(_fightInAuraSeconds), fightOutAuraSeconds = Math.Round(_fightOutAuraSeconds)
             });
         }
         catch { }
-        _runLoot.Clear(); _runEscapes = 0;
+        _runLoot.Clear(); _runEscapes = 0; _runDuoDeaths.Clear();
     }
     // ── Duo: Aurabot (2026-09-25, user) ─────────────────────────────────────────────────────────────────────────
     // "Aurabot有りモード": entered automatically while the partner (Settings.Duo.PartnerName) is in the party and its
@@ -1043,7 +1044,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var d = ctx.Settings.Duo;
         var justEntered = Run.EnteredUtc.HasValue && (now - Run.EnteredUtc.Value).TotalSeconds < 12;
         var inAura = CarryInPartnerAura(ctx);
-        var far = PartnerSameArea(ctx) ? (inAura.HasValue ? !inAura.Value : PartnerDistance(ctx) > d.LeashDistance.Value) : justEntered;
+        // User 2026-09-26: the Aurabot only moves as fast as the Carry while Soul Link is on — wait for the relink too.
+        var linkLost = _duoLinkOkAt != DateTime.MinValue && (now - _duoLinkOkAt).TotalSeconds > 1.5;
+        var far = PartnerSameArea(ctx) ? ((inAura.HasValue ? !inAura.Value : PartnerDistance(ctx) > d.LeashDistance.Value) || linkLost) : justEntered;
         // A partner hundreds of units behind cannot catch up in a few seconds: don't stall for it (it re-paths to us).
         if (PartnerSameArea(ctx) && PartnerDistance(ctx) > 350) far = false;
         if (!far) { if (_leashSince != DateTime.MinValue) { _leashSeconds += (now - _leashSince).TotalSeconds; _leashSince = DateTime.MinValue; } return false; }
@@ -1080,7 +1083,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         {
             var dist = PartnerDistance(ctx);
             var inAura = CarryInPartnerAura(ctx);
-            hold = (inAura.HasValue ? !inAura.Value : dist > aura * 0.8f) && dist < 350;
+            var linkLost = _duoLinkOkAt != DateTime.MinValue && (now - _duoLinkOkAt).TotalSeconds > 1.5;
+            hold = ((inAura.HasValue ? !inAura.Value : dist > aura * 0.8f) || linkLost) && dist < 350;
             partner = ctx.Duo.Last!.Pos;
         }
         else hold = Run.EnteredUtc.HasValue && (now - Run.EnteredUtc.Value).TotalSeconds < 15; // it is still coming through the portal
@@ -1128,6 +1132,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         p.LinkOk = gc.Player != null && HasSoulLink(gc);
         var inAuraNow = CarryInPartnerAura(ctx);
         p.AuraKnown = inAuraNow.HasValue; p.InAura = inAuraNow ?? false;
+        { var nowT = DateTime.UtcNow; if (p.LinkOk) _duoLinkOkAt = nowT; if (inAuraNow == true) _duoInAuraAt = nowT; }
         // Movement skills used elsewhere (navigation dashes) show up as a position jump between two datagrams.
         try
         {
@@ -2952,6 +2957,19 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         return true;
     }
     // 2026-09-26 (user): "キャリーがブリンクするときは、移動座標を直通通信でaurabotにつたえ、aurabotもブリンクする".
+    private DateTime _duoLinkOkAt = DateTime.MinValue, _duoInAuraAt = DateTime.MinValue;
+    private readonly List<object> _runDuoDeaths = new();
+    /// <summary>Duo state just before a death (buffs are gone once dead, so the last-seen times are used).</summary>
+    private object DuoDeathState(BotContext ctx)
+    {
+        var now = DateTime.UtcNow;
+        double Since(DateTime t) => t == DateTime.MinValue ? -1 : Math.Round((now - t).TotalSeconds, 1);
+        var linked = _duoLinkOkAt != DateTime.MinValue && (now - _duoLinkOkAt).TotalSeconds < 1.5;
+        var aura = _duoInAuraAt != DateTime.MinValue && (now - _duoInAuraAt).TotalSeconds < 1.5;
+        return new { active = _duoActive, sameArea = PartnerSameArea(ctx), dist = PartnerSameArea(ctx) ? Math.Round(PartnerDistance(ctx)) : -1,
+            linked, aura, sinceLinkS = Since(_duoLinkOkAt), sinceAuraS = Since(_duoInAuraAt), partnerHp = ctx.Duo.Last?.HpPct, partnerEs = ctx.Duo.Last?.EsPct,
+            verdict = !_duoActive ? "solo" : linked && aura ? "linked_and_aura" : linked ? "linked_no_aura" : aura ? "aura_no_link" : "unsupported" };
+    }
     private long _duoBlinkSeq; private Vector2 _duoBlinkTarget; private Vector2 _duoLastPos; private DateTime _duoLastPosAt = DateTime.MinValue;
     private bool TryEscapeBlink(BotContext ctx, Vector2 target)
     {
@@ -3080,8 +3098,10 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
                         d = Math.Round(Vector2.Distance(player, e.GridPosNum)), size = e.GetComponent<Positioned>()?.Size, mods, anim };
                 }).ToArray();
             var life = gc.Player.GetComponent<Life>();
+            var duoState = DuoDeathState(ctx);
+            if (name == "death.context") _runDuoDeaths.Add(duoState);
             _log.Event(Run, name, new { Run.Phase, hp = life?.CurHP, es = life?.CurES, x = player.X, y = player.Y,
-                hazards = Hazards(ctx).Select(h => new { h.Kind, h.Radius, d = Math.Round(Vector2.Distance(player, h.Pos)) }).ToArray(), near });
+                hazards = Hazards(ctx).Select(h => new { h.Kind, h.Radius, d = Math.Round(Vector2.Distance(player, h.Pos)) }).ToArray(), near, duo = duoState });
         }
         catch (Exception ex) { _log.Event(Run, name, new { error = ex.Message }); }
     }
