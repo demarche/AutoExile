@@ -959,7 +959,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // DuoLink heartbeat is alive; otherwise everything runs solo exactly as before. The Carry tells the Aurabot where
     // it is going (next waypoint), when to come / hold in the map / take the portal, and whether Soul Link is on it;
     // in maps it pauses its own movement (bounded) when the Aurabot falls out of aura / link range.
-    private bool _duoActive, _duoInParty; private DateTime _duoPartyCheckAt, _duoLogAt;
+    private bool _duoActive, _duoInParty; private DateTime _duoPartyCheckAt, _duoLogAt, _duoLastAliveAt = DateTime.MinValue;
     private DateTime _leashSince = DateTime.MinValue, _leashCooldownUntil = DateTime.MinValue;
     private int _leashWaits; private double _leashSeconds; private float _leashLastDist = float.MaxValue; private DateTime _leashDistAt;
     public bool DuoActive => _duoActive;
@@ -974,6 +974,11 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var alive = d.Enabled.Value && link.Alive && link.Last?.Role == "aura" &&
             string.Equals(link.Last.Name, d.PartnerName.Value, StringComparison.OrdinalIgnoreCase) && link.Last.Phase != "stopped";
         if ((now - _duoPartyCheckAt).TotalSeconds >= 2) { _duoPartyCheckAt = now; _duoInParty = PartnerInParty(ctx.Game, d.PartnerName.Value); }
+        // 2026-09-26 01:34: the Aurabot's datagrams stop during its loading screen; the Carry went "solo", fought at the
+        // entrance before its partner arrived and died (verdict solo). A partner seen alive in the last 15 s still counts.
+        if (alive) _duoLastAliveAt = now;
+        else if (d.Enabled.Value && _duoInParty && _duoLastAliveAt != DateTime.MinValue && (now - _duoLastAliveAt).TotalSeconds < 15
+                 && link.Last?.Phase != "stopped") alive = true;
         var was = _duoActive;
         _duoActive = alive && _duoInParty;
         if (was != _duoActive || (now - _duoLogAt).TotalMinutes >= 10)
@@ -1084,7 +1089,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             var dist = PartnerDistance(ctx);
             var inAura = CarryInPartnerAura(ctx);
             var linkLost = _duoLinkOkAt != DateTime.MinValue && (now - _duoLinkOkAt).TotalSeconds > 1.5;
-            hold = ((inAura.HasValue ? !inAura.Value : dist > aura * 0.8f) || linkLost) && dist < 350;
+            // Standing next to the Aurabot already (01:35:41: dist 5, auras not yet applied after entry): nothing to
+            // gain by walking — keep fighting.
+            hold = ((inAura.HasValue ? !inAura.Value : dist > aura * 0.8f) || linkLost) && dist > 20 && dist < 350;
             partner = ctx.Duo.Last!.Pos;
         }
         else hold = Run.EnteredUtc.HasValue && (now - Run.EnteredUtc.Value).TotalSeconds < 15; // it is still coming through the portal
