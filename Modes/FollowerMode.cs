@@ -164,6 +164,7 @@ namespace AutoExile.Modes
             // 2026-09-26 08:20: the party-teleport button now opens "Are you sure you want to teleport to this player's
             // location?" [CANCEL][OK]; nobody answered it and the modal froze the Aurabot (navigation stuck at 1/3).
             if (HandleTeleportConfirm(ctx, gc)) return;
+            if (UnstickUi(ctx, gc, playerGridPos)) return;
 
             // In hideout: skip combat/loot/skills — only decision is teleport or portal
             if (!isHideout)
@@ -633,8 +634,26 @@ namespace AutoExile.Modes
             return true;
         }
 
+        // 2026-09-26 06:26-06:51: after a "/hideout" whose keys straddled the loading screen, the Aurabot stood 25 min on
+        // the hideout spawn "navigating to the portal" without moving (chat box / hotkey panels left open swallow the
+        // move key). Navigating but not moving for 6 s: press Escape (at most twice per stuck spell).
+        private Vector2 _stuckPos; private DateTime _stuckSince = DateTime.Now, _stuckEscAt = DateTime.MinValue; private int _stuckEscapes;
+        private bool UnstickUi(BotContext ctx, GameController gc, Vector2 pos)
+        {
+            var moving = _state is FollowerState.NavigatingToTransition or FollowerState.Following || ctx.Navigation.IsNavigating;
+            if (!moving || Vector2.Distance(pos, _stuckPos) > 2) { _stuckPos = pos; _stuckSince = DateTime.Now; _stuckEscapes = 0; return false; }
+            if ((DateTime.Now - _stuckSince).TotalSeconds < 6 || _stuckEscapes >= 2 || (DateTime.Now - _stuckEscAt).TotalSeconds < 3
+                || _chatKeys.Count > 0 || !BotInput.CanAct) return false;
+            if (!BotInput.PressKey(System.Windows.Forms.Keys.Escape)) return false;
+            _stuckEscapes++; _stuckEscAt = DateTime.Now; _stuckSince = DateTime.Now;
+            ctx.Log($"Follower: not moving for 6 s while {_state} at ({pos.X:F0},{pos.Y:F0}) — Escape #{_stuckEscapes} to close chat/panels");
+            _status = "Unsticking: Escape (chat/panel open?)"; _decision = "duo_unstick_escape";
+            return true;
+        }
+
         private void OnAreaChanged(BotContext ctx)
         {
+            _chatKeys.Clear(); // keys typed after a loading screen become hotkeys (I, H, …) and leave the chat box open
             ModeHelpers.CancelAllSystems(ctx);
             _lootTracker.ResetCount();
             ctx.Loot.ClearFailed();

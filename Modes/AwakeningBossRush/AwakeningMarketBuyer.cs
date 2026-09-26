@@ -102,13 +102,16 @@ public sealed class AwakeningMarketBuyer
         // 02:13-02:23: 19 of 21 travels "failed" at 14 s — the same four sellers again and again in every retry (each
         // retry forgot them), and one of them (TWoods) arrived in 18 s on a later try. 20 s, never while loading, and
         // remember dead sellers across market runs for 20 min.
-        if (_step == Step.Arrive && _sellerHash == 0 && !gc.IsLoading && AreaHash(gc) == _homeHash && (DateTime.UtcNow - _stepAt).TotalSeconds > 20 && _skippedSellers.Count < 12)
+        if (_step == Step.Arrive && _sellerHash == 0 && !gc.IsLoading && AreaHash(gc) == _homeHash && (DateTime.UtcNow - _stepAt).TotalSeconds > 14 && _skippedSellers.Count < 12)
         {
             _log("market.travel_failed", new { seller = _seller });
             // 03:38-03:48 every travel failed (7/7), 04:23 two of the same sellers arrived in 6-9 s: the failures come in
             // waves on our side. Dump the visible UI for the first few so the blocker (a dialog? a message?) can be seen.
             // 04:47 UI dumps showed no dialog at all; the reason is a chat/system line. Log the game's Client.txt tail.
-            if (_clientTails < 12) { _clientTails++; try { _log("market.travel_failed_client", new { seller = _seller, lines = ClientLogTail(25) }); } catch (Exception ex) { _log("market.travel_failed_client", new { error = ex.Message }); } }
+            // 06:19 Client.txt: every failed visit is an ETrade request pair (api type 4 then 5) answered "error = 0" and
+            // then nothing — the server accepts it but the seller never lets us in (not our client). The loading guard
+            // above keeps slow-but-real travels (loading starts within a few seconds), so 14 s is enough again.
+            if (_clientTails < 3) { _clientTails++; try { _log("market.travel_failed_client", new { seller = _seller, lines = ClientLogTail(25) }); } catch (Exception ex) { _log("market.travel_failed_client", new { error = ex.Message }); } }
             _skippedSellers.Add(_seller); DeadSellers[_seller] = DateTime.UtcNow; Set(Step.Search, "travel failed, next seller"); return;
         }
         var limit = _step switch { Step.Arrive => 30, Step.Home => 60, Step.Buy => 180, _ => 25 };
