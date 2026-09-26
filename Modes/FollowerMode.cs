@@ -1,4 +1,4 @@
-using ExileCore;
+﻿using ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
@@ -279,7 +279,7 @@ namespace AutoExile.Modes
         private DateTime _lastLinkCast = DateTime.MinValue;
         private int _linkCasts;
         private DuoPacket? _lastDuo; private DateTime _lastDuoAt = DateTime.MinValue; private DateTime _areaEnteredAt = DateTime.Now;
-        private DateTime _duoPortalAt = DateTime.MinValue, _duoHomeSince = DateTime.MinValue, _duoRepathAt = DateTime.MinValue;
+        private DateTime _duoPortalAt = DateTime.MinValue, _duoHomeSince = DateTime.MinValue, _duoRepathAt = DateTime.MinValue, _duoDirectUntil = DateTime.MinValue;
         public int SoulLinkCasts => _linkCasts;
 
         /// <summary>The Carry's latest datagram, when fresh and from our leader.</summary>
@@ -520,7 +520,13 @@ namespace AutoExile.Modes
             var now = DateTime.Now;
             var hasLOS = dist < 70 && ctx.Navigation.HasWalkableLOS(gc, playerGridPos, target);
             var preferPath = ctx.Navigation.IsNavigating && (now - _lastPathStartTime).TotalMilliseconds < PathHysteresisMs;
-            if (hasLOS && !preferPath) ctx.Navigation.MoveToward(gc, target);
+            // 2026-09-26 02:40:50: the Carry stood where our A* found no route ("failed"), so every 500 ms retry failed
+            // again and we stood still 97 away for the whole fight. After a failed route, walk/dash straight at the
+            // Carry for 2 s (the game's own click-to-move gets round local obstacles) before trying A* again.
+            if (!ctx.Navigation.IsNavigating && !ctx.Navigation.IsPathfinding && ctx.Navigation.PathfindingStatus.StartsWith("failed", StringComparison.Ordinal) && (now - _duoDirectUntil).TotalSeconds > 1)
+                _duoDirectUntil = now.AddSeconds(2);
+            if (now < _duoDirectUntil && !hasLOS) { ctx.Navigation.MoveToward(gc, target); _duoRepathAt = now; }
+            else if (hasLOS && !preferPath) ctx.Navigation.MoveToward(gc, target);
             else if (ctx.Navigation.IsNavigating || ctx.Navigation.IsPathfinding)
             {
                 var navDest = ctx.Navigation.Destination;

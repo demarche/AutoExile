@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Numerics;
 using System.Security.Cryptography;
 using System.Text;
@@ -952,7 +952,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             });
         }
         catch { }
-        _runLoot.Clear(); _runEscapes = 0; _runDuoDeaths.Clear();
+        _runLoot.Clear(); _runEscapes = 0; _runDuoDeaths.Clear(); _fightInAuraSeconds = 0; _fightOutAuraSeconds = 0; // per attempt, not per session
     }
     // ── Duo: Aurabot (2026-09-25, user) ─────────────────────────────────────────────────────────────────────────
     // "Aurabot有りモード": entered automatically while the partner (Settings.Duo.PartnerName) is in the party and its
@@ -1078,7 +1078,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // when it is outside 80% of the aura radius (bounded 8 s, then 6 s cooldown so a stuck partner never stalls the
     // fight); (2) back-off and ES-retreat directions lean toward the Aurabot; (3) Spark repositions that would leave
     // the aura are skipped.
-    private DateTime _regroupSince = DateTime.MinValue, _regroupCooldownUntil = DateTime.MinValue; private int _regroups; private double _regroupSeconds;
+    private DateTime _regroupSince = DateTime.MinValue, _regroupCooldownUntil = DateTime.MinValue, _regroupTickAt = DateTime.MinValue, _regroupDistAt = DateTime.MinValue; private float _regroupLastDist = -1; private int _regroups; private double _regroupSeconds;
     private bool DuoRegroup(BotContext ctx, DateTime now)
     {
         if (!_duoActive) return false;
@@ -1091,7 +1091,9 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             var linkLost = _duoLinkOkAt != DateTime.MinValue && (now - _duoLinkOkAt).TotalSeconds > 1.5;
             // Standing next to the Aurabot already (01:35:41: dist 5, auras not yet applied after entry): nothing to
             // gain by walking — keep fighting.
-            hold = ((inAura.HasValue ? !inAura.Value : dist > aura * 0.8f) || linkLost) && dist > 20 && dist < 350;
+            // 02:26:29: the Aurabot was 350+ behind, so the old "< 350" bound let the Carry fight The Feared alone and die
+            // 2 s later. Walking toward it closes the gap from both sides — regroup at any distance.
+            hold = ((inAura.HasValue ? !inAura.Value : dist > aura * 0.8f) || linkLost) && dist > 20;
             partner = ctx.Duo.Last!.Pos;
         }
         else hold = Run.EnteredUtc.HasValue && (now - Run.EnteredUtc.Value).TotalSeconds < 15; // it is still coming through the portal
@@ -1106,7 +1108,14 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             _regroupSince = now; _regroups++;
             _log.Event(Run, "duo.fight_regroup", new { dist = PartnerSameArea(ctx) ? Math.Round(PartnerDistance(ctx)) : -1, sameArea = PartnerSameArea(ctx), aura, inAura = CarryInPartnerAura(ctx), selfAuras = _selfAuras.ToArray() });
         }
-        if ((now - _regroupSince).TotalSeconds > 8)
+        // A regroup left half-way (Fight → Scout "boss_not_observable" → Fight) starts over instead of timing out at once.
+        if ((now - _regroupTickAt).TotalSeconds > 2) { _regroupSince = now; _regroupLastDist = PartnerSameArea(ctx) ? PartnerDistance(ctx) : -1; _regroupDistAt = now; }
+        _regroupTickAt = now;
+        // Keep regrouping while the gap is visibly closing (up to 20 s); stop after 8 s when it is not.
+        var closingR = PartnerSameArea(ctx) && _regroupLastDist > 0 && _regroupLastDist - PartnerDistance(ctx) > 3;
+        if (PartnerSameArea(ctx) && (now - _regroupDistAt).TotalSeconds >= 1) { _regroupLastDist = PartnerDistance(ctx); _regroupDistAt = now; }
+        var regroupWaited = (now - _regroupSince).TotalSeconds;
+        if (regroupWaited > 8 && (!closingR || regroupWaited > 20))
         {
             _regroupSeconds += (now - _regroupSince).TotalSeconds; _regroupSince = DateTime.MinValue; _regroupCooldownUntil = now.AddSeconds(6);
             _log.Event(Run, "duo.fight_regroup_timeout", new { dist = PartnerSameArea(ctx) ? Math.Round(PartnerDistance(ctx)) : -1 });

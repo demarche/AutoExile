@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Numerics;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
@@ -36,6 +36,7 @@ public sealed class AwakeningMarketBuyer
     private readonly HashSet<string> _skippedSellers = new();
     private string _seller = "", _homeArea = "";
     private long _homeHash, _sellerHash;
+    private static readonly Dictionary<string, DateTime> DeadSellers = new();
     private double _firstPrice;
     private int _gridCountBefore = -1, _pendingIndex = -1, _failedClicks, _searches, _mapsBefore;
     private double _pendingPrice;
@@ -69,8 +70,11 @@ public sealed class AwakeningMarketBuyer
         // A travel click that never leaves the hideout (seller offline / listing gone): try the next seller.
         // 2026-09-26 01:33: successful travels arrive in 6-11 s; each dead seller cost 20 s, and after the 6th search the
         // next one waited the full 60 s step timeout (3 maps in 3 min). Give up on a seller after 14 s, up to 12 of them.
-        if (_step == Step.Arrive && _sellerHash == 0 && AreaHash(gc) == _homeHash && (DateTime.UtcNow - _stepAt).TotalSeconds > 14 && _skippedSellers.Count < 12)
-        { _log("market.travel_failed", new { seller = _seller }); _skippedSellers.Add(_seller); Set(Step.Search, "travel failed, next seller"); return; }
+        // 02:13-02:23: 19 of 21 travels "failed" at 14 s — the same four sellers again and again in every retry (each
+        // retry forgot them), and one of them (TWoods) arrived in 18 s on a later try. 20 s, never while loading, and
+        // remember dead sellers across market runs for 20 min.
+        if (_step == Step.Arrive && _sellerHash == 0 && !gc.IsLoading && AreaHash(gc) == _homeHash && (DateTime.UtcNow - _stepAt).TotalSeconds > 20 && _skippedSellers.Count < 12)
+        { _log("market.travel_failed", new { seller = _seller }); _skippedSellers.Add(_seller); DeadSellers[_seller] = DateTime.UtcNow; Set(Step.Search, "travel failed, next seller"); return; }
         var limit = _step switch { Step.Arrive => 30, Step.Home => 60, Step.Buy => 180, _ => 25 };
         if ((DateTime.UtcNow - _stepAt).TotalSeconds > limit) { GoHomeOrFail(gc, "step_timeout:" + _step); return; }
         if (_keys.Count > 0)
@@ -391,7 +395,8 @@ public sealed class AwakeningMarketBuyer
         _log("market.results", new { count = rows.Count, rows = rows.Select(r => new { r.Name, r.Price, r.Currency, r.Seller, r.Quantity, r.Pack, r.Prefix, r.Suffix, reject = r.Reject }) });
         if (rows.Count > 0 && rows.All(r => r.Reject?.StartsWith("not_T16", StringComparison.Ordinal) == true) && _filterRounds < 3)
         { _filtersSet = false; _resetFilters = true; Set(Step.Search, "results are not T16 maps: resetting the filters"); return; }
-        var pick = rows.FirstOrDefault(r => r.Reject == null && !_skippedSellers.Contains(r.Seller));
+        foreach (var k in DeadSellers.Where(x => (DateTime.UtcNow - x.Value).TotalMinutes > 20).Select(x => x.Key).ToList()) DeadSellers.Remove(k);
+        var pick = rows.FirstOrDefault(r => r.Reject == null && !_skippedSellers.Contains(r.Seller) && !DeadSellers.ContainsKey(r.Seller));
         if (pick == null) { GoHomeOrFail(gc, rows.Count == 0 ? "no_results" : "no_acceptable_listing"); return; }
         var travel = Child(pick.Entry, 0, 1, 2, 0, 4, 0);
         if (travel == null) { Fail("travel_button_not_found"); return; }
@@ -437,7 +442,7 @@ public sealed class AwakeningMarketBuyer
     {
         var grid = SellerGrid(gc);
         if (grid == null) { Status = $"Market: waiting for {_seller}'s stash"; return; }
-        _sellerHash = AreaHash(gc);
+        _sellerHash = AreaHash(gc); DeadSellers.Remove(_seller);
         _gridCountBefore = -1; _pendingIndex = -1; _failedClicks = 0;
         _log("market.arrived", new { seller = _seller, area = gc.Area?.CurrentArea?.Name, items = grid.Children.Count });
         Set(Step.Buy, $"buying from {_seller}");
