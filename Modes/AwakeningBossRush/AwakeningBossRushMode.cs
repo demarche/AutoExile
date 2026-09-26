@@ -177,7 +177,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
     // Called on the frame thread: background HTTP serialization must never enumerate live collections.
     public JsonElement Snapshot() => JsonSerializer.SerializeToElement(new { hostProcessId = Environment.ProcessId, hostExecutable = Environment.ProcessPath,
         shutdownRequested = _shutdownRequested, generation = Supervisor.Generation, loadedMvid = Supervisor.Mvid, armed = Supervisor.State.Armed,
-        phase = Run.Phase.ToString(), Status, Decision, duoActive = _duoActive, duoInParty = _duoInParty, leashWaits = _leashWaits, leashSeconds = Math.Round(_leashSeconds, 1), regroups = _regroups, regroupSeconds = Math.Round(_regroupSeconds, 1), manualContinuous = _manualContinuous, stopAfterMap = _stopAfterMap, run = Run, lastCommand = Supervisor.LastCommand,
+        phase = Run.Phase.ToString(), Status, Decision, duoActive = _duoActive, duoInParty = _duoInParty, leashWaits = _leashWaits, leashSeconds = Math.Round(_leashSeconds, 1), regroups = _regroups, regroupSeconds = Math.Round(_regroupSeconds, 1), inAura = _inAuraCached, selfAuras = _selfAuras.ToArray(), fightInAuraSeconds = Math.Round(_fightInAuraSeconds), fightOutAuraSeconds = Math.Round(_fightOutAuraSeconds), manualContinuous = _manualContinuous, stopAfterMap = _stopAfterMap, run = Run, lastCommand = Supervisor.LastCommand,
         phaseStartedUtc = _phaseAt,
         inspecting = _inspecting, inspectionStatus = _inspectionStatus,
         commandRequestId = _commandRequestId, commandResult = _commandResult, observedUtc = _observedUtc,
@@ -991,6 +991,43 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         try { return gc.Player.GetComponent<Buffs>()?.BuffsList?.Any(b => b?.Name != null && b.Name.StartsWith("soul_link", StringComparison.OrdinalIgnoreCase)) == true; }
         catch { return false; }
     }
+    // 2026-09-26 (user): "8割遠い… ではなく、aurabot特有のdeterminationオーラなどがキャリー側に乗っているかをメモリで判断".
+    // The Aurabot publishes its own aura buffs (player_aura_*). The Carry learns which of those it casts itself
+    // (seen while the partner is elsewhere / far) and treats the rest — Determination "player_aura_armour" first — as
+    // the Aurabot's signature: present on the Carry = inside its auras. Unknown (no data yet) = null → distance fallback.
+    private readonly HashSet<string> _selfAuras = new(StringComparer.Ordinal);
+    private bool _selfAurasLearned;
+    private DateTime _auraCheckAt; private bool? _inAuraCached;
+    private double _fightInAuraSeconds, _fightOutAuraSeconds; private DateTime _auraStatAt = DateTime.MinValue;
+    private bool? CarryInPartnerAura(BotContext ctx)
+    {
+        var now = DateTime.UtcNow;
+        if ((now - _auraCheckAt).TotalMilliseconds < 250) return _inAuraCached;
+        _auraCheckAt = now;
+        try
+        {
+            var mine = ctx.Game.Player?.GetComponent<Buffs>()?.BuffsList?.Where(b => b?.Name != null).Select(b => b.Name).ToHashSet(StringComparer.Ordinal);
+            if (mine == null) return _inAuraCached = null;
+            var same = PartnerSameArea(ctx);
+            // 2026-09-26 08:25: learning "our own" auras while the partner looked absent picked up all of the Aurabot's
+            // auras (its area hash lagged behind after a restart). Use the Carry's own aura skills, read from memory solo
+            // on 09-26 (Discipline, Wrath, Purity of Elements); Determination is never ours.
+            if (!_selfAurasLearned)
+            {
+                foreach (var n in new[] { "player_aura_energy_shield", "player_aura_lightning_damage", "player_aura_resists" }) _selfAuras.Add(n);
+                _selfAurasLearned = true;
+            }
+            var partner = ctx.Duo.Last?.Auras;
+            if (!same || partner == null || partner.Length == 0) return _inAuraCached = null;
+            if (partner.Contains("player_aura_armour") && !_selfAuras.Contains("player_aura_armour"))
+                return _inAuraCached = mine.Contains("player_aura_armour");
+            if (!_selfAurasLearned) return _inAuraCached = null;
+            var signature = partner.Where(n => !_selfAuras.Contains(n)).ToList();
+            if (signature.Count == 0) return _inAuraCached = null;
+            return _inAuraCached = signature.Any(mine.Contains);
+        }
+        catch { return _inAuraCached = null; }
+    }
     /// <summary>
     /// True while the Carry should hold its movement for the Aurabot: in the map, out of scouting fights, partner
     /// farther than the leash (or not yet in the map right after entry). Each wait is capped (LeashMaxWaitSeconds)
@@ -1005,7 +1042,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (now < _leashCooldownUntil) return false;
         var d = ctx.Settings.Duo;
         var justEntered = Run.EnteredUtc.HasValue && (now - Run.EnteredUtc.Value).TotalSeconds < 12;
-        var far = PartnerSameArea(ctx) ? PartnerDistance(ctx) > d.LeashDistance.Value : justEntered;
+        var inAura = CarryInPartnerAura(ctx);
+        var far = PartnerSameArea(ctx) ? (inAura.HasValue ? !inAura.Value : PartnerDistance(ctx) > d.LeashDistance.Value) : justEntered;
         // A partner hundreds of units behind cannot catch up in a few seconds: don't stall for it (it re-paths to us).
         if (PartnerSameArea(ctx) && PartnerDistance(ctx) > 350) far = false;
         if (!far) { if (_leashSince != DateTime.MinValue) { _leashSeconds += (now - _leashSince).TotalSeconds; _leashSince = DateTime.MinValue; } return false; }
@@ -1041,7 +1079,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (PartnerSameArea(ctx))
         {
             var dist = PartnerDistance(ctx);
-            hold = dist > aura * 0.8f && dist < 350;
+            var inAura = CarryInPartnerAura(ctx);
+            hold = (inAura.HasValue ? !inAura.Value : dist > aura * 0.8f) && dist < 350;
             partner = ctx.Duo.Last!.Pos;
         }
         else hold = Run.EnteredUtc.HasValue && (now - Run.EnteredUtc.Value).TotalSeconds < 15; // it is still coming through the portal
@@ -1054,7 +1093,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (_regroupSince == DateTime.MinValue)
         {
             _regroupSince = now; _regroups++;
-            _log.Event(Run, "duo.fight_regroup", new { dist = PartnerSameArea(ctx) ? Math.Round(PartnerDistance(ctx)) : -1, sameArea = PartnerSameArea(ctx), aura });
+            _log.Event(Run, "duo.fight_regroup", new { dist = PartnerSameArea(ctx) ? Math.Round(PartnerDistance(ctx)) : -1, sameArea = PartnerSameArea(ctx), aura, inAura = CarryInPartnerAura(ctx), selfAuras = _selfAuras.ToArray() });
         }
         if ((now - _regroupSince).TotalSeconds > 8)
         {
@@ -1065,7 +1104,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         ctx.Combat.Suspend(); _relocating = false;
         if (partner.HasValue && Vector2.Distance(ctx.Game.Player.GridPosNum, partner.Value) > 12) Navigate(ctx, partner.Value);
         else if (ctx.Navigation.IsNavigating) ctx.Navigation.Stop(ctx.Game);
-        Status = partner.HasValue ? $"Duo: regrouping with the Aurabot ({PartnerDistance(ctx):0}/{aura:0})" : "Duo: waiting for the Aurabot before the fight";
+        Status = partner.HasValue ? $"Duo: regrouping — Aurabot's auras not on us ({PartnerDistance(ctx):0})" : "Duo: waiting for the Aurabot before the fight";
         return true;
     }
     /// <summary>Unit direction "away from the threat", leaning toward the Aurabot when it is in this area.</summary>
@@ -1087,6 +1126,22 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         p.Fighting = Run.Phase is AwakeningPhase.Fight;
         p.AuraRadius = d.AuraRadius.Value;
         p.LinkOk = gc.Player != null && HasSoulLink(gc);
+        var inAuraNow = CarryInPartnerAura(ctx);
+        p.AuraKnown = inAuraNow.HasValue; p.InAura = inAuraNow ?? false;
+        // Movement skills used elsewhere (navigation dashes) show up as a position jump between two datagrams.
+        try
+        {
+            if (gc.Player != null && InMap(ctx))
+            {
+                var pos = gc.Player.GridPosNum; var nowUtc = DateTime.UtcNow;
+                if (_duoLastPosAt != DateTime.MinValue && (nowUtc - _duoLastPosAt).TotalMilliseconds < 400 && Vector2.Distance(pos, _duoLastPos) > 18
+                    && (nowUtc - _lastBlinkAt).TotalMilliseconds > 500)
+                { _duoBlinkSeq++; _duoBlinkTarget = pos; }
+                _duoLastPos = pos; _duoLastPosAt = nowUtc;
+            }
+        }
+        catch { }
+        p.BlinkSeq = _duoBlinkSeq; p.BlinkX = _duoBlinkTarget.X; p.BlinkY = _duoBlinkTarget.Y;
         p.PartnerDist = float.IsInfinity(PartnerDistance(ctx)) ? -1 : PartnerDistance(ctx);
         // Map owned by the current run: its hash once entered, -1 while freshly opened (nobody knows the hash yet).
         p.MapHash = Run.Instance != 0 ? (long)Run.Instance : Run.ActivationConfirmed ? -1 : 0;
@@ -2896,6 +2951,8 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         Status = blinked ? "Escaping danger (movement skill)" : "Escaping danger";
         return true;
     }
+    // 2026-09-26 (user): "キャリーがブリンクするときは、移動座標を直通通信でaurabotにつたえ、aurabotもブリンクする".
+    private long _duoBlinkSeq; private Vector2 _duoBlinkTarget; private Vector2 _duoLastPos; private DateTime _duoLastPosAt = DateTime.MinValue;
     private bool TryEscapeBlink(BotContext ctx, Vector2 target)
     {
         if ((DateTime.UtcNow - _lastBlinkAt).TotalMilliseconds < 600) return false;
@@ -2907,6 +2964,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         if (screen.X < 20 || screen.Y < 20 || screen.X > window.Width - 20 || screen.Y > window.Height - 20) return false;
         if (!BotInput.CursorPressKey(new Vector2(window.X + screen.X, window.Y + screen.Y), skill.Key)) return false;
         skill.LastUsedAt = DateTime.Now; _lastBlinkAt = DateTime.UtcNow;
+        _duoBlinkSeq++; _duoBlinkTarget = target; // told to the Aurabot in the next datagram (≤100 ms)
         return true;
     }
     private Vector2? KnownDropSite()
@@ -3087,6 +3145,12 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
         var closest = alive.OrderBy(e => Vector2.Distance(ctx.Game.Player.GridPosNum, e.GridPosNum)).FirstOrDefault();
         if (closest == null) { if (regular) Explore(ctx); else SetPhase(AwakeningPhase.Scout, "boss_not_observable"); return; }
         // 2026-09-26 (user): the build relies on the Aurabot's auras/Soul Link; boss fights happened outside its range.
+        if (!regular && _duoActive && PartnerSameArea(ctx))
+        {
+            var dtAura = _auraStatAt == DateTime.MinValue ? 0 : Math.Min(1.0, (now - _auraStatAt).TotalSeconds); _auraStatAt = now;
+            var ia = CarryInPartnerAura(ctx);
+            if (ia == true) _fightInAuraSeconds += dtAura; else if (ia == false) _fightOutAuraSeconds += dtAura;
+        }
         if (!regular && DuoRegroup(ctx, now)) return;
         if (Vector2.Distance(ctx.Game.Player.GridPosNum, closest.GridPosNum) > ctx.Settings.Build.CombatRange.Value)
         { Navigate(ctx, closest.GridPosNum); return; }

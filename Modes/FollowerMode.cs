@@ -161,6 +161,10 @@ namespace AutoExile.Modes
             var playerGridPos = GetPlayerGrid(gc);
             var isHideout = gc.Area?.CurrentArea?.IsHideout == true;
 
+            // 2026-09-26 08:20: the party-teleport button now opens "Are you sure you want to teleport to this player's
+            // location?" [CANCEL][OK]; nobody answered it and the modal froze the Aurabot (navigation stuck at 1/3).
+            if (HandleTeleportConfirm(ctx, gc)) return;
+
             // In hideout: skip combat/loot/skills — only decision is teleport or portal
             if (!isHideout)
             {
@@ -302,18 +306,61 @@ namespace AutoExile.Modes
                 p.PartnerDist = Vector2.Distance(GetPlayerGrid(ctx.Game), duo.Pos);
             else p.PartnerDist = -1;
             p.Cmd = _decision;
+            // 2026-09-26 (user): range is judged from memory — the Carry checks which of these buffs it carries.
+            try
+            {
+                p.Auras = ctx.Game.Player?.GetComponent<Buffs>()?.BuffsList?
+                    .Where(x => x?.Name != null && x.Name.StartsWith("player_aura_", StringComparison.Ordinal))
+                    .Select(x => x.Name).Distinct().ToArray();
+            }
+            catch { p.Auras = null; }
         }
 
         /// <summary>
         /// Duo-driven behaviour. Returns true when it handled this tick (movement decided), false to fall back to
         /// the memory-based follow (e.g. leader in another area with no command for us).
         /// </summary>
+        private long _duoBlinkSeq = -1; private DateTime _duoBlinkAt = DateTime.MinValue;
+        /// <summary>Casts our movement skill (build role MovementSkill, e.g. Q) toward the Carry's blink destination.</summary>
+        private bool TryFollowBlink(BotContext ctx, GameController gc, Vector2 dest, Vector2 me)
+        {
+            try
+            {
+                var dist = Vector2.Distance(me, dest);
+                if (dist < 18 || dist > 400 || !BotInput.CanAct || (DateTime.Now - _duoBlinkAt).TotalMilliseconds < 400) return false;
+                var skill = ctx.Combat.MovementSkills.FirstOrDefault(m => m.IsReady && (DateTime.Now - m.LastUsedAt).TotalMilliseconds >= m.MinCastIntervalMs);
+                if (skill == null) return false;
+                var range = Math.Max(10, ctx.Settings.Build.BlinkRange.Value);
+                var dir = (dest - me) / dist;
+                var aim = me + dir * Math.Min(dist - 6, range);   // stop just short of the Carry
+                var screen = Pathfinding.GridToScreen(gc, aim);
+                var w = gc.Window.GetWindowRectangle();
+                if (screen.X < 20 || screen.Y < 20 || screen.X > w.Width - 20 || screen.Y > w.Height - 20) return false;
+                if (!BotInput.CursorPressKey(new Vector2(w.X + screen.X, w.Y + screen.Y), skill.Key)) return false;
+                skill.LastUsedAt = DateTime.Now; _duoBlinkAt = DateTime.Now;
+                ctx.Navigation.Stop(gc);
+                _status = $"Duo: blinking after {LeaderName} ({dist:F0})"; _decision = "duo_blink";
+                return true;
+            }
+            catch { return false; }
+        }
+        private int _duoHomeChats; private long _duoHomeChatArea; private DateTime _duoHomeChatAt = DateTime.MinValue;
         private bool TickDuo(BotContext ctx, GameController gc, DuoPacket duo, Vector2 playerGridPos, bool isHideout)
         {
             if (PumpChatKeys()) return true;
             var sameArea = duo.AreaHash == (long)(gc.IngameState?.Data?.CurrentAreaHash ?? 0);
             if (isHideout)
             {
+                // 2026-09-26: while the Carry visited map sellers' hideouts (MarketBuy), the memory-based follow saw the
+                // leader "leave" and walked the Aurabot into a leftover map portal (Dunes) — or would party-teleport it into
+                // the seller's hideout. The Carry's errands away from its hideout are not ours: wait here.
+                if (!duo.InMap && duo.Cmd != "portal" && !sameArea && (duo.Phase == "MarketBuy" || duo.Area == "The Menagerie"))
+                {
+                    if (_state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition) { ctx.Interaction.Cancel(gc); _transitionGridPos = null; _transitionEntityId = 0; }
+                    ctx.Navigation.Stop(gc); _state = FollowerState.NearLeader;
+                    _status = $"Duo: {LeaderName} is on an errand ({duo.Phase}) — waiting in the hideout"; _decision = "duo_errand_wait";
+                    return true;
+                }
                 // Our own portal run (started below) must not be cancelled by the "hideout: idle near leader" rule.
                 if ((DateTime.Now - _duoPortalAt).TotalSeconds < 20 && _state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition)
                 {
@@ -389,9 +436,25 @@ namespace AutoExile.Modes
                 // Carry's hideout directly with "/hideout <name>" (its map portals are there).
                 if (!isHideout)
                 {
+                    // 2026-09-26 07:55: "/hideout" did not get the Aurabot out of a leftover Dunes (chat input unreliable
+                    // in its session). After one chat attempt in this area, walk into the map's own portal instead: map
+                    // portals lead back to the Carry's hideout, where its new map portals are.
+                    if (_duoHomeChats > 0 && _duoHomeChatArea == ourHash && (DateTime.Now - _duoHomeChatAt).TotalSeconds > 12 && _state is not (FollowerState.NavigatingToTransition or FollowerState.ClickingTransition or FollowerState.WaitingForLoad))
+                    {
+                        var exits = FindAllPortals(gc);
+                        if (exits.Count > 0)
+                        {
+                            var exit = exits.OrderBy(e => Vector2.Distance(playerGridPos, new Vector2(e.GridPosNum.X, e.GridPosNum.Y))).First();
+                            ctx.Log($"Duo: stale map — taking its portal home at ({exit.GridPosNum.X:F0},{exit.GridPosNum.Y:F0})");
+                            if (StartNavigationToEntity(ctx, gc, exit)) { _decision = "duo_home_portal"; _status = "Duo: stale map — portal home"; return true; }
+                        }
+                    }
+                    if (_state is FollowerState.NavigatingToTransition or FollowerState.ClickingTransition) return false;
                     if (_duoHomeSince == DateTime.MinValue) _duoHomeSince = DateTime.Now;
                     if ((DateTime.Now - _duoHomeSince).TotalSeconds > (duo.Cmd == "home" ? 6 : 4) && _state is FollowerState.SearchingForLeader or FollowerState.NearLeader or FollowerState.Following && BotInput.CanAct)
                     {
+                        if (_duoHomeChatArea != ourHash) { _duoHomeChatArea = ourHash; _duoHomeChats = 0; }
+                        _duoHomeChats++; _duoHomeChatAt = DateTime.Now;
                         _duoHomeSince = DateTime.Now.AddSeconds(20); // don't spam
                         ChatCommand("/hideout " + LeaderName);
                         _status = "Duo: map done — /hideout";
@@ -406,6 +469,12 @@ namespace AutoExile.Modes
             // Same map as the Carry.
             var leader = FindLeader(gc);
             if (leader != null) TrySoulLink(ctx, gc, leader, duo, playerGridPos);
+            // 2026-09-26 (user): the Carry announces each blink/dash over the Duo link — blink after it right away.
+            if (duo.BlinkSeq != _duoBlinkSeq)
+            {
+                var first = _duoBlinkSeq < 0; _duoBlinkSeq = duo.BlinkSeq;
+                if (!first && duo.Cmd != "grace" && TryFollowBlink(ctx, gc, new Vector2(duo.BlinkX, duo.BlinkY), playerGridPos)) return true;
+            }
             // The Carry's entry grace period: nobody moves until it starts (user, 2026-09-25).
             if (duo.Cmd == "grace")
             {
@@ -432,7 +501,8 @@ namespace AutoExile.Modes
             var followDist = Math.Min(FollowDistance, aura * 0.55f);
             var stopDist = Math.Min(StopDistance, followDist * 0.5f);
             var dist = Vector2.Distance(playerGridPos, carry);
-            var come = duo.Cmd == "come";
+            // The Carry reports from its own buff list whether our auras reach it: outside → close in like "come".
+            var come = duo.Cmd == "come" || (duo.AuraKnown && !duo.InAura);
             var should = come ? dist > stopDist : dist > followDist || (duo.HasDest && dist > stopDist + 4f);
             if (!should)
             {
@@ -1161,6 +1231,63 @@ namespace AutoExile.Modes
         /// Click the "teleport to player" button on the party UI for the leader.
         /// Only works in town/hideout. Returns true if the click was sent.
         /// </summary>
+        private DateTime _popupScanAt = DateTime.MinValue, _popupClickAt = DateTime.MinValue;
+        /// <summary>
+        /// Finds the teleport confirmation modal in the UI tree (memory). OK when we asked for the teleport in the last
+        /// 15 s (state TeleportingViaParty), otherwise CANCEL. True when it handled a click this tick.
+        /// </summary>
+        private bool HandleTeleportConfirm(BotContext ctx, GameController gc)
+        {
+            var now = DateTime.Now;
+            if ((now - _popupScanAt).TotalMilliseconds < 700 || (now - _popupClickAt).TotalMilliseconds < 1200) return false;
+            _popupScanAt = now;
+            try
+            {
+                var root = gc.IngameState?.IngameUi;
+                if (root == null) return false;
+                ExileCore.PoEMemory.Element? question = null;
+                var stack = new Stack<(ExileCore.PoEMemory.Element E, int D)>();
+                foreach (var c in root.Children) if (c != null && c.IsVisible) stack.Push((c, 0));
+                var visited = 0;
+                while (stack.Count > 0 && visited < 4000 && question == null)
+                {
+                    var (e, d) = stack.Pop(); visited++;
+                    string? t = null; try { t = e.Text; } catch { }
+                    if (t != null && t.Contains("teleport to this player", StringComparison.OrdinalIgnoreCase)) { question = e; break; }
+                    if (d >= 7) continue;
+                    var kids = e.Children;
+                    if (kids == null) continue;
+                    foreach (var k in kids) if (k != null && k.IsVisible) stack.Push((k, d + 1));
+                }
+                if (question == null) return false;
+                var want = _state == FollowerState.TeleportingViaParty && (now - _lastPartyTeleportAttempt).TotalSeconds < 15;
+                var label = want ? "ok" : "cancel";
+                // The buttons are siblings of the question text inside the same panel (a few levels up).
+                ExileCore.PoEMemory.Element? button = null;
+                var panel = question.Parent;
+                for (var up = 0; up < 4 && panel != null && button == null; up++, panel = panel.Parent)
+                {
+                    var q = new Stack<ExileCore.PoEMemory.Element>(); q.Push(panel); var n = 0;
+                    while (q.Count > 0 && n++ < 300)
+                    {
+                        var e = q.Pop(); string? t = null; try { t = e.Text?.Trim(); } catch { }
+                        if (t != null && t.Equals(label, StringComparison.OrdinalIgnoreCase)) { button = e; break; }
+                        if (e.Children != null) foreach (var k in e.Children) if (k != null && k.IsVisible) q.Push(k);
+                    }
+                }
+                if (button == null || !BotInput.CanAct) { _status = "Teleport confirmation open — button not found"; return true; }
+                var r = button.GetClientRect(); var w = gc.Window.GetWindowRectangle();
+                if (BotInput.Click(new Vector2(w.X + r.Center.X, w.Y + r.Center.Y)))
+                {
+                    _popupClickAt = now;
+                    ctx.Log($"Teleport confirmation: clicked {label.ToUpperInvariant()}");
+                    _status = $"Teleport confirmation: {label.ToUpperInvariant()}"; _decision = "teleport_confirm_" + label;
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
         private bool TryTeleportViaPartyUI(BotContext ctx, GameController gc)
         {
             // Rate-limit attempts

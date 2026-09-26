@@ -158,6 +158,15 @@ public sealed class DuoPacket
     public int EsPct { get; set; }
     public float AuraRadius { get; set; }
     public float PartnerDist { get; set; }
+    /// <summary>Aurabot: its own aura buffs ("player_aura_*", read from its Buffs component).</summary>
+    public string[]? Auras { get; set; }
+    /// <summary>Carry: whether one of the Aurabot's own auras is currently applied to it (memory, not distance).</summary>
+    public bool AuraKnown { get; set; }
+    public bool InAura { get; set; }
+    /// <summary>Carry: increments on every blink/dash; BlinkX/Y = where it is going (Aurabot blinks after it).</summary>
+    public long BlinkSeq { get; set; }
+    public float BlinkX { get; set; }
+    public float BlinkY { get; set; }
     /// <summary>Carry: map portals still open in the hideout (the last one is reserved for the Carry).</summary>
     public int PortalsLeft { get; set; }
     /// <summary>Carry: area hash of the map its current run owns (0 = none). The Aurabot only holds / waits in that map.</summary>
