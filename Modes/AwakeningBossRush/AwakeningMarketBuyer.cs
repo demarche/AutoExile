@@ -67,9 +67,11 @@ public sealed class AwakeningMarketBuyer
         var gc = ctx.Game;
         if ((DateTime.UtcNow - _startedAt).TotalMinutes > 15) { GoHomeOrFail(gc, "overall_timeout:" + _step); return; }
         // A travel click that never leaves the hideout (seller offline / listing gone): try the next seller.
-        if (_step == Step.Arrive && _sellerHash == 0 && AreaHash(gc) == _homeHash && (DateTime.UtcNow - _stepAt).TotalSeconds > 20 && _searches < 6)
+        // 2026-09-26 01:33: successful travels arrive in 6-11 s; each dead seller cost 20 s, and after the 6th search the
+        // next one waited the full 60 s step timeout (3 maps in 3 min). Give up on a seller after 14 s, up to 12 of them.
+        if (_step == Step.Arrive && _sellerHash == 0 && AreaHash(gc) == _homeHash && (DateTime.UtcNow - _stepAt).TotalSeconds > 14 && _skippedSellers.Count < 12)
         { _log("market.travel_failed", new { seller = _seller }); _skippedSellers.Add(_seller); Set(Step.Search, "travel failed, next seller"); return; }
-        var limit = _step switch { Step.Arrive or Step.Home => 60, Step.Buy => 180, _ => 25 };
+        var limit = _step switch { Step.Arrive => 30, Step.Home => 60, Step.Buy => 180, _ => 25 };
         if ((DateTime.UtcNow - _stepAt).TotalSeconds > limit) { GoHomeOrFail(gc, "step_timeout:" + _step); return; }
         if (_keys.Count > 0)
         {
@@ -124,7 +126,7 @@ public sealed class AwakeningMarketBuyer
         // 2026-09-22: a PoE restart cleared the manually saved filters (category Any → gems listed). Fill them in.
         if (!_filtersSet && _filterRounds < 3) { _filterRounds++; PlanFilters(market); Set(Step.Filters, "setting the search filters"); return; }
         _searches++;
-        if (_searches > 6) { Fail("too_many_searches"); return; }
+        if (_searches > 14) { Fail("too_many_searches"); return; } // 2026-09-26: 6 → 14 (one search per seller; 3 maps per trip was too few)
         Click(gc, button);
         Set(Step.Read, "waiting for results");
     }
@@ -479,7 +481,7 @@ public sealed class AwakeningMarketBuyer
         }
         // Nothing left in this tab within the margin: next cheapest seller if more maps are needed.
         _log("market.seller_done", new { seller = _seller, bought = Bought });
-        if (Bought < r.Count && _searches < 6) { _skippedSellers.Add(_seller); GoHome(gc, "seller_exhausted", research: true); return; }
+        if (Bought < r.Count && _searches < 14) { _skippedSellers.Add(_seller); GoHome(gc, "seller_exhausted", research: true); return; }
         GoHome(gc, "seller_exhausted");
     }
     private (double Price, string[] Mods, string? Reject) CheckSellerItem(GameController gc, Element element, MarketMapRequest r, double cap)
