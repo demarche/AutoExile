@@ -141,7 +141,7 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
 
     public AwakeningBossRushMode(string directory, Action<string> log)
     {
-        _directory = Path.Combine(directory, "AwakeningData");
+        _directory = Path.Combine(directory, "AwakeningData"); AwakeningMarketBuyer.DumpDirectory = _directory;
         Supervisor = new(_directory, typeof(AwakeningBossRushMode).Assembly.ManifestModule.ModuleVersionId.ToString());
         _log = new(_directory, log, Supervisor.Generation);
         _ledger = new(_directory);

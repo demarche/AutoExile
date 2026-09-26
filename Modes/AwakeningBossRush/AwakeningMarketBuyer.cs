@@ -37,6 +37,7 @@ public sealed class AwakeningMarketBuyer
     private string _seller = "", _homeArea = "";
     private long _homeHash, _sellerHash;
     private static readonly Dictionary<string, DateTime> DeadSellers = new();
+    public static string? DumpDirectory; private static int _travelDumps;
     private double _firstPrice;
     private int _gridCountBefore = -1, _pendingIndex = -1, _failedClicks, _searches, _mapsBefore;
     private double _pendingPrice;
@@ -74,7 +75,13 @@ public sealed class AwakeningMarketBuyer
         // retry forgot them), and one of them (TWoods) arrived in 18 s on a later try. 20 s, never while loading, and
         // remember dead sellers across market runs for 20 min.
         if (_step == Step.Arrive && _sellerHash == 0 && !gc.IsLoading && AreaHash(gc) == _homeHash && (DateTime.UtcNow - _stepAt).TotalSeconds > 20 && _skippedSellers.Count < 12)
-        { _log("market.travel_failed", new { seller = _seller }); _skippedSellers.Add(_seller); DeadSellers[_seller] = DateTime.UtcNow; Set(Step.Search, "travel failed, next seller"); return; }
+        {
+            _log("market.travel_failed", new { seller = _seller });
+            // 03:38-03:48 every travel failed (7/7), 04:23 two of the same sellers arrived in 6-9 s: the failures come in
+            // waves on our side. Dump the visible UI for the first few so the blocker (a dialog? a message?) can be seen.
+            if (_travelDumps < 4 && DumpDirectory != null) { _travelDumps++; try { _log("market.travel_failed_ui", new { file = AwakeningUiInspector.Dump(gc, DumpDirectory, "travelfail", maxDepth: 6) }); } catch { } }
+            _skippedSellers.Add(_seller); DeadSellers[_seller] = DateTime.UtcNow; Set(Step.Search, "travel failed, next seller"); return;
+        }
         var limit = _step switch { Step.Arrive => 30, Step.Home => 60, Step.Buy => 180, _ => 25 };
         if ((DateTime.UtcNow - _stepAt).TotalSeconds > limit) { GoHomeOrFail(gc, "step_timeout:" + _step); return; }
         if (_keys.Count > 0)
@@ -395,8 +402,11 @@ public sealed class AwakeningMarketBuyer
         _log("market.results", new { count = rows.Count, rows = rows.Select(r => new { r.Name, r.Price, r.Currency, r.Seller, r.Quantity, r.Pack, r.Prefix, r.Suffix, reject = r.Reject }) });
         if (rows.Count > 0 && rows.All(r => r.Reject?.StartsWith("not_T16", StringComparison.Ordinal) == true) && _filterRounds < 3)
         { _filtersSet = false; _resetFilters = true; Set(Step.Search, "results are not T16 maps: resetting the filters"); return; }
-        foreach (var k in DeadSellers.Where(x => (DateTime.UtcNow - x.Value).TotalMinutes > 20).Select(x => x.Key).ToList()) DeadSellers.Remove(k);
-        var pick = rows.FirstOrDefault(r => r.Reject == null && !_skippedSellers.Contains(r.Seller) && !DeadSellers.ContainsKey(r.Seller));
+        foreach (var k in DeadSellers.Where(x => (DateTime.UtcNow - x.Value).TotalMinutes > 10).Select(x => x.Key).ToList()) DeadSellers.Remove(k);
+        // 03:42-03:58: the 20-min memory hid every acceptable listing and the buyer retried "no_acceptable_listing" for
+        // 16 min. Recently failed sellers only go to the back of the queue — they are still tried when nobody else is left.
+        var pick = rows.FirstOrDefault(r => r.Reject == null && !_skippedSellers.Contains(r.Seller) && !DeadSellers.ContainsKey(r.Seller))
+            ?? rows.FirstOrDefault(r => r.Reject == null && !_skippedSellers.Contains(r.Seller));
         if (pick == null) { GoHomeOrFail(gc, rows.Count == 0 ? "no_results" : "no_acceptable_listing"); return; }
         var travel = Child(pick.Entry, 0, 1, 2, 0, 4, 0);
         if (travel == null) { Fail("travel_button_not_found"); return; }
