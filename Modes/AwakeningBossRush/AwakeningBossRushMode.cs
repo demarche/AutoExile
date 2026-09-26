@@ -710,6 +710,18 @@ public sealed class AwakeningBossRushMode : IBotMode, IDisposable
             {
                 if (Run.RecoveryRequired)
                 { Run.RecoveryRequired = false; ctx.Settings.Running.Value = false; CancelInput(ctx); StopContinuousLoop("return_failed_after_terminal_attempt"); SetPhase(AwakeningPhase.AwaitingReview, "return_failed_after_terminal_attempt"); }
+                // 2026-09-26 02:52 / 02:59: after a Timeout (bosses done) the recorded portal was still listed but clicking it
+                // never took us in; every "continuous" re-tried the same map and stopped again after 60 s. A portal that
+                // cannot be entered for 60 s in continuous mode: give the map up and start a fresh one.
+                else if (_manualContinuous && Run.Phase == AwakeningPhase.EnterPortal && Run.ActivationConfirmed && Supervisor.StorageError.Length == 0)
+                {
+                    _log.Event(Run, "map.abandon_unenterable", new { Run.Instance, Run.Deaths, Run.BossesCompleted, Status, portals = Run.PortalIds });
+                    var attempt = Run.AttemptId;
+                    Supervisor.State.Run = new() { AttemptId = attempt, AttemptNumber = 1, Phase = AwakeningPhase.Prepare,
+                        BuildMvid = Supervisor.Mvid, BuildFingerprint = Run.BuildFingerprint, BuildConfiguration = Run.BuildConfiguration,
+                        PriorPortalIds = StrictMapRecipe.Portals(ctx.Game).Select(p => (long)p.Id).ToList() };
+                    Supervisor.Save(); _phaseAt = DateTime.UtcNow;
+                }
                 else Finish(ctx, AttemptOutcome.OperationalFailure, "phase_timeout:" + Run.Phase + ":" + Status);
                 return;
             }
